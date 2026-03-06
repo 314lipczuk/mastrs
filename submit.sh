@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=cvae-erk
-#SBATCH --partition=pgpu
+#SBATCH --partition=all
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=4G
@@ -29,7 +29,8 @@ uv sync
 NOTEBOOK="${1:-notebooks/notebook.ipynb}"
 OUT_NOTEBOOK="${NOTEBOOK%.ipynb}_executed_$(date +%Y%m%d_%H%M%S).ipynb"
 
-uv run papermill "$NOTEBOOK" "$OUT_NOTEBOOK" --no-progress-bar
+uv run python -m ipykernel install --user --name masters
+uv run papermill "$NOTEBOOK" "$OUT_NOTEBOOK" --no-progress-bar -k masters
 
 echo "Job finished: $(date)"
 echo "Executed notebook: $OUT_NOTEBOOK"
