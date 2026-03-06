@@ -8,7 +8,7 @@ def load_and_clean(
     cell_selection_csv: str | None = None,
     tracking_threshold: float = 0.9,
     norm_until_timepoint: int = 10,
-    baseline_cnr_max: float | None = None,
+    baseline_cnr_max: float | None = 0.8,
     cell_line: str | None = 'EGFR'
 ) -> pd.DataFrame:
     """Read a parquet experiment file and return a cleaned dataframe.
@@ -59,9 +59,9 @@ def load_and_clean(
         .groupby("uid")["cnr"]
         .median()
     )
-    df["cnr_norm"] = df["uid"].map(baseline_mean)
-    df["cnr_norm"] = df["cnr"] / df["cnr_norm"]
-    df.dropna(subset=["cnr_norm"], inplace=True)
+    df["cnr_mean_norm"] = df["uid"].map(baseline_mean)
+    df["cnr_mean_norm"] = df["cnr"] / df["cnr_mean_norm"]
+    df.dropna(subset=["cnr_mean_norm"], inplace=True)
 
     # --- manual cell selection ----------------------------------------------
     if cell_selection_csv is not None and os.path.isfile(cell_selection_csv):
@@ -191,7 +191,10 @@ def add_stim_features(df, window_min=5, ewma_alpha_fast=0.5, ewma_alpha_slow=0.1
         g["slope_5"] = sl5
         return g
 
+    saved_uid = df[["uid"]].copy()
     df = df.groupby("uid", group_keys=False).apply(_cell_features)
+    if "uid" not in df.columns:
+        df["uid"] = saved_uid["uid"]
 
     # --- vectorised columns (EWMA, cumsum) ---
     df["ewma_fast"] = (
@@ -205,6 +208,119 @@ def add_stim_features(df, window_min=5, ewma_alpha_fast=0.5, ewma_alpha_slow=0.1
     df["s_cum"] = df.groupby("uid")["u_t"].cumsum()
 
     return df
+
+DEFAULT_STIM_COLS = ["u_t", "m_t", "recency", "ewma_fast", "ewma_slow",
+                     "n_5", "slope_5", "burst_pos", "s_cum"]
+
+def make_windows(df, window_size=None, stride=None, value_col="cnr_median_norm",
+                 stim_cols=None):
+    """Slice per-cell trajectories into fixed-length windows.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Long-format dataset with ``uid``, ``frame``, *value_col*, and *stim_cols*.
+    window_size : int or None
+        Length of each window in frames.  ``None`` → shortest experiment length.
+    stride : int or None
+        Step between consecutive windows.  ``None`` → ``window_size`` (no overlap).
+    value_col : str
+        Column name for the target signal (e.g. ERK readout).
+    stim_cols : list of str or None
+        Stimulus feature columns to extract.  ``None`` → ``DEFAULT_STIM_COLS``.
+
+    Returns
+    -------
+    erk : np.ndarray, shape (n_windows, window_size)
+    stim : np.ndarray, shape (n_windows, n_stim_cols, window_size)
+    meta : pd.DataFrame  — one row per window with uid, window_start, and first-row metadata.
+    """
+    if stim_cols is None:
+        stim_cols = DEFAULT_STIM_COLS
+    if window_size is None:
+        window_size = int(df.groupby("ramp_pattern_name")["frame"].nunique().min())
+    if stride is None:
+        stride = window_size
+
+    erk_windows, stim_windows, meta_rows = [], [], []
+
+    for uid, g in df.groupby("uid"):
+        g = g.sort_values("frame")
+        vals = g[value_col].values
+        stim_mat = g[stim_cols].values  # (n_frames, n_stim_cols)
+        frames = g["frame"].values
+        n = len(vals)
+
+        first_row = g.iloc[0]
+
+        for start in range(0, n - window_size + 1, stride):
+            chunk_v = vals[start : start + window_size]
+            chunk_s = stim_mat[start : start + window_size]  # (window_size, n_stim_cols)
+            if np.isnan(chunk_v).any() or np.isnan(chunk_s).any():
+                continue
+            erk_windows.append(chunk_v)
+            stim_windows.append(chunk_s.T)  # (n_stim_cols, window_size)
+            meta_rows.append({
+                "uid": uid,
+                "window_start": int(frames[start]),
+                "cell_line": first_row.get("cell_line", None),
+                "ramp_pattern_name": first_row.get("ramp_pattern_name", None),
+                "fov": first_row.get("fov", None),
+            })
+
+    erk = np.array(erk_windows, dtype=np.float32)
+    stim = np.array(stim_windows, dtype=np.float32)
+    meta = pd.DataFrame(meta_rows)
+    return erk, stim, meta
+
+
+def plot_nan_audit(df):
+    """Plot NaN counts per column broken down by experiment, and per-cell NaN fraction.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The combined dataset (must contain a ``ramp_pattern_name`` and ``uid`` column).
+    """
+    import matplotlib.pyplot as plt
+
+    # Per-column NaN count per experiment
+    nan_by_exp = pd.DataFrame({
+        pat: df[df['ramp_pattern_name'] == pat].isna().sum()
+        for pat in df['ramp_pattern_name'].unique()
+    })
+    nan_by_exp = nan_by_exp[nan_by_exp.sum(axis=1) > 0]
+
+    if len(nan_by_exp) == 0:
+        print("No NaN values found in any column — data is clean.")
+    else:
+        fig, ax = plt.subplots(figsize=(10, max(3, len(nan_by_exp) * 0.4)))
+        nan_by_exp.plot(kind='barh', ax=ax)
+        ax.set_title('NaN counts per column per experiment')
+        ax.set_xlabel('NaN count')
+        plt.tight_layout()
+        plt.show()
+        print("\nColumns with NaNs:")
+        print(nan_by_exp)
+
+    # Per-cell NaN fraction
+    cell_nan_frac = df.groupby('uid')[df.columns.difference(['uid'])].apply(
+        lambda g: g.isna().any(axis=1).mean()
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(cell_nan_frac, bins=50)
+    ax.set_xlabel('Fraction of frames with any NaN')
+    ax.set_ylabel('Number of cells')
+    ax.set_title('Per-cell NaN contamination')
+    plt.tight_layout()
+    plt.show()
+
+    threshold = 0.1
+    dirty = cell_nan_frac[cell_nan_frac > threshold]
+    print(f"Cells with >{threshold*100:.0f}% NaN frames: {len(dirty)} / {len(cell_nan_frac)}")
+    return cell_nan_frac
+
 
 def check_df(df):
     # TODO: make this better.
