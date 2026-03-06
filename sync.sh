@@ -19,6 +19,7 @@ EXCLUDES=(
     "*.pyc"
     "*.egg-info/"
     ".git/"
+    cluster_results/
 )
 
 # ── Build exclude flags ──────────────────────────────────────────────────────

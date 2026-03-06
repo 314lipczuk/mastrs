@@ -27,8 +27,8 @@ uv sync
 
 # ── Run notebook ────────────────────────────────────────────────────────────
 NOTEBOOK="${1:-notebooks/notebook.ipynb}"
-OUT_NOTEBOOK="${NOTEBOOK%.ipynb}_executed_$(date +%Y%m%d_%H%M%S).ipynb"
-
+OUT_NOTEBOOK="~/results/${NOTEBOOK%.ipynb}_executed_$(date +%Y%m%d_%H%M%S).ipynb"
+mkdir -p "$(dirname "$OUT_NOTEBOOK")"
 uv run python -m ipykernel install --user --name masters
 uv run papermill "$NOTEBOOK" "$OUT_NOTEBOOK" --no-progress-bar -k masters
 
