@@ -9,3 +9,4 @@ extra
 *.parquet
 *.zip
 *.gif
+.DS_Store
