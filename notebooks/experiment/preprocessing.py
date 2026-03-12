@@ -355,6 +355,52 @@ if __name__ == '__main__':
     df.to_parquet('dataset.parquet')
     print('saved dataset...')
 
+def filter_dead_cells(df,
+                      intensity_col="mean_intensity_C0_nuc",
+                      drop_ratio=0.4,
+                      min_area=50,
+                      remove_from="entire"):
+    """Remove cells that die during the experiment.
 
+    A cell is flagged as dead at the first frame where its nuclear
+    intensity drops below ``drop_ratio`` of its per-cell median, or
+    its nuclear area falls below ``min_area`` pixels.
+
+    Parameters
+    ----------
+    intensity_col : str
+        Column used to detect intensity collapse.
+    drop_ratio : float
+        Fraction of per-cell baseline median intensity below which a
+        cell is considered dead (default 0.4 = 40 %). Baseline is the
+        first 10 frames of each cell's track.
+    min_area : int
+        Minimum nuclear area in pixels.  Below this the cell is
+        considered dead/fragmented.
+    remove_from : {"death", "entire"}
+        ``"death"`` removes only frames from the death timepoint onward.
+        ``"entire"`` removes the whole cell track.
+    """
+    df = df.copy()
+    area_col = "area_nuc" if "area_nuc" in df.columns else "area"
+
+    # per-cell baseline median intensity as reference (first 10 frames)
+    baseline = df.loc[df["frame"] < 10]
+    med_int = baseline.groupby("uid")[intensity_col].median()
+    df["_int_threshold"] = df["uid"].map(med_int) * drop_ratio
+
+    dead_mask = (df[intensity_col] < df["_int_threshold"]) | (df[area_col] < min_area)
+
+    if remove_from == "entire":
+        dead_uids = df.loc[dead_mask, "uid"].unique()
+        df = df[~df["uid"].isin(dead_uids)]
+    else:
+        # find first death frame per cell, drop everything from there on
+        dead_frames = df.loc[dead_mask].groupby("uid")["frame"].min()
+        for uid, death_frame in dead_frames.items():
+            df = df[~((df["uid"] == uid) & (df["frame"] >= death_frame))]
+
+    df.drop(columns=["_int_threshold"], inplace=True)
+    return df
 
 
