@@ -274,6 +274,70 @@ def make_windows(df, window_size=None, stride=None, value_col="cnr_median_norm",
     return erk, stim, meta
 
 
+def make_windows_sample(df, window_size=None, value_col="cnr_median_norm",
+                        stim_cols=None, rng=None):
+    """Sample one random window per cell track.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Long-format dataset with ``uid``, ``frame``, *value_col*, and *stim_cols*.
+    window_size : int or None
+        Length of each window in frames.  ``None`` → shortest experiment length.
+    value_col : str
+        Column name for the target signal.
+    stim_cols : list of str or None
+        Stimulus feature columns.  ``None`` → ``DEFAULT_STIM_COLS``.
+    rng : np.random.Generator or int or None
+        Random generator or seed for reproducibility.
+
+    Returns
+    -------
+    erk : np.ndarray, shape (n_cells, window_size)
+    stim : np.ndarray, shape (n_cells, n_stim_cols, window_size)
+    meta : pd.DataFrame  — one row per cell with uid, window_start, and first-row metadata.
+    """
+    if stim_cols is None:
+        stim_cols = DEFAULT_STIM_COLS
+    if window_size is None:
+        window_size = int(df.groupby("ramp_pattern_name")["frame"].nunique().min())
+    if not isinstance(rng, np.random.Generator):
+        rng = np.random.default_rng(rng)
+
+    erk_windows, stim_windows, meta_rows = [], [], []
+
+    for uid, g in df.groupby("uid"):
+        g = g.sort_values("frame")
+        vals = g[value_col].values
+        stim_mat = g[stim_cols].values
+        frames = g["frame"].values
+        n = len(vals)
+
+        if n < window_size:
+            continue
+
+        start = rng.integers(0, n - window_size + 1)
+        chunk_v = vals[start : start + window_size]
+        chunk_s = stim_mat[start : start + window_size]
+        if np.isnan(chunk_v).any() or np.isnan(chunk_s).any():
+            continue
+
+        erk_windows.append(chunk_v)
+        stim_windows.append(chunk_s.T)
+        meta_rows.append({
+            "uid": uid,
+            "window_start": int(frames[start]),
+            "cell_line": g.iloc[0].get("cell_line", None),
+            "ramp_pattern_name": g.iloc[0].get("ramp_pattern_name", None),
+            "fov": g.iloc[0].get("fov", None),
+        })
+
+    erk = np.array(erk_windows, dtype=np.float32)
+    stim = np.array(stim_windows, dtype=np.float32)
+    meta = pd.DataFrame(meta_rows)
+    return erk, stim, meta
+
+
 def plot_nan_audit(df):
     """Plot NaN counts per column broken down by experiment, and per-cell NaN fraction.
 

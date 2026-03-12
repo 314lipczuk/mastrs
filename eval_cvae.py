@@ -126,17 +126,24 @@ def _get_device(model: nn.Module) -> torch.device:
 
 def _encode_all(
     model: nn.Module, dataset, batch_size: int = 256
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Encode all samples. Returns (z_mu, z_logvar) for VAEs or (z, None) for AEs."""
     device = _get_device(model)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     mus, logvars = [], []
     with torch.no_grad():
         for encoder_input, stim_cond, target in loader:
             encoder_input = encoder_input.float().to(device)
-            mu, logvar = model.encoder(encoder_input)
-            mus.append(mu.cpu().numpy())
-            logvars.append(logvar.cpu().numpy())
-    return np.concatenate(mus), np.concatenate(logvars)
+            out = model.encoder(encoder_input)
+            if isinstance(out, tuple):
+                mu, logvar = out
+                mus.append(mu.cpu().numpy())
+                logvars.append(logvar.cpu().numpy())
+            else:
+                mus.append(out.cpu().numpy())
+    z_mu = np.concatenate(mus)
+    z_logvar = np.concatenate(logvars) if logvars else None
+    return z_mu, z_logvar
 
 
 def _reconstruct_all(
@@ -149,8 +156,9 @@ def _reconstruct_all(
         for encoder_input, stim_cond, target in loader:
             encoder_input = encoder_input.float().to(device)
             stim_cond = stim_cond.float().to(device)
-            mu, logvar = model.encoder(encoder_input)
-            recon = model.decoder(mu, stim_cond)  # use mean (no sampling)
+            out = model.encoder(encoder_input)
+            z = out[0] if isinstance(out, tuple) else out
+            recon = model.decoder(z, stim_cond)
             recons.append(recon.cpu().numpy())
             targets.append(target.cpu().numpy())
     return np.concatenate(recons), np.concatenate(targets)
@@ -392,10 +400,12 @@ def _plot_latent_traversals(
 def _compute_stimulus_invariance(
     z_mu: np.ndarray, metadata: pd.DataFrame, condition_col: str
 ) -> tuple[float, float, np.ndarray]:
-    labels = metadata[condition_col].values[: len(z_mu)]
+    labels = metadata[condition_col].to_numpy()[: len(z_mu)]
     unique = np.unique(labels)
     chance = 1.0 / len(unique)
-    clf = LogisticRegression(max_iter=1000, solver="lbfgs", multi_class="multinomial")
+    if len(unique) < 2:
+        return float(chance), float(chance), np.array([chance])
+    clf = LogisticRegression(max_iter=1000, solver="lbfgs")
     scores = cross_val_score(clf, z_mu, labels, cv=min(5, len(unique)), scoring="accuracy")
     return float(scores.mean()), float(chance), scores
 
@@ -408,7 +418,7 @@ def _plot_stimulus_invariance(
     chance: float,
     active_dims: np.ndarray,
 ) -> Figure:
-    labels = metadata[condition_col].values[: len(z_mu)]
+    labels = metadata[condition_col].to_numpy()[: len(z_mu)]
     active_idx = np.where(active_dims)[0]
     if len(active_idx) < 2:
         active_idx = np.arange(min(2, z_mu.shape[1]))
@@ -440,7 +450,7 @@ def _plot_stimulus_invariance(
 def _plot_within_condition(
     z_mu: np.ndarray, metadata: pd.DataFrame, condition_col: str, active_dims: np.ndarray
 ) -> Figure:
-    labels = metadata[condition_col].values[: len(z_mu)]
+    labels = metadata[condition_col].to_numpy()[: len(z_mu)]
     unique_conds = sorted(set(labels))
     active_idx = np.where(active_dims)[0]
     if len(active_idx) == 0:
@@ -527,9 +537,16 @@ def evaluate(
     # --- MSE ---
     mse_per_cell = _compute_mse_per_cell(recons, targets)
 
-    # --- KL ---
-    kl_per_dim, kl_per_cell = _compute_kl_per_dimension(z_mu, z_logvar)
-    active_dims = kl_per_dim >= kl_active_threshold
+    # --- KL (VAE only) ---
+    is_vae = z_logvar is not None
+    if is_vae:
+        kl_per_dim, kl_per_cell = _compute_kl_per_dimension(z_mu, z_logvar)
+        active_dims = kl_per_dim >= kl_active_threshold
+    else:
+        latent_dim = z_mu.shape[1]
+        kl_per_dim = np.zeros(latent_dim)
+        kl_per_cell = np.zeros((len(z_mu), latent_dim))
+        active_dims = np.ones(latent_dim, dtype=bool)  # treat all dims as active for AE
 
     # --- Frequency ---
     orig_psd, recon_psd, freqs = _compute_frequency_analysis(recons, targets, dt)
@@ -549,7 +566,8 @@ def evaluate(
     )
     figures["mse_distribution"] = _plot_mse_distribution(mse_per_cell, metadata, condition_col)
     figures["power_spectra"] = _plot_power_spectra(orig_psd, recon_psd, freqs)
-    figures["kl_per_dim"] = _plot_kl_per_dimension(kl_per_dim, kl_active_threshold)
+    if is_vae:
+        figures["kl_per_dim"] = _plot_kl_per_dimension(kl_per_dim, kl_active_threshold)
     figures["latent_traversals"] = _plot_latent_traversals(traversals, active_dims, traversal_range)
     figures["stimulus_invariance"] = _plot_stimulus_invariance(
         z_mu, metadata, condition_col, accuracy, chance, active_dims
@@ -558,7 +576,8 @@ def evaluate(
         z_mu, metadata, condition_col, accuracy, chance, active_dims
     )
     figures["within_condition"] = _plot_within_condition(z_mu, metadata, condition_col, active_dims)
-    figures["encoder_uncertainty"] = _plot_encoder_uncertainty(z_logvar, metadata, condition_col)
+    if is_vae:
+        figures["encoder_uncertainty"] = _plot_encoder_uncertainty(z_logvar, metadata, condition_col)
 
     # --- Assemble ---
     metrics = {

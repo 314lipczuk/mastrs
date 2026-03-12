@@ -27,10 +27,12 @@ uv sync
 
 # ── Run notebook ────────────────────────────────────────────────────────────
 NOTEBOOK="${1:-notebooks/notebook.ipynb}"
-OUT_NOTEBOOK="~/results/${NOTEBOOK%.ipynb}_executed_$(date +%Y%m%d_%H%M%S).ipynb"
+OUT_NOTEBOOK="/home/ppilip/results/${NOTEBOOK%.ipynb}_executed_$(date +%Y%m%d_%H%M%S).ipynb"
 mkdir -p "$(dirname "$OUT_NOTEBOOK")"
-uv run python -m ipykernel install --user --name masters
-uv run papermill "$NOTEBOOK" "$OUT_NOTEBOOK" --no-progress-bar -k masters
+KERNEL_NAME="masters-${SLURM_JOB_ID}"
+rm -rf ~/.local/share/jupyter/kernels/"$KERNEL_NAME"
+uv run python -m ipykernel install --user --name "$KERNEL_NAME"
+uv run papermill "$NOTEBOOK" "$OUT_NOTEBOOK" --no-progress-bar -k "$KERNEL_NAME"
 
 echo "Job finished: $(date)"
 echo "Executed notebook: $OUT_NOTEBOOK"
