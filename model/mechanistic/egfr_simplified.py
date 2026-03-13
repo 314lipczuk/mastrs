@@ -2,23 +2,23 @@
 Simplified EGFR → RAS → RAF → MEK → ERK cascade with negative feedback (NFB).
 
 Five active-form states: RAS_s, RAF_s, MEK_s, NFB_s, ERK_s.
-
-Activation is pseudo-first-order (linear in upstream signal — inactive pools
-assumed large / approximately constant, absorbed into rate constants).
-Deactivation retains Michaelis-Menten saturation.
+Total protein is conserved per node (Active + Inactive = Total, normalised to 1),
+so activation is proportional to the inactive pool (1 - Active).
+Deactivation retains Michaelis-Menten saturation with a single shared Km.
 """
-from sympy import Eq, Derivative, Symbol
+from sympy import Eq, Derivative, Symbol, log
 from sympy.abc import t
 
 from model.mechanistic.mechanistic_model import EquationDescription
 
 
 PARAM_NAMES = [
-    "k12", "k21", "K21",
-    "k34", "knfb", "k43", "K43",
-    "k56", "k65", "K65",
-    "k78", "k87", "K87",
-    "f12", "f21", "F21",
+    "Km",
+    "k12", "k21",
+    "k34", "knfb", "k43",
+    "k56", "k65",
+    "k78", "k87",
+    "f12", "f21",
 ]
 
 NODE_NAMES = ["RAS", "RAF", "MEK", "NFB", "ERK"]
@@ -38,30 +38,30 @@ def model_eqs(params, states) -> EquationDescription:
     s = symbols_dict
 
     equations = [
-        # d(RAS_s)/dt = light * k12 - k21 * RAS_s/(K21 + RAS_s)
+        # d(RAS_s)/dt = light * k12 * (1 - RAS_s) - k21 * RAS_s/(Km + RAS_s)
         Eq(Derivative(s['RAS_s'], t),
-           s['light'] * s['k12']
-           - s['k21'] * (s['RAS_s'] / (s['K21'] + s['RAS_s']))),
+           s['light'] * s['k12'] * (1 - s['RAS_s'])
+           - s['k21'] * (s['RAS_s'] / (s['Km'] + s['RAS_s']))),
 
-        # d(RAF_s)/dt = k34 * RAS_s - (knfb*NFB_s + k43) * RAF_s/(K43 + RAF_s)
+        # d(RAF_s)/dt = k34 * RAS_s * (1 - RAF_s) - (knfb*NFB_s + k43) * RAF_s/(Km + RAF_s)
         Eq(Derivative(s['RAF_s'], t),
-           s['k34'] * s['RAS_s']
-           - (s['knfb'] * s['NFB_s'] + s['k43']) * (s['RAF_s'] / (s['K43'] + s['RAF_s']))),
+           s['k34'] * s['RAS_s'] * (1 - s['RAF_s'])
+           - (s['knfb'] * s['NFB_s'] + s['k43']) * (s['RAF_s'] / (s['Km'] + s['RAF_s']))),
 
-        # d(MEK_s)/dt = k56 * RAF_s - k65 * MEK_s/(K65 + MEK_s)
+        # d(MEK_s)/dt = k56 * RAF_s * (1 - MEK_s) - k65 * MEK_s/(Km + MEK_s)
         Eq(Derivative(s['MEK_s'], t),
-           s['k56'] * s['RAF_s']
-           - s['k65'] * (s['MEK_s'] / (s['K65'] + s['MEK_s']))),
+           s['k56'] * s['RAF_s'] * (1 - s['MEK_s'])
+           - s['k65'] * (s['MEK_s'] / (s['Km'] + s['MEK_s']))),
 
-        # d(NFB_s)/dt = f12 * ERK_s - f21 * NFB_s/(F21 + NFB_s)
+        # d(NFB_s)/dt = f12 * ERK_s * (1 - NFB_s) - f21 * NFB_s/(Km + NFB_s)
         Eq(Derivative(s['NFB_s'], t),
-           s['f12'] * s['ERK_s']
-           - s['f21'] * (s['NFB_s'] / (s['F21'] + s['NFB_s']))),
+           s['f12'] * s['ERK_s'] * (1 - s['NFB_s'])
+           - s['f21'] * (s['NFB_s'] / (s['Km'] + s['NFB_s']))),
 
-        # d(ERK_s)/dt = k78 * MEK_s - k87 * ERK_s/(K87 + ERK_s)
+        # d(ERK_s)/dt = k78 * MEK_s * (1 - ERK_s) - k87 * ERK_s/(Km + ERK_s)
         Eq(Derivative(s['ERK_s'], t),
-           s['k78'] * s['MEK_s']
-           - s['k87'] * (s['ERK_s'] / (s['K87'] + s['ERK_s']))),
+           s['k78'] * s['MEK_s'] * (1 - s['ERK_s'])
+           - s['k87'] * (s['ERK_s'] / (s['Km'] + s['ERK_s']))),
     ]
 
     return {'base_equations': equations, 'symbols': symbols_dict, 'equations': equations}
@@ -95,9 +95,10 @@ if __name__ == "__main__":
     assert all(np.isfinite(dy))
     print(f"[PASS] make_numerical — dy = {[f'{v:.4f}' for v in dy]}")
 
-    # Test 3: RAS activation = light * k12 when RAS_s ≈ 0
-    # With all params=1, light=1: d(RAS_s)/dt = 1*1 - 1*(0.05/(1+0.05)) ≈ 0.952
-    assert dy[0] > 0.9
+    # Test 3: RAS activation with totals
+    # With all params=1, light=1, RAS_s=0.05:
+    # d(RAS_s)/dt = 1*1*(1-0.05) - 1*(0.05/(1+0.05)) ≈ 0.902
+    assert dy[0] > 0.8
     print(f"[PASS] RAS activation rate sanity — dy[0] = {dy[0]:.4f}")
 
     # Test 4: integration doesn't blow up
