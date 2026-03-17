@@ -18,4 +18,12 @@ dependencies = [
     "scipy>=1.12.0",
     "sympy>=1.13.0",
     "ipywidgets>=8.1.8",
+    "gymnasium>=1.2.3",
+    "stable-baselines3>=2.7.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "nbclient>=0.10.4",
 ]

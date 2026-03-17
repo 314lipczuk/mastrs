@@ -23,13 +23,12 @@ from model.mechanistic.egfr_simplified import (
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DRY_RUN = True
+DRY_RUN = False
 
 N_TOTAL = 10000
 N_PER_GENERATOR = N_TOTAL // 4
 T_MAX = 100.0
-DT = 0.1
-N_TIMEPOINTS = 500          # output resolution for trajectories
+N_TIMEPOINTS = 100 # output resolution for trajectories
 SEED = 42
 PARAMS_PATH = "egfr_params.json"
 OUTPUT_PATH = "synthetic_EGFR_data.parquet"
@@ -200,7 +199,7 @@ def plot_sample_trajectories(df, n=6, seed=0):
 
     axes[-1][0].set_xlabel("Time")
     plt.tight_layout()
-    plt.savefig("synthetic_sample_trajectories.png", dpi=150, bbox_inches="tight")
+    #plt.savefig("synthetic_sample_trajectories.png", dpi=150, bbox_inches="tight")
     plt.show()
     print(f"Plotted {len(sample)} sample trajectories")
 

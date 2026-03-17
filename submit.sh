@@ -32,7 +32,7 @@ mkdir -p "$(dirname "$OUT_NOTEBOOK")"
 KERNEL_NAME="masters-${SLURM_JOB_ID}"
 rm -rf ~/.local/share/jupyter/kernels/"$KERNEL_NAME"
 uv run python -m ipykernel install --user --name "$KERNEL_NAME"
-uv run papermill "$NOTEBOOK" "$OUT_NOTEBOOK" --no-progress-bar -k "$KERNEL_NAME"
+uv run papermill "$NOTEBOOK" "$OUT_NOTEBOOK" --no-progress-bar -k "$KERNEL_NAME" -p EXPERIMENT_NAME "$(basename "$NOTEBOOK" .ipynb)"
 
 echo "Job finished: $(date)"
 echo "Executed notebook: $OUT_NOTEBOOK"
