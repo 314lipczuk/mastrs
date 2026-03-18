@@ -24,6 +24,8 @@ dependencies = [
     "polars>=1.39.2",
     "umap-learn>=0.5.11",
     "wigglystuff>=0.2.39",
+    "pydantic-ai>=1.70.0",
+    "pydantic>=2.12.5",
 ]
 
 [dependency-groups]

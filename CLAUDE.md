@@ -38,6 +38,10 @@ Loads parquet microscopy data, computes CNR (cytoplasm-to-nucleus ratio as ERK b
 - Device inference is automatic (CUDA/MPS/CPU); never hardcode device strings.
 - **Save training results via `save_experiment()`** from `experiment.py`. This is the standard way to persist a complete training run (weights, configs, metrics, figures) to `results/<name>/`.
 
+## Notebook migration
+
+Migrating from Jupyter to marimo. New notebooks should be written as marimo notebooks (`.py` files with `@app.cell` decorators). Existing Jupyter notebooks in `notebooks/` will be converted incrementally — don't rewrite them proactively, but prefer marimo when creating new experiment notebooks.
+
 ## Documentation
 
 - `docs/exp_data_reference.md` — Parquet column schema and calibration tables
@@ -174,7 +178,7 @@ automatically resolve common formatting issues, and detect common pitfalls.
 
 ## Examples
 
-<example title="Markdown ccell">
+<example title="Markdown cell">
 ```
 @app.cell
 def _():
