@@ -4,17 +4,10 @@ import os
 
 
 notebooks_to_run = '''
-./notebooks/baseline_L3.ipynb
-./notebooks/higher_beta_later.ipynb
-./notebooks/L2_combination_beta_and_spectral.ipynb
-./notebooks/L3_combination_beta_and_spectral.ipynb
-./notebooks/L3_combination_lower_beta_and_higher_spectral.ipynb
-./notebooks/L3_combination_lower_beta_and_spectral.ipynb
-./notebooks/L3_nonVar_bet_spect.ipynb
-./notebooks/nonVariational_L3_L10_spectral_50.ipynb
-./notebooks/oscil_term_30.ipynb
-./notebooks/oscil_term_50.ipynb
-./notebooks/small_beta.ipynb
+./notebooks/synthetic_SV_AE_compression_H4-4_L2.ipynb
+./notebooks/synthetic_SV_AE_compression_H4-4_L3.ipynb
+./notebooks/synthetic_SV_AE_compression_H8-4_L2.ipynb
+./notebooks/synthetic_SV_AE_compression_H8-4_L3.ipynb
 '''.split()
 
 
