@@ -9,24 +9,27 @@ def _():
     import marimo as mo
     import socket
     from pathlib import Path
+    import os
+    import getpass
 
-    return Path, mo, socket
+    return Path, getpass, mo
 
 
 @app.cell
-def _(Path, mo, socket):
-    hostname = socket.gethostname()
+def _(Path, getpass, mo):
+    hostname = getpass.getuser()
+
     is_cluster = not hostname.startswith("polya")
     env_label = f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
 
     results_sources = {
         "Local": str(Path.cwd() / "results"),
-        "Cluster (mounted)": str(Path.home() / "mnt" / "cluster_results"),
+        "Kingston": str('/Volumes/imaging.data/ppilip/results/models')
     }
 
     source_selector = mo.ui.dropdown(
         options=list(results_sources.keys()),
-        value="Local",
+        value="Kingston",
         label="Results source",
     )
 
@@ -147,24 +150,38 @@ def _(bundle, mo):
             "### Warnings\n" + "\n".join(f"- {w}" for w in bundle.warnings)
         ))
     mo.vstack(parts)
-    return (plt,)
+    return
 
 
 @app.cell
-def _(bundle, mo, plt):
-    fig_items = {}
-    for fig_name, fig_data in bundle.figures.items():
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.imshow(fig_data)
-        ax.set_axis_off()
-        ax.set_title(fig_name.replace("_", " ").title())
-        fig.tight_layout()
-        fig_items[fig_name] = fig
+def show_experiment_figures(experiment_dropdown, mo, results_path):
+    import base64
 
-    mo.vstack([
-        mo.md("## Figures"),
-        mo.tabs(fig_items),
-    ])
+    _fig_dir = results_path / experiment_dropdown.value / "figures"
+    _pngs = sorted(_fig_dir.glob("*.png")) if _fig_dir.is_dir() else []
+
+    if not _pngs:
+        mo.stop(True, mo.md("No figures found."))
+
+    _cards = []
+    for _png in _pngs:
+        _b64 = base64.b64encode(_png.read_bytes()).decode()
+        _label = _png.stem.replace("_", " ").title()
+        _cards.append(
+            mo.md(f"""
+    **{_label}**
+
+    <img src="data:image/png;base64,{_b64}" style="width:100%; border-radius:6px;" />
+    """)
+        )
+
+    _cols = min(len(_cards), 2)
+    _rows = [
+        mo.hstack(_cards[i : i + _cols], widths="equal", gap=1)
+        for i in range(0, len(_cards), _cols)
+    ]
+
+    mo.vstack([mo.md("## Figures"), *_rows])
     return
 
 
