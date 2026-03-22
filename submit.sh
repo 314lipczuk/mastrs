@@ -21,6 +21,6 @@ echo "GPU        : $(nvidia-smi --query-gpu=name,memory.total --format=csv,nohea
 echo "══════════════════════════════════════════════════════"
 
 uv sync
-uv run marimo run "$NOTEBOOK" -- --name "$NAME" "$@"
+uv run marimo run "$NOTEBOOK" -- --port 0 --name "$NAME" "$@"
 
 echo "Job finished: $(date)"

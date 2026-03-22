@@ -1,10 +1,10 @@
 import marimo
 
 __generated_with = "0.21.1"
-app = marimo.App(width="medium")
+app = marimo.App(width="columns")
 
 
-@app.cell
+@app.cell(column=0)
 def _():
     import marimo as mo
     import socket
@@ -71,34 +71,12 @@ def _(Path, mo, results_sources, source_selector):
 
 @app.cell
 def _(experiment_dropdown, load_button, mo, results_path):
-    import torch
-    import matplotlib.image as mpimg
     from experiment import ExperimentBundle
 
     mo.stop(not load_button.value, mo.md("Select an experiment and click **Load experiment**."))
 
     _exp_dir = results_path / experiment_dropdown.value
-    _pt_files = sorted(_exp_dir.glob("*.pt"))
-    _data = torch.load(_pt_files[0], map_location="cpu", weights_only=False)
-
-    _figures = {}
-    _fig_dir = _exp_dir / "figures"
-    if _fig_dir.is_dir():
-        for _png in sorted(_fig_dir.glob("*.png")):
-            _figures[_png.stem] = mpimg.imread(str(_png))
-
-    bundle = ExperimentBundle(
-        name=_data.get("name", _exp_dir.name),
-        timestamp=_data.get("timestamp", "unknown"),
-        model_type=_data.get("model_type", ""),
-        model_config=_data.get("model_config", {}),
-        model_state_dict=_data.get("model_state_dict"),
-        training_config=_data.get("training_config", {}),
-        training_results=_data.get("training_results", {}),
-        metrics=_data.get("metrics", {}),
-        figures=_figures,
-        normalization=_data.get("normalization"),
-    )
+    bundle = ExperimentBundle.load(str(_exp_dir))
     return (bundle,)
 
 
@@ -182,6 +160,21 @@ def show_experiment_figures(experiment_dropdown, mo, results_path):
     ]
 
     mo.vstack([mo.md("## Figures"), *_rows])
+    return
+
+
+@app.cell
+def _(bundle, mo):
+    from interactive_viz import get_views
+
+    views = get_views(bundle)
+    mo.stop(not views, mo.md("_No interactive visualizations available for this model._"))
+    mo.vstack([mo.md("## Interactive Visualizations"), mo.ui.tabs(views)])
+    return
+
+
+@app.cell(column=1)
+def _():
     return
 
 

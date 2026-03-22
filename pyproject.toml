@@ -26,6 +26,8 @@ dependencies = [
     "wigglystuff>=0.2.39",
     "pydantic-ai>=1.70.0",
     "pydantic>=2.12.5",
+    "altair>=6.0.0",
+    "plotly>=6.6.0",
 ]
 
 [dependency-groups]

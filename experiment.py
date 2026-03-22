@@ -59,6 +59,80 @@ def _resolve_model_class(model_type: str) -> type:
     return getattr(module, class_name)
 
 
+def _infer_config_from_state_dict(state_dict: dict) -> dict:
+    """Best-effort inference of model config from state_dict weight shapes.
+
+    Detects MLP autoencoders (encoder.net.N.weight) vs Conv1d conditional
+    models (encoder.net.N.conv.weight + decoder.stim_net) and extracts
+    latent_dim, hidden_dims/hidden_dim, input_dim, in_channels, stim_channels.
+    """
+    keys = set(state_dict.keys())
+    config: dict = {}
+
+    is_conv = any("conv.weight" in k for k in keys)
+
+    if is_conv:
+        # Conv1d architecture (ConditionalBetaVAE / ConditionalAE / BetaVAE)
+        # hidden_dim from first encoder conv
+        first_conv = state_dict.get("encoder.net.0.conv.weight")
+        if first_conv is not None:
+            config["hidden_dim"] = first_conv.shape[0]
+            config["in_channels"] = first_conv.shape[1]
+
+        # latent_dim from fc_mu (VAE) or fc (AE)
+        if "encoder.fc_mu.weight" in keys:
+            config["latent_dim"] = state_dict["encoder.fc_mu.weight"].shape[0]
+        elif "encoder.fc.weight" in keys:
+            config["latent_dim"] = state_dict["encoder.fc.weight"].shape[0]
+
+        # stim_channels from decoder.stim_net (conditional models)
+        stim_conv = state_dict.get("decoder.stim_net.0.conv.weight")
+        if stim_conv is not None:
+            config["stim_channels"] = stim_conv.shape[1]
+    else:
+        # MLP architecture (AutoEncoder / VAE)
+        # Extract layer sizes: encoder.net.0.weight, encoder.net.2.weight, ...
+        enc_weights = sorted(
+            [(k, v) for k, v in state_dict.items()
+             if k.startswith("encoder.net.") and k.endswith(".weight")],
+            key=lambda x: x[0],
+        )
+        if enc_weights:
+            config["input_dim"] = enc_weights[0][1].shape[1]
+            config["latent_dim"] = enc_weights[-1][1].shape[0]
+            hidden_dims = tuple(w.shape[0] for _, w in enc_weights[:-1])
+            if hidden_dims:
+                config["hidden_dims"] = hidden_dims
+
+        # Detect VAE: has fc_mu / fc_logvar
+        if "encoder.fc_mu.weight" in keys:
+            config["latent_dim"] = state_dict["encoder.fc_mu.weight"].shape[0]
+
+    return config
+
+
+def _infer_model_type_from_state_dict(state_dict: dict) -> str:
+    """Best-effort inference of fully qualified model class from state_dict keys."""
+    keys = set(state_dict.keys())
+    is_conv = any("conv.weight" in k for k in keys)
+    has_fc_mu = "encoder.fc_mu.weight" in keys
+    has_stim_net = any(k.startswith("decoder.stim_net.") for k in keys)
+
+    if is_conv:
+        if has_stim_net and has_fc_mu:
+            return "model.dl.cvae.ConditionalBetaVAE"
+        elif has_stim_net:
+            return "model.dl.cae.ConditionalAE"
+        elif has_fc_mu:
+            return "model.dl.vae.BetaVAE"
+    else:
+        if has_fc_mu:
+            return "model.dl.vae.VAE"
+        else:
+            return "model.dl.ae.AutoEncoder"
+    return ""
+
+
 def _prepare_config_for_save(model_config: dict) -> dict:
     """Convert non-serializable config values (e.g. activation classes) to strings."""
     out = {}
@@ -178,15 +252,12 @@ class ExperimentBundle:
         d = Path(directory)
         warnings: list[str] = []
 
-        # Load bundle.pt
         bundle_path = d / "bundle.pt"
-        if not bundle_path.exists():
-            raise FileNotFoundError(
-                f"No bundle.pt found in {directory}. "
-                f"This directory may use an older save format."
-            )
-
-        data = torch.load(bundle_path, map_location="cpu", weights_only=False)
+        if bundle_path.exists():
+            data = torch.load(bundle_path, map_location="cpu", weights_only=False)
+        else:
+            # Legacy format: model_*.pt + metrics.npz + scalars.json
+            data = cls._load_legacy(d, warnings)
 
         # Load figures from PNGs (best-effort)
         figures: dict[str, np.ndarray] = {}
@@ -198,8 +269,14 @@ class ExperimentBundle:
                 except Exception as e:
                     warnings.append(f"Could not load figure '{png.name}': {e}")
 
-        # Validate model class is importable
+        # Infer model_type from state_dict if missing
         model_type = data.get("model_type", "")
+        model_state_dict = data.get("model_state_dict")
+        if not model_type and model_state_dict:
+            model_type = _infer_model_type_from_state_dict(model_state_dict)
+            if model_type:
+                warnings.append(f"Inferred model_type from state_dict: {model_type}")
+
         if model_type:
             try:
                 _resolve_model_class(model_type)
@@ -211,15 +288,26 @@ class ExperimentBundle:
                 )
 
         # Validate state dict is loadable (basic shape check deferred to reconstruct_model)
-        model_state_dict = data.get("model_state_dict")
         if model_state_dict is None:
             warnings.append("No model_state_dict found in bundle. Model reconstruction not possible.")
+
+        # Impute missing model_config from state_dict shapes
+        model_config = data.get("model_config", {})
+        if model_state_dict and not model_config.get("latent_dim"):
+            inferred = _infer_config_from_state_dict(model_state_dict)
+            for k, v in inferred.items():
+                if k not in model_config:
+                    model_config[k] = v
+            if inferred:
+                warnings.append(
+                    f"Inferred model_config from state_dict: {inferred}"
+                )
 
         return cls(
             name=data.get("name", d.name),
             timestamp=data.get("timestamp", "unknown"),
             model_type=model_type,
-            model_config=data.get("model_config", {}),
+            model_config=model_config,
             model_state_dict=model_state_dict,
             training_config=data.get("training_config", {}),
             training_results=data.get("training_results", {}),
@@ -228,6 +316,62 @@ class ExperimentBundle:
             normalization=data.get("normalization"),
             warnings=warnings,
         )
+
+    @staticmethod
+    def _load_legacy(d: Path, warnings: list[str]) -> dict:
+        """Load from the legacy format: model_*.pt + metrics.npz + scalars.json."""
+        import json
+
+        # Find the .pt checkpoint (use the latest one)
+        pt_files = sorted(d.glob("*.pt"))
+        if not pt_files:
+            raise FileNotFoundError(
+                f"No .pt files found in {d}. Cannot load experiment."
+            )
+        checkpoint = torch.load(pt_files[-1], map_location="cpu", weights_only=False)
+
+        # Build model_config from the legacy 'config' key
+        config = checkpoint.get("config", {})
+        training_kwargs = checkpoint.get("training_kwargs", {})
+
+        # Merge metrics from scalars.json and metrics.npz
+        metrics: dict = {}
+        scalars_path = d / "scalars.json"
+        if scalars_path.exists():
+            with open(scalars_path) as f:
+                metrics.update(json.load(f))
+        npz_path = d / "metrics.npz"
+        if npz_path.exists():
+            npz = np.load(npz_path, allow_pickle=True)
+            metrics.update({k: npz[k] for k in npz.files})
+
+        # Build training_results from history
+        training_results: dict = {}
+        if "history" in checkpoint:
+            training_results["history"] = checkpoint["history"]
+        if "train_elapsed_s" in checkpoint:
+            training_results["train_elapsed_s"] = checkpoint["train_elapsed_s"]
+
+        # Build normalization
+        normalization = None
+        if "erk_mu" in checkpoint or "erk_sigma" in checkpoint:
+            normalization = {}
+            if "erk_mu" in checkpoint:
+                normalization["erk_mu"] = checkpoint["erk_mu"]
+            if "erk_sigma" in checkpoint:
+                normalization["erk_sigma"] = checkpoint["erk_sigma"]
+
+        return {
+            "name": d.name,
+            "timestamp": checkpoint.get("train_start", "unknown"),
+            "model_type": "",
+            "model_config": config,
+            "model_state_dict": checkpoint.get("model_state_dict"),
+            "training_config": training_kwargs,
+            "training_results": training_results,
+            "metrics": metrics,
+            "normalization": normalization,
+        }
 
     def reconstruct_model(self) -> nn.Module:
         """Instantiate the model class, load weights, return in eval mode.
