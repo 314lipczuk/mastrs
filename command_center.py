@@ -1,10 +1,10 @@
 import marimo
 
 __generated_with = "0.21.1"
-app = marimo.App(width="columns")
+app = marimo.App(width="full")
 
 
-@app.cell(column=0)
+@app.cell
 def _():
     import marimo as mo
     import socket
@@ -170,11 +170,6 @@ def _(bundle, mo):
     views = get_views(bundle)
     mo.stop(not views, mo.md("_No interactive visualizations available for this model._"))
     mo.vstack([mo.md("## Interactive Visualizations"), mo.ui.tabs(views)])
-    return
-
-
-@app.cell(column=1)
-def _():
     return
 
 
