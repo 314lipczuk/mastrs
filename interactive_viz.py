@@ -228,6 +228,7 @@ def render_trajectory_explorer(bundle: ExperimentBundle) -> Any:
             s = local_idx * traj_len
             e = s + traj_len
             orig = test_split.states[s:e]  # (traj_len, n_vars)
+            light = test_split.light[s:e]  # (traj_len,)
             x = torch.tensor(orig, dtype=torch.float32).to(device)
             recon, z = model(x)
             recon = recon.cpu().numpy()
@@ -235,7 +236,7 @@ def render_trajectory_explorer(bundle: ExperimentBundle) -> Any:
             traj_label = int(test_split.traj_ids[local_idx])
 
             for t in range(traj_len):
-                row: dict[str, Any] = {"traj_id": traj_label, "timepoint": t}
+                row: dict[str, Any] = {"traj_id": traj_label, "timepoint": t, "light": float(light[t])}
                 for d in range(z.shape[1]):
                     row[f"z{d}"] = float(z[t, d])
                 for vi, name in enumerate(state_names):
@@ -311,6 +312,15 @@ def render_trajectory_explorer(bundle: ExperimentBundle) -> Any:
             (line + rule).properties(width=chart_width, height=small_height)
         )
 
+    # --- Light stimulus pattern ---
+    light_chart = (
+        base.mark_line(color="#f5a623", strokeWidth=1.5).encode(
+            x=alt.X("timepoint:Q", title=""),
+            y=alt.Y("light:Q", title="light"),
+            tooltip=["timepoint:Q", alt.Tooltip("light:Q", format=".2f")],
+        ) + rule
+    ).properties(width=chart_width, height=small_height, title="Light stimulus")
+
     # --- State variable plots: original (black) + reconstructed (red dashed) ---
     state_charts = []
     for name in state_names:
@@ -327,12 +337,12 @@ def render_trajectory_explorer(bundle: ExperimentBundle) -> Any:
         c = (orig_line + rec_line + rule).properties(width=chart_width, height=small_height)
         state_charts.append(c)
 
-    # --- Layout: left column (latent path + latent time), right column (state space) ---
+    # --- Layout: left column (latent path + latent time), right column (light + state space) ---
     left_column = alt.vconcat(
         alt.hconcat(*path_charts).properties(title="Latent trajectory"),
         *latent_time_charts,
     )
-    right_column = alt.vconcat(*state_charts).properties(
+    right_column = alt.vconcat(light_chart, *state_charts).properties(
         title="State space: original (black) vs reconstructed (red dashed)"
     )
 

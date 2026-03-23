@@ -32,6 +32,7 @@ DEFAULT_PARQUET = "synthetic_EGFR_data.parquet"
 class StateSplit:
     """One split (train/val/test) of the state-space dataset."""
     states: np.ndarray       # (N_timepoints, n_vars) — all timepoints concatenated
+    light: np.ndarray        # (N_timepoints,) — light stimulus per timepoint
     traj_lengths: np.ndarray  # (n_trajectories,) — length of each trajectory
     traj_ids: np.ndarray      # (n_trajectories,) — original row indices in the parquet
 
@@ -59,6 +60,7 @@ def load_synthetic_states(
     all_states = np.stack(
         [np.concatenate(df[c].values) for c in STATE_COLS], axis=1
     ).astype(np.float32)
+    all_light = np.concatenate(df["light"].values).astype(np.float32)
 
     traj_len = len(df[STATE_COLS[0]].iloc[0])
 
@@ -72,6 +74,7 @@ def load_synthetic_states(
         )
         return StateSplit(
             states=all_states[idx],
+            light=all_light[idx],
             traj_lengths=np.full(len(ids), traj_len),
             traj_ids=ids,
         )
