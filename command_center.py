@@ -1,10 +1,10 @@
 import marimo
 
 __generated_with = "0.21.1"
-app = marimo.App(width="full")
+app = marimo.App(width="columns")
 
 
-@app.cell
+@app.cell(column=0)
 def _():
     import marimo as mo
     import socket
@@ -15,7 +15,7 @@ def _():
     return Path, getpass, mo
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(Path, getpass, mo):
     hostname = getpass.getuser()
 
@@ -40,7 +40,7 @@ def _(Path, getpass, mo):
     return results_sources, source_selector
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(Path, mo, results_sources, source_selector):
     results_path = Path(results_sources[source_selector.value])
 
@@ -69,7 +69,7 @@ def _(Path, mo, results_sources, source_selector):
     return experiment_dropdown, load_button, results_path
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(experiment_dropdown, load_button, mo, results_path):
     from experiment import ExperimentBundle
 
@@ -80,7 +80,7 @@ def _(experiment_dropdown, load_button, mo, results_path):
     return (bundle,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(bundle, mo):
     import matplotlib.pyplot as plt
     import numpy as np
@@ -131,7 +131,7 @@ def _(bundle, mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def show_experiment_figures(experiment_dropdown, mo, results_path):
     import base64
 
@@ -163,13 +163,41 @@ def show_experiment_figures(experiment_dropdown, mo, results_path):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(bundle, mo):
     from interactive_viz import get_views
 
     views = get_views(bundle)
     mo.stop(not views, mo.md("_No interactive visualizations available for this model._"))
     mo.vstack([mo.md("## Interactive Visualizations"), mo.ui.tabs(views)])
+    return
+
+
+@app.cell(column=1, hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Mechanistic model
+
+    Simplified EGFR → RAS → RAF → MEK → ERK cascade with negative feedback. Simplifications used in the `equation` field of `eq_desc`:
+
+    - **5-node lumped cascade** — the full EGFR signaling network is collapsed into five active-fraction states: RAS, RAF, MEK, NFB, ERK
+    - **Total protein conservation** — each node is normalized so Active + Inactive = 1; activation is proportional to the inactive pool `(1 - X_s)`, removing the need for separate inactive-state ODEs (but restricting any state from reaching values below or equal 0, at every timestep we take $max(1e-3 ,x)$)
+    - **Single shared Km** — all Michaelis-Menten deactivation terms share one saturation constant, reducing the parameter count
+    - **Mass-action activation, MM deactivation** — forward activation is linear (rate × upstream × inactive pool), while deactivation uses saturating Michaelis-Menten kinetics `X_s / (Km + X_s)`
+    - **Explicit NFB intermediate** — ERK-driven negative feedback on RAF goes through a dedicated NFB state variable rather than a direct algebraic term, introducing a time delay in the feedback loop
+    - **Light as direct RAS input** — optogenetic stimulation enters only through the RAS activation term (`light × k12 × (1 - RAS_s)`), treating upstream receptor dynamics as instantaneous
+
+    There are many things wrong in this model, but it is simple enough to capture some general trends;
+    However, one thing that might be too much to overlook even in the simple model is light being directly wired; Maybe it should get treated like an MM term? Explicit saturation based on some theoretical limits?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    import model.mechanistic.egfr_simplified as es
+    eq_desc = es.model_eqs(es.PARAM_NAMES, es.STATE_NAMES)
+    eq_desc
     return
 
 
