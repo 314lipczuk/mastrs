@@ -10,3 +10,9 @@ extra
 *.zip
 *.gif
 .DS_Store
+results
+*.png
+DS_Store
+./notebooks/.DS_Store
+docs
+*.md
