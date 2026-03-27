@@ -209,6 +209,84 @@ def add_stim_features(df, window_min=5, ewma_alpha_fast=0.5, ewma_alpha_slow=0.1
 
     return df
 
+def augment(df, baseline_frames=10, responder_sigma=2.0):
+    """Add per-cell baseline decomposition, sensitivity, and responder columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Long-format dataset produced by ``load_and_clean`` (must have
+        ``uid``, ``frame``, ``cnr_median_norm``, ``median_intensity_C1_ring``,
+        ``median_intensity_C1_nuc``, ``fluence_mJ_cm2``, ``energy_uJ``,
+        ``ewma_slow``).
+    baseline_frames : int
+        Number of initial frames (0 .. baseline_frames-1) used to compute
+        per-cell baselines (default 10).
+    responder_sigma : float
+        A cell is classified as a responder when its amplitude exceeds
+        ``responder_sigma`` × baseline noise std (default 2.0).
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of *df* with the following columns added:
+
+        Per-cell scalars (broadcast to every row):
+            baseline_ring, baseline_nuc, peak_cnr, amplitude,
+            total_fluence, total_energy, sensitivity_fluence,
+            sensitivity_energy, responder
+
+        Per-timepoint:
+            delta_cnr, sensitivity_ewma
+    """
+    df = df.copy()
+    bl = df.loc[df["frame"] < baseline_frames]
+
+    # --- 1. Baseline decomposition (per-cell) ------------------------------
+    baseline_ring = bl.groupby("uid")["median_intensity_C1_ring"].median()
+    baseline_nuc = bl.groupby("uid")["median_intensity_C1_nuc"].median()
+    df["baseline_ring"] = df["uid"].map(baseline_ring)
+    df["baseline_nuc"] = df["uid"].map(baseline_nuc)
+
+    # --- 2. Peak / amplitude (per-cell) ------------------------------------
+    peak_cnr = df.groupby("uid")["cnr_median_norm"].max()
+    df["peak_cnr"] = df["uid"].map(peak_cnr)
+    df["amplitude"] = df["peak_cnr"] - 1.0
+
+    # --- 3. Total dose (per-cell) ------------------------------------------
+    total_fluence = df.groupby("uid")["fluence_mJ_cm2"].sum()
+    total_energy = df.groupby("uid")["energy_uJ"].sum()
+    df["total_fluence"] = df["uid"].map(total_fluence)
+    df["total_energy"] = df["uid"].map(total_energy)
+
+    # --- 4. Dose-response sensitivity (per-cell) --------------------------
+    df["sensitivity_fluence"] = np.where(
+        df["total_fluence"] > 0,
+        df["amplitude"] / df["total_fluence"],
+        np.nan,
+    )
+    df["sensitivity_energy"] = np.where(
+        df["total_energy"] > 0,
+        df["amplitude"] / df["total_energy"],
+        np.nan,
+    )
+
+    # --- 5. Per-timepoint sensitivity --------------------------------------
+    df["delta_cnr"] = df["cnr_median_norm"] - 1.0
+    df["sensitivity_ewma"] = np.where(
+        df["ewma_slow"] > 0,
+        df["delta_cnr"] / df["ewma_slow"],
+        np.nan,
+    )
+
+    # --- 6. Responder classification (per-cell) ----------------------------
+    baseline_noise_std = bl["cnr_median_norm"].std()
+    threshold = responder_sigma * baseline_noise_std
+    df["responder"] = df["amplitude"] > threshold
+
+    return df
+
+
 DEFAULT_STIM_COLS = ["u_t", "m_t", "recency", "ewma_fast", "ewma_slow",
                      "n_5", "slope_5", "burst_pos", "s_cum"]
 
