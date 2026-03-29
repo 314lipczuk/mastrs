@@ -4,7 +4,7 @@ __generated_with = "0.21.1"
 app = marimo.App(width="columns")
 
 
-@app.cell(column=0)
+@app.cell(column=0, hide_code=True)
 def _():
     import marimo as mo
     import numpy as np
@@ -24,14 +24,14 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(augment, pd):
     df = augment(pd.read_parquet('dataset.parquet'))
     df.info()
     return (df,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(df, plt):
     df['median_cnr_0_9'].hist(bins=50)
     plt.xlabel('median CNR (frames 0-9)')
@@ -406,6 +406,116 @@ def _(df, np, plt):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
+    ## Feature correlations
+
+    Spearman correlations between the five features available in real data,
+    computed on baseline frames (0–9) to avoid stimulation-driven covariance.
+    Density = number of cell neighbours within an 80-pixel radius.
+    """)
+    return
+
+
+@app.cell
+def _(df, np, pd):
+    from scipy.spatial import cKDTree as _cKDTree
+
+    _RADIUS = 1000  # pixels
+
+    _baseline = df[df['frame'] < 10].copy()
+
+    def _count_nb(grp):
+        xy = grp[['x', 'y']].values
+        if len(xy) < 2:
+            return pd.Series(np.zeros(len(grp), dtype=int), index=grp.index)
+        tree = _cKDTree(xy)
+        counts = tree.query_ball_point(xy, r=_RADIUS, return_length=True) - 1
+        return pd.Series(counts, index=grp.index)
+
+    _nb = _baseline.groupby(['fov', 'frame'], group_keys=False).apply(_count_nb)
+    _baseline = _baseline.assign(neighbour_count=_nb)
+
+    _feat_cols = {
+        'cnr_median_norm':         'CNR',
+        'median_intensity_C1_nuc': 'Nuc intensity',
+        'median_intensity_C1_ring':'Cyt intensity',
+        'area':                    'Area',
+        'neighbour_count':         'Density',
+    }
+    corr_features = (
+        _baseline.groupby('uid')[list(_feat_cols.keys())].median()
+        .rename(columns=_feat_cols)
+        .dropna()
+    )
+    corr_matrix = corr_features.corr(method='spearman')
+    return corr_features, corr_matrix
+
+
+@app.cell
+def _(corr_features, corr_matrix, plt):
+    import matplotlib.gridspec as _gs
+
+    _cols = list(corr_matrix.columns)
+    _n = len(_cols)
+    _data = corr_features.values
+
+    _fig = plt.figure(figsize=(20, 8))
+    _outer = _gs.GridSpec(1, 2, figure=_fig, width_ratios=[1, 1.8], wspace=0.25)
+
+    # --- annotated heatmap ---
+    _ax_h = _fig.add_subplot(_outer[0])
+    _im = _ax_h.imshow(corr_matrix.values, vmin=-1, vmax=1, cmap='RdBu_r')
+    _ax_h.set_xticks(range(_n))
+    _ax_h.set_yticks(range(_n))
+    _ax_h.set_xticklabels(_cols, rotation=40, ha='right', fontsize=9)
+    _ax_h.set_yticklabels(_cols, fontsize=9)
+    for _i in range(_n):
+        for _j in range(_n):
+            _v = corr_matrix.values[_i, _j]
+            _ax_h.text(_j, _i, f'{_v:.2f}', ha='center', va='center',
+                       fontsize=8, color='white' if abs(_v) > 0.5 else 'black')
+    _fig.colorbar(_im, ax=_ax_h, fraction=0.046, pad=0.04, label='Spearman r')
+    _ax_h.set_title('Spearman r  (baseline frames 0–9, per-cell median)', fontsize=10)
+
+    # --- scatter matrix (lower=scatter, diag=hist, upper=r text) ---
+    _inner = _gs.GridSpecFromSubplotSpec(_n, _n, subplot_spec=_outer[1], hspace=0.08, wspace=0.08)
+    for _i in range(_n):
+        for _j in range(_n):
+            _ax_s = _fig.add_subplot(_inner[_i, _j])
+            if _i == _j:
+                _col = _data[:, _i]
+                try:
+                    _ax_s.hist(_col, bins=25, color='steelblue', alpha=0.7, lw=0)
+                except ValueError:
+                    _ax_s.axvline(_col.mean(), color='steelblue', lw=2)
+            elif _i > _j:
+                _ax_s.scatter(_data[:, _j], _data[:, _i],
+                               s=2, alpha=0.2, color='steelblue', rasterized=True)
+            else:
+                _v = corr_matrix.values[_i, _j]
+                _rgba = plt.cm.RdBu_r((_v + 1) / 2)
+                _ax_s.set_facecolor((*_rgba[:3], 0.15))
+                _ax_s.text(0.5, 0.5, f'r={_v:.2f}', ha='center', va='center',
+                            transform=_ax_s.transAxes, fontsize=8,
+                            fontweight='bold' if abs(_v) > 0.3 else 'normal',
+                            color='crimson' if abs(_v) > 0.3 else 'gray')
+            _ax_s.tick_params(labelsize=5, length=2)
+            if _j > 0:
+                _ax_s.set_yticks([])
+            if _i < _n - 1:
+                _ax_s.set_xticks([])
+            if _j == 0:
+                _ax_s.set_ylabel(_cols[_i], fontsize=7)
+            if _i == _n - 1:
+                _ax_s.set_xlabel(_cols[_j], fontsize=7)
+
+    _fig.suptitle('Feature correlation analysis', fontsize=12, y=1.01)
+    _fig
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
     # Stochastic EGFR cascade simulator
 
     Same RAS → RAF → MEK → ERK cascade with negative feedback as in `model/mechanistic/egfr_simplified.py`,
@@ -423,14 +533,15 @@ def _(np):
 
     def egfr_system(t, y, params, K, light_fn):
         RAS, RAF, MEK, NFB, ERK = y
+        K_RAS, K_RAF, K_MEK, K_NFB, K_ERK = K
         Km, k12, k21, k34, knfb, k43, k56, k65, k78, k87, f12, f21 = params
         light = light_fn(t)
 
-        dRAS = light * k12 * (K - RAS) - k21 * (RAS / (Km + RAS))
-        dRAF = k34 * RAS * (K - RAF) - (knfb * NFB + k43) * (RAF / (Km + RAF))
-        dMEK = k56 * RAF * (K - MEK) - k65 * (MEK / (Km + MEK))
-        dNFB = f12 * ERK * (K - NFB) - f21 * (NFB / (Km + NFB))
-        dERK = k78 * MEK * (K - ERK) - k87 * (ERK / (Km + ERK))
+        dRAS = light * k12 * (K_RAS - RAS) - k21 * (RAS / (Km + RAS))
+        dRAF = k34 * RAS * (K_RAF - RAF) - (knfb * NFB + k43) * (RAF / (Km + RAF))
+        dMEK = k56 * RAF * (K_MEK - MEK) - k65 * (MEK / (Km + MEK))
+        dNFB = f12 * ERK * (K_NFB - NFB) - f21 * (NFB / (Km + NFB))
+        dERK = k78 * MEK * (K_ERK - ERK) - k87 * (ERK / (Km + ERK))
         return [dRAS, dRAF, dMEK, dNFB, dERK]
 
     DEFAULT_PARAMS = np.array([
@@ -453,7 +564,7 @@ def _(np):
 
         sigma_sq = np.log(1 + (K_std / K_mean) ** 2)
         mu = np.log(K_mean) - sigma_sq / 2
-        K_values = rng.lognormal(mean=mu, sigma=np.sqrt(sigma_sq), size=n_cells)
+        K_values = rng.lognormal(mean=mu, sigma=np.sqrt(sigma_sq), size=(n_cells, 5))
 
         times = np.arange(0, t_max, dt)
         y0 = [0.05, 0.05, 0.05, 0.05, 0.05]
@@ -477,6 +588,65 @@ def _(np):
 
 
 @app.cell(column=1)
+def _(
+    np,
+    plt,
+    sim_erk_mean,
+    sim_erk_noisy,
+    sim_erk_std,
+    sim_light_pattern,
+    sim_times,
+):
+    _fig, _axes = plt.subplots(1, 2, figsize=(18, 5))
+
+    # ERK trajectories: noisy individual traces, clean population mean
+    _ax = _axes[0]
+    for _i in range(sim_erk_noisy.shape[0]):
+        _ax.plot(sim_times, sim_erk_noisy[_i], color='steelblue', alpha=0.15, lw=0.5)
+    _ax.plot(sim_times, sim_erk_mean, color='navy', lw=2, label='mean (clean)')
+    _ax.fill_between(
+        sim_times,
+        np.maximum(sim_erk_mean - sim_erk_std, 0),
+        sim_erk_mean + sim_erk_std,
+        alpha=0.3, color='navy', label='±1 std',
+    )
+    _ax.set_xlabel('time (s)')
+    _ax.set_ylabel('ERK readout')
+    _ax.set_title(f'Simulated ERK trajectories (n={sim_erk_noisy.shape[0]})')
+    _ax.legend(fontsize=8)
+
+    # # K distribution (one per state variable)
+    # _ax = _axes[1]
+    # _state_names = ['RAS', 'RAF', 'MEK', 'NFB', 'ERK']
+    # _kcolors = ['#e41a1c', '#ff7f00', '#4daf4a', '#984ea3', '#377eb8']
+    # for _j, (_name, _col) in enumerate(zip(_state_names, _kcolors)):
+    #     _ax.hist(sim_K_values[:, _j], bins=30, edgecolor='white', alpha=0.5, color=_col, label=_name)
+    # _ax.set_xlabel('K (total kinase concentration)')
+    # _ax.set_ylabel('cells')
+    # _ax.set_title('Sampled K distributions per state variable')
+    # _ax.legend(fontsize=8)
+
+    # Light stimulus
+    _ax = _axes[1]
+    _light_signal = np.array([
+        (1.0 if sim_light_pattern.value == "constant" else
+         (1.0 if 10.0 <= t <= 40.0 else 0.0) if sim_light_pattern.value == "pulse" else
+         min(t / 30.0, 1.0) if t <= 60.0 else 0.0)
+        for t in sim_times
+    ])
+    _ax.fill_between(sim_times, _light_signal, alpha=0.3, color='gold')
+    _ax.plot(sim_times, _light_signal, color='orange', lw=1.5)
+    _ax.set_xlabel('time (s)')
+    _ax.set_ylabel('light intensity')
+    _ax.set_title('Light stimulus')
+    _ax.set_ylim(-0.05, 1.2)
+
+    _fig.tight_layout()
+    _fig
+    return
+
+
+@app.cell(hide_code=True)
 def _(mo):
     sim_n_cells = mo.ui.slider(10, 200, value=50, step=10, label="Number of cells")
     sim_K_mean = mo.ui.slider(0.5, 2.0, value=1.0, step=0.05, label="K mean")
@@ -490,7 +660,19 @@ def _(mo):
     return sim_K_mean, sim_K_std, sim_light_pattern, sim_n_cells
 
 
-@app.cell
+@app.cell(hide_code=True)
+def _(dataset_noise, mo, trajectory_noise):
+    noise_jitter_scale = mo.ui.slider(0.0, 3.0, value=1.0, step=0.1,
+        label=f"Jitter scale  (×dataset σ={dataset_noise:.4f})")
+    noise_baseline_scale = mo.ui.slider(0.0, 3.0, value=1.0, step=0.1,
+        label=f"Baseline shift scale  (×traj median σ={trajectory_noise.median():.4f})")
+    noise_jitter_timescale = mo.ui.slider(1, 50, value=10, step=1,
+        label="Jitter timescale (frames)")
+    mo.hstack([noise_jitter_scale, noise_baseline_scale, noise_jitter_timescale])
+    return noise_baseline_scale, noise_jitter_scale, noise_jitter_timescale
+
+
+@app.cell(hide_code=True)
 def _(
     DEFAULT_PARAMS,
     np,
@@ -525,65 +707,29 @@ def _(
     sim_erk = sim_trajectories[:, 4, :]
     sim_erk_mean = np.nanmean(sim_erk, axis=0)
     sim_erk_std = np.nanstd(sim_erk, axis=0)
-    return sim_K_values, sim_erk, sim_erk_mean, sim_erk_std, sim_times
+    return sim_erk, sim_erk_mean, sim_erk_std, sim_times
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
+    dataset_noise,
+    noise_baseline_scale,
+    noise_jitter_scale,
+    noise_jitter_timescale,
     np,
-    plt,
-    sim_K_values,
     sim_erk,
-    sim_erk_mean,
-    sim_erk_std,
-    sim_light_pattern,
-    sim_times,
+    trajectory_noise,
 ):
-    _fig, _axes = plt.subplots(1, 3, figsize=(18, 5))
-
-    # ERK trajectories
-    _ax = _axes[0]
-    for _i in range(sim_erk.shape[0]):
-        _ax.plot(sim_times, sim_erk[_i], color='steelblue', alpha=0.15, lw=0.5)
-    _ax.plot(sim_times, sim_erk_mean, color='navy', lw=2, label='mean')
-    _ax.fill_between(
-        sim_times,
-        np.maximum(sim_erk_mean - sim_erk_std, 0),
-        sim_erk_mean + sim_erk_std,
-        alpha=0.3, color='navy', label='±1 std',
-    )
-    _ax.set_xlabel('time (s)')
-    _ax.set_ylabel('ERK active fraction')
-    _ax.set_title(f'Simulated ERK trajectories (n={sim_erk.shape[0]})')
-    _ax.legend(fontsize=8)
-
-    # K distribution
-    _ax = _axes[1]
-    _ax.hist(sim_K_values, bins=30, edgecolor='white', alpha=0.8, color='coral')
-    _ax.axvline(np.mean(sim_K_values), color='red', ls='--', lw=2, label=f'mean={np.mean(sim_K_values):.3f}')
-    _ax.set_xlabel('K (total kinase concentration)')
-    _ax.set_ylabel('cells')
-    _ax.set_title('Sampled K distribution')
-    _ax.legend(fontsize=8)
-
-    # Light stimulus
-    _ax = _axes[2]
-    _light_signal = np.array([
-        (1.0 if sim_light_pattern.value == "constant" else
-         (1.0 if 10.0 <= t <= 40.0 else 0.0) if sim_light_pattern.value == "pulse" else
-         min(t / 30.0, 1.0) if t <= 60.0 else 0.0)
-        for t in sim_times
-    ])
-    _ax.fill_between(sim_times, _light_signal, alpha=0.3, color='gold')
-    _ax.plot(sim_times, _light_signal, color='orange', lw=1.5)
-    _ax.set_xlabel('time (s)')
-    _ax.set_ylabel('light intensity')
-    _ax.set_title('Light stimulus')
-    _ax.set_ylim(-0.05, 1.2)
-
-    _fig.tight_layout()
-    _fig
-    return
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    _rng = np.random.default_rng(0)
+    _jitter_std = dataset_noise * noise_jitter_scale.value
+    _baseline_std = trajectory_noise.median() * noise_baseline_scale.value
+    _baseline_shifts = _rng.normal(0, _baseline_std, size=(sim_erk.shape[0], 1))
+    _raw = _rng.normal(0, 1.0, size=sim_erk.shape)
+    _smooth = _gf1d(_raw, sigma=noise_jitter_timescale.value, axis=1)
+    _smooth = _smooth / _smooth.std(axis=1, keepdims=True) * _jitter_std
+    sim_erk_noisy = sim_erk + _baseline_shifts + _smooth
+    return (sim_erk_noisy,)
 
 
 @app.cell
@@ -608,6 +754,46 @@ def _(np, plt, sim_erk, sim_times):
 
     _fig.tight_layout()
     _fig
+    return
+
+
+@app.cell(column=2)
+def _():
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    return nn, torch
+
+
+@app.cell
+def _(nn, torch):
+    rnn = nn.LSTM(10, 20, 2)
+    input = torch.randn(5,3,10)
+    h0 = torch.randn(2,3,20)
+    c0 = torch.randn(2,3,20)
+    rnn
+    return c0, h0, input, rnn
+
+
+@app.cell
+def _(c0, h0, input, rnn):
+    output, (hn,cn) = rnn(input, (h0, c0))
+    output, (hn, cn)
+
+    return
+
+
+@app.cell
+def _():
+    EPOCHS = 5
+
+
+
+
+
+
+
     return
 
 
