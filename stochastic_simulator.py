@@ -513,6 +513,20 @@ def _(corr_features, corr_matrix, plt):
     return
 
 
+@app.cell
+def _(np):
+    def sample_image_quality(n_cells, rng=None):
+        # TODO: replace with image-based quantification — e.g. Laplacian variance
+        # of the per-cell bounding-box crop, Cellpose flow confidence, or
+        # per-cell SNR estimated from background pixels in the raw TIFF.
+        if rng is None:
+            rng = np.random.default_rng()
+        # Heuristic: Beta(5, 2) — most cells score ~0.7–0.9, a tail of poor-quality ones.
+        return rng.beta(a=5, b=2, size=n_cells)
+
+    return (sample_image_quality,)
+
+
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
@@ -757,6 +771,219 @@ def _(np, plt, sim_erk, sim_times):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Randomized trajectory demo
+
+    Generate a fresh single-cell trajectory with a randomly sampled light pattern.
+    Only active in interactive mode — clicking the button picks a new random seed each time.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    demo_run_btn = mo.ui.run_button(label="New random trajectory")
+    demo_generator = mo.ui.dropdown(
+        options=["random", "stochastic", "sequential", "functional", "smoothed"],
+        value="random",
+        label="Light pattern generator",
+    )
+    mo.hstack([demo_run_btn, demo_generator])
+    return demo_generator, demo_run_btn
+
+
+@app.cell
+def _(
+    DEFAULT_PARAMS,
+    dataset_noise,
+    demo_generator,
+    demo_run_btn,
+    mo,
+    noise_baseline_scale,
+    noise_jitter_scale,
+    noise_jitter_timescale,
+    np,
+    plt,
+    simulate_population,
+    trajectory_noise,
+):
+    from model.mechanistic.egfr_simplified import (
+        generate_stochastic_pulses as _gen_stochastic,
+        generate_sequential_pulses as _gen_sequential,
+        generate_functional_pulses as _gen_functional,
+        generate_smoothed_pulses as _gen_smoothed,
+    )
+    from scipy.ndimage import gaussian_filter1d as _gf1d_demo
+
+    mo.stop(not demo_run_btn.value)
+
+    _rng = np.random.default_rng()  # new seed each click
+    _gen_map = {
+        "stochastic": _gen_stochastic,
+        "sequential": _gen_sequential,
+        "functional": _gen_functional,
+        "smoothed":   _gen_smoothed,
+    }
+    _gen_fn = _gen_map.get(demo_generator.value) or _rng.choice(list(_gen_map.values()))
+    _pat = _gen_fn(t_max=100.0, rng=_rng)
+    _pulses = _pat["pulses"]
+    _light_fn = lambda t, _p=_pulses: sum(p["amplitude"] for p in _p if p["t_on"] <= t <= p["t_off"])
+
+    _times, _trajs, _ = simulate_population(
+        n_cells=1, params=DEFAULT_PARAMS,
+        K_mean=1.0, K_std=0.15,
+        light_fn=_light_fn, t_max=100.0, dt=1.0,
+        seed=int(_rng.integers(0, 2**31)),
+    )
+    _erk = _trajs[0, 4, :]
+    _jitter_std = dataset_noise * noise_jitter_scale.value
+    _baseline_shift = _rng.normal(0, trajectory_noise.median() * noise_baseline_scale.value)
+    _raw = _rng.normal(0, 1.0, len(_erk))
+    _smooth_noise = _gf1d_demo(_raw, sigma=noise_jitter_timescale.value)
+    _smooth_noise = _smooth_noise / (_smooth_noise.std() + 1e-9) * _jitter_std
+    _erk_noisy = _erk + _baseline_shift + _smooth_noise
+
+    _light_vals = np.array([_light_fn(t) for t in _times])
+    _fig, _ax = plt.subplots(figsize=(12, 4))
+    _ax_l = _ax.twinx()
+    _ax_l.fill_between(_times, _light_vals, alpha=0.12, color='gold')
+    _ax_l.set_ylim(-0.05, max(_light_vals, default=1) * 4)
+    _ax_l.set_ylabel('light intensity', color='orange', fontsize=8)
+    _ax_l.tick_params(axis='y', labelcolor='orange', labelsize=7)
+    _ax.plot(_times, _erk, color='navy', lw=1.5, alpha=0.7, label='ERK (clean)')
+    _ax.plot(_times, _erk_noisy, color='steelblue', lw=1.0, alpha=0.85, label='ERK (noisy)')
+    _ax.set_xlabel('time (s)')
+    _ax.set_ylabel('ERK active fraction')
+    _ax.set_title(f'Random trajectory  [{demo_generator.value} generator]')
+    _ax.legend(fontsize=8)
+    _fig.tight_layout()
+    _fig
+    return
+
+
+@app.cell
+def _(
+    dataset_noise,
+    mo,
+    noise_baseline_scale,
+    noise_jitter_scale,
+    noise_jitter_timescale,
+    np,
+    pd,
+    sample_image_quality,
+    trajectory_noise,
+):
+    # In notebook mode, just show a note and stop. In CLI mode (app.run() from __main__),
+    # mo.running_in_notebook() is False so the stop is skipped and generation runs.
+    mo.stop(mo.running_in_notebook(), mo.md(
+        "*Run `python stochastic_simulator.py` to generate a 30 K-trajectory parquet.*"
+    ))
+
+    import json as _json
+    from tqdm import tqdm as _tqdm
+    from scipy.integrate import solve_ivp as _solve_ivp_cli
+    from scipy.ndimage import gaussian_filter1d as _gf1d_cli
+    from model.mechanistic.egfr_simplified import (
+        generate_stochastic_pulses as _gs,
+        generate_sequential_pulses as _gseq,
+        generate_functional_pulses as _gfunc,
+        generate_smoothed_pulses as _gsm,
+    )
+
+    _N_TOTAL = 30_000
+    _N_TP    = 100
+    _T_MAX   = 100.0
+    _OUTPUT  = "stochastic_sim_output.parquet"
+
+    def _egfr_cli(t, y, params, K, light_fn):
+        RAS, RAF, MEK, NFB, ERK = y
+        K_RAS, K_RAF, K_MEK, K_NFB, K_ERK = K
+        Km, k12, k21, k34, knfb, k43, k56, k65, k78, k87, f12, f21 = params
+        light = light_fn(t)
+        dRAS = light * k12 * (K_RAS - RAS) - k21 * (RAS / (Km + RAS))
+        dRAF = k34 * RAS * (K_RAF - RAF) - (knfb * NFB + k43) * (RAF / (Km + RAF))
+        dMEK = k56 * RAF * (K_MEK - MEK) - k65 * (MEK / (Km + MEK))
+        dNFB = f12 * ERK * (K_NFB - NFB) - f21 * (NFB / (Km + NFB))
+        dERK = k78 * MEK * (K_ERK - ERK) - k87 * (ERK / (Km + ERK))
+        return [dRAS, dRAF, dMEK, dNFB, dERK]
+
+    _PARAMS = np.ones(12)
+    _K_MEAN, _K_STD = 1.0, 0.15
+    _sigma_sq = np.log(1 + (_K_STD / _K_MEAN) ** 2)
+    _mu_K = np.log(_K_MEAN) - _sigma_sq / 2
+
+    _rng = np.random.default_rng(42)
+    _patterns = []
+    for _gname, _gfn in [
+        ("stochastic", _gs), ("sequential", _gseq),
+        ("functional", _gfunc), ("smoothed", _gsm),
+    ]:
+        for _ in range(_N_TOTAL // 4):
+            _p = _gfn(t_max=_T_MAX, rng=_rng)
+            _p["generator"] = _gname
+            _patterns.append(_p)
+    _rng.shuffle(_patterns)
+
+    _times_cli = np.linspace(0, _T_MAX, _N_TP)
+    _rows, _n_fail = [], 0
+
+    for _i, _pat in enumerate(_tqdm(_patterns, desc="Simulating")):
+        _K_i = _rng.lognormal(mean=_mu_K, sigma=np.sqrt(_sigma_sq), size=5)
+        _plist = _pat["pulses"]
+        _lfn = lambda t, _p=_plist: sum(p["amplitude"] for p in _p if p["t_on"] <= t <= p["t_off"])
+
+        _sol = _solve_ivp_cli(
+            lambda t, y, _K=_K_i: _egfr_cli(t, y, _PARAMS, _K, _lfn),
+            [_times_cli[0], _times_cli[-1]], [0.05] * 5,
+            t_eval=_times_cli, method='LSODA', rtol=1e-8,
+        )
+        if not _sol.success:
+            _n_fail += 1
+            continue
+
+        _erk = _sol.y[4]
+        _erk_norm = _erk / _K_i[4]
+        _b_nuc = _rng.lognormal(np.log(0.5), 0.2)
+        _scale = _rng.lognormal(0.0, 0.2)
+        # Noise model: same parameterisation as the interactive sliders in column 1.
+        # In CLI mode the sliders use their default values (scale=1.0, timescale=10).
+        _jitter_std = dataset_noise * noise_jitter_scale.value
+        _baseline_shift = _rng.normal(0, trajectory_noise.median() * noise_baseline_scale.value)
+        _raw_j = _rng.normal(0, 1.0, _N_TP)
+        _smooth_j = _gf1d_cli(_raw_j, sigma=noise_jitter_timescale.value)
+        _smooth_j = _smooth_j / (_smooth_j.std() + 1e-9) * _jitter_std
+        _nuc = _b_nuc * (1.0 - _erk_norm * _scale) + _smooth_j * 0.5
+        _cyt = _b_nuc * (1.0 + _erk_norm * _scale) + _smooth_j
+        _cnr = (_cyt / np.maximum(_nuc, 1e-6)) + _baseline_shift
+
+        _rows.append({
+            "trajectory_id":  _i,
+            "generator":      _pat["generator"],
+            "pulses_json":    _json.dumps(_pat["pulses"]),
+            "K_values":       _K_i.tolist(),
+            "times":          _times_cli.tolist(),
+            "light":          [_lfn(t) for t in _times_cli],
+            "RAS_s": _sol.y[0].tolist(), "RAF_s": _sol.y[1].tolist(),
+            "MEK_s": _sol.y[2].tolist(), "NFB_s": _sol.y[3].tolist(),
+            "ERK_s": _erk.tolist(),
+            "cnr":            _cnr.tolist(),
+            "nuc_intensity":  _nuc.tolist(),
+            "cyt_intensity":  _cyt.tolist(),
+            "area":           float(_rng.lognormal(np.log(500), 0.3)),
+            "density":        int(_rng.poisson(5)),
+            "image_quality":  float(sample_image_quality(1, _rng)[0]),
+        })
+
+    _df_out = pd.DataFrame(_rows)
+    _df_out.to_parquet(_OUTPUT, index=False)
+    print(f"Saved {len(_df_out)} trajectories to {_OUTPUT}")
+    if _n_fail:
+        print(f"WARNING: {_n_fail} simulations failed and were skipped")
+    return
+
+
 @app.cell(column=2)
 def _():
     import torch
@@ -780,20 +1007,115 @@ def _(nn, torch):
 def _(c0, h0, input, rnn):
     output, (hn,cn) = rnn(input, (h0, c0))
     output, (hn, cn)
-
     return
 
 
 @app.cell
 def _():
     EPOCHS = 5
+    return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Generated data inspection
+
+    Load the parquet produced by `python stochastic_simulator.py` and visually inspect sample trajectories and feature distributions.
+    """)
+    return
 
 
+@app.cell
+def _(mo):
+    inspect_path = mo.ui.text(value="stochastic_sim_output.parquet", label="Parquet path")
+    inspect_load_btn = mo.ui.run_button(label="Load")
+    inspect_n = mo.ui.slider(1, 20, value=6, step=1, label="Samples to show")
+    inspect_generator = mo.ui.dropdown(
+        options=["all", "stochastic", "sequential", "functional", "smoothed"],
+        value="all", label="Generator filter",
+    )
+    mo.vstack([
+        mo.hstack([inspect_path, inspect_load_btn]),
+        mo.hstack([inspect_n, inspect_generator]),
+    ])
+    return inspect_generator, inspect_load_btn, inspect_n, inspect_path
 
 
+@app.cell
+def _(
+    inspect_generator,
+    inspect_load_btn,
+    inspect_n,
+    inspect_path,
+    mo,
+    np,
+    pd,
+    plt,
+):
+    import os as _os
+    mo.stop(not inspect_load_btn.value, mo.md("Click **Load** to inspect generated trajectories."))
+    mo.stop(not _os.path.exists(inspect_path.value), mo.md(f"`{inspect_path.value}` not found — run `python stochastic_simulator.py` first."))
 
+    _df_insp = pd.read_parquet(inspect_path.value)
+    _sub = _df_insp if inspect_generator.value == "all" else _df_insp[_df_insp["generator"] == inspect_generator.value]
+    _sample = _sub.sample(n=min(inspect_n.value, len(_sub)), random_state=0)
+
+    _n_rows = len(_sample)
+    _fig_t, _axes_t = plt.subplots(_n_rows, 1, figsize=(12, 3.5 * _n_rows), squeeze=False)
+    for _ax_row, (_, _row) in zip(_axes_t, _sample.iterrows()):
+        _ax = _ax_row[0]
+        _t = np.array(_row["times"])
+        _light = np.array(_row["light"])
+        _erk = np.array(_row["ERK_s"])
+        _cnr = np.array(_row["cnr"])
+        _ax_l = _ax.twinx()
+        _ax_l.fill_between(_t, _light, alpha=0.12, color='gold')
+        _max_l = _light.max() if _light.max() > 0 else 1
+        _ax_l.set_ylim(-0.05, _max_l * 4)
+        _ax_l.set_ylabel("light", color='orange', fontsize=7)
+        _ax_l.tick_params(axis='y', labelcolor='orange', labelsize=6)
+        _ax.plot(_t, _erk, color='navy', lw=1.5, alpha=0.85, label='ERK_s')
+        _ax.plot(_t, _cnr, color='steelblue', lw=1.0, alpha=0.7, label='CNR')
+        _ax.set_ylabel("value")
+        _ax.set_title(f"id={_row['trajectory_id']}  [{_row['generator']}]", fontsize=9, fontweight='bold')
+        _ax.legend(fontsize=7, loc='upper right')
+    _axes_t[-1][0].set_xlabel("time (s)")
+    _fig_t.tight_layout()
+    _fig_t
+    return
+
+
+@app.cell
+def _(inspect_load_btn, inspect_path, mo, np, pd, plt):
+    import os as _os2
+    mo.stop(not inspect_load_btn.value)
+    mo.stop(not _os2.path.exists(inspect_path.value))
+
+    _df_dist = pd.read_parquet(inspect_path.value)
+    _fig_d, _axd = plt.subplots(1, 4, figsize=(16, 4))
+
+    _axd[0].hist(_df_dist["area"].values, bins=40, color='steelblue', alpha=0.8, edgecolor='white')
+    _axd[0].set_title("Area")
+    _axd[0].set_xlabel("area (px²)")
+
+    _density_vals = _df_dist["density"].values.astype(int)
+    _axd[1].hist(_density_vals, bins=range(0, max(_density_vals) + 2), color='coral', alpha=0.8, edgecolor='white')
+    _axd[1].set_title("Density")
+    _axd[1].set_xlabel("neighbours in radius")
+
+    _axd[2].hist(_df_dist["image_quality"].values, bins=30, color='seagreen', alpha=0.8, edgecolor='white')
+    _axd[2].set_title("Image quality")
+    _axd[2].set_xlabel("quality score")
+
+    _peak_cnr = np.array([np.max(row) for row in _df_dist["cnr"].values])
+    _axd[3].hist(_peak_cnr, bins=40, color='mediumpurple', alpha=0.8, edgecolor='white')
+    _axd[3].set_title("Peak CNR per trajectory")
+    _axd[3].set_xlabel("peak CNR")
+
+    _fig_d.suptitle(f"Feature distributions  (n={len(_df_dist):,} trajectories)", fontsize=11)
+    _fig_d.tight_layout()
+    _fig_d
     return
 
 
