@@ -29,7 +29,7 @@ for pattern in "${EXCLUDES[@]}"; do
 done
 
 # ── Parse args ───────────────────────────────────────────────────────────────
-TARGETS=("izb" "ibucluster")
+TARGETS=("izb")
 if [[ $# -gt 0 ]]; then
     TARGETS=("$@")
 fi

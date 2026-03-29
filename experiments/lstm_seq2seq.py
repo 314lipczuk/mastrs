@@ -67,7 +67,6 @@ def _(mo):
         epochs=int(args.get("epochs", "20" if DRY_RUN else "200")),
         batch_size=int(args.get("batch_size", "256")),
         patience=int(args.get("patience", "10" if DRY_RUN else "50")),
-        teacher_forcing=float(args.get("teacher_forcing", "0.5")),
     )
 
     mo.md(f"""
@@ -87,7 +86,6 @@ def _(mo):
     | epochs | {config['epochs']} |
     | batch_size | {config['batch_size']} |
     | patience | {config['patience']} |
-    | teacher_forcing | {config['teacher_forcing']} |
     | dry_run | {DRY_RUN} |
     """)
     return DRY_RUN, EXPERIMENT_NAME, config
@@ -185,7 +183,7 @@ def _(
 
 
 @app.cell
-def _(config, device, mo, nn, torch):
+def _(config, device, mo, nn):
     class LSTMEncoder(nn.Module):
         def __init__(self, input_dim, hidden_dim, num_layers):
             super().__init__()
@@ -203,35 +201,18 @@ def _(config, device, mo, nn, torch):
     class LSTMDecoder(nn.Module):
         def __init__(self, hidden_dim, num_layers):
             super().__init__()
-            # Input: previous CNR prediction (1) + current light (1) = 2
+            # Input: light stimulus (1) at each future step
             self.lstm = nn.LSTM(
-                2, hidden_dim, num_layers,
+                1, hidden_dim, num_layers,
                 batch_first=True, dropout=0.1 if num_layers > 1 else 0.0,
             )
             self.fc_out = nn.Linear(hidden_dim, 1)
 
-        def forward(self, future_light, h_0, c_0, target=None, teacher_forcing_ratio=0.0):
+        def forward(self, future_light, h_0, c_0):
             # future_light: (batch, future_len, 1)
-            # target: (batch, future_len) — actual CNR for teacher forcing
-            batch_size, future_len, _ = future_light.shape
-            outputs = []
-            # First input: zero (no previous prediction yet)
-            prev_erk = torch.zeros(batch_size, 1, 1, device=future_light.device)
-            h, c = h_0, c_0
-
-            for t in range(future_len):
-                light_t = future_light[:, t : t + 1, :]  # (batch, 1, 1)
-                dec_input = torch.cat([prev_erk, light_t], dim=-1)  # (batch, 1, 2)
-                out, (h, c) = self.lstm(dec_input, (h, c))
-                pred = self.fc_out(out)  # (batch, 1, 1)
-                outputs.append(pred.squeeze(-1))  # (batch, 1)
-
-                if target is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                    prev_erk = target[:, t].unsqueeze(1).unsqueeze(2)
-                else:
-                    prev_erk = pred.detach()
-
-            return torch.cat(outputs, dim=1)  # (batch, future_len)
+            # h_0, c_0: encoder hidden state as initialization
+            out, _ = self.lstm(future_light, (h_0, c_0))
+            return self.fc_out(out).squeeze(-1)  # (batch, future_len)
 
     class Seq2Seq(nn.Module):
         def __init__(self, input_dim, hidden_dim, num_layers):
@@ -239,10 +220,9 @@ def _(config, device, mo, nn, torch):
             self.encoder = LSTMEncoder(input_dim, hidden_dim, num_layers)
             self.decoder = LSTMDecoder(hidden_dim, num_layers)
 
-        def forward(self, encoder_input, future_light, target=None, teacher_forcing_ratio=0.0):
+        def forward(self, encoder_input, future_light):
             h, c = self.encoder(encoder_input)
-            predictions = self.decoder(future_light, h, c, target, teacher_forcing_ratio)
-            return predictions
+            return self.decoder(future_light, h, c)
 
         def loss(self, predictions, target):
             return nn.functional.mse_loss(predictions, target)
@@ -281,7 +261,6 @@ def _(
 
         epochs = cfg["epochs"]
         patience = cfg["patience"]
-        tf_start = cfg["teacher_forcing"]
 
         best_val = float("inf")
         wait = 0
@@ -291,8 +270,6 @@ def _(
         os.close(ckpt_fd)
 
         for epoch in range(epochs):
-            tf_ratio = tf_start * max(0, 1 - epoch / (epochs * 0.7))
-
             model.train()
             t_losses = []
             for enc_in, dec_light, dec_target in train_loader:
@@ -300,7 +277,7 @@ def _(
                 dec_light = dec_light.to(device)
                 dec_target = dec_target.to(device)
 
-                preds = model(enc_in, dec_light, target=dec_target, teacher_forcing_ratio=tf_ratio)
+                preds = model(enc_in, dec_light)
                 loss = model.loss(preds, dec_target)
 
                 optimizer.zero_grad()
@@ -339,7 +316,7 @@ def _(
                     break
 
             if epoch % 20 == 0:
-                print(f"Epoch {epoch:3d} | Train: {t_mean:.6f} | Val: {v_mean:.6f} | TF: {tf_ratio:.3f}")
+                print(f"Epoch {epoch:3d} | Train: {t_mean:.6f} | Val: {v_mean:.6f}")
 
         model.load_state_dict(torch.load(ckpt_path, weights_only=True))
         os.remove(ckpt_path)
