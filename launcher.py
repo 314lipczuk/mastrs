@@ -57,8 +57,31 @@ def launch(job: Job, local: bool = False):
 JOBS = [
     Job(
         notebook="experiments/lstm_seq2seq.py",
-        name="lstm_seq2seq_v2",
-        params=dict(dry_run="true"),
+        name="lstm_seq2seq_synthetic",
+        params=dict(source="synthetic", dry_run="false"),
+        time="24:00:00",
+        mem="16G",
+    ),
+    Job(
+        notebook="experiments/lstm_seq2seq.py",
+        name="lstm_seq2seq_real",
+        params=dict(source="real", dry_run="false"),
+        time="24:00:00",
+        mem="16G",
+    ),
+    Job(
+        notebook="experiments/lstm_gridsearch_seq2seq.py",
+        name="lstm_gridsearch_synthetic",
+        params=dict(gridsearch="true", gridsearch_sources="synthetic", dry_run="false"),
+        time="23:00:00",
+        mem="32G",
+    ),
+    Job(
+        notebook="experiments/lstm_gridsearch_seq2seq.py",
+        name="lstm_gridsearch_real",
+        params=dict(gridsearch="true", gridsearch_sources="real", dry_run="false"),
+        time="23:00:00",
+        mem="32G",
     ),
     #Job(
     #    notebook="experiments/VAE_single_timepoint_state_space.py",
