@@ -573,7 +573,7 @@ def _(np):
         1.0,   # f21
     ])
 
-    def simulate_population(n_cells, params, K_mean, K_std, light_fn, t_max=100.0, dt=0.1, seed=42):
+    def simulate_population(n_cells, params, K_mean, K_std, light_fn, t_max=100.0, dt=1, seed=42):
         rng = np.random.default_rng(seed)
 
         sigma_sq = np.log(1 + (K_std / K_mean) ** 2)
@@ -648,7 +648,6 @@ def _(
          min(t / 30.0, 1.0) if t <= 60.0 else 0.0)
         for t in sim_times
     ])
-    _ax.fill_between(sim_times, _light_signal, alpha=0.3, color='gold')
     _ax.plot(sim_times, _light_signal, color='orange', lw=1.5)
     _ax.set_xlabel('time (s)')
     _ax.set_ylabel('light intensity')

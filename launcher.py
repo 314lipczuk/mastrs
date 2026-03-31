@@ -9,8 +9,8 @@ class Job:
     name: str
     params: dict[str, str] = field(default_factory=dict)
     partition: str = "all"
-    time: str = "04:00:00"
-    mem: str = "4G"
+    time: str = "24:00:00"
+    mem: str = "16G"
 
 
 def launch(job: Job, local: bool = False):
@@ -56,15 +56,15 @@ def launch(job: Job, local: bool = False):
 
 JOBS = [
     Job(
-        notebook="experiments/VAE_single_timepoint_state_space.py",
-        name="VAE_ss_H16-8_L2_b1",
-        params=dict(hidden_dims="16,8", latent_dim="2", beta="1.0", dry_run="false"),
+        notebook="experiments/lstm_seq2seq.py",
+        name="lstm_seq2seq_v2",
+        params=dict(dry_run="true"),
     ),
-    Job(
-        notebook="experiments/VAE_single_timepoint_state_space.py",
-        name="VAE_ss_H16-8_L3_b1",
-        params=dict(hidden_dims="16,8", latent_dim="3", beta="1.0", dry_run="false"),
-    ),
+    #Job(
+    #    notebook="experiments/VAE_single_timepoint_state_space.py",
+    #    name="VAE_ss_H16-8_L3_b1",
+    #    params=dict(hidden_dims="16,8", latent_dim="3", beta="1.0", dry_run="false"),
+    #),
 ]
 
 if __name__ == "__main__":
