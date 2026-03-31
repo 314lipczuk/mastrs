@@ -28,6 +28,7 @@ def _():
     from experiment import save_experiment
     from utils import get_device
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
+    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
     device = get_device()
     n_stim = len(STIM_COLS)
@@ -40,6 +41,7 @@ def _():
         else str(Path(__file__).resolve().parent.parent / "results")
     )
     return (
+        DEFAULT_STIM_COLS,
         DataLoader,
         Dataset,
         STIM_COLS,
@@ -214,7 +216,116 @@ def _(
 
     Train: {len(train_ds)} windows | Val: {len(val_ds)} | Test: {len(test_ds)}
     """)
-    return F_, H, test_ds, train_loader, val_loader
+    return F_, H, cnr_all, stim_all, test_ds, train_loader, val_loader
+
+
+@app.cell
+def _(STIM_COLS, cnr_all, np, plt, stim_all):
+    # Cross-correlation between each stim channel and CNR to find the response lag.
+    # xcorr[lag > 0]: stim at t predicts CNR at t+lag.
+    _n_traj, _traj_len = cnr_all.shape
+    _max_lag = min(50, _traj_len // 2)
+    _lags = np.arange(-_max_lag, _max_lag + 1)
+
+    _xcorr_mean = np.zeros((len(STIM_COLS), len(_lags)))
+
+    for _ti in range(_n_traj):
+        _cnr = cnr_all[_ti] - cnr_all[_ti].mean()
+        _cnr_norm = np.linalg.norm(_cnr) + 1e-8
+        for _si, _ in enumerate(STIM_COLS):
+            _s = stim_all[_ti, _si] - stim_all[_ti, _si].mean()
+            _s_norm = np.linalg.norm(_s) + 1e-8
+            _full = np.correlate(_cnr, _s, mode="full") / (_cnr_norm * _s_norm)
+            # full xcorr has length 2*T-1; center (lag=0) is at index T-1
+            _center = _traj_len - 1
+            _xcorr_mean[_si] += _full[_center - _max_lag : _center + _max_lag + 1]
+
+    _xcorr_mean /= _n_traj
+
+    fig_xcorr, _ax = plt.subplots(figsize=(12, 4))
+    for _si, _col in enumerate(STIM_COLS):
+        _ax.plot(_lags, _xcorr_mean[_si], label=_col, alpha=0.8)
+    _ax.axvline(0, color="black", lw=1, linestyle="--")
+    _ax.axhline(0, color="gray", lw=0.5)
+
+    # annotate peak positive-lag correlation for each channel
+    for _si, _col in enumerate(STIM_COLS):
+        _pos = _xcorr_mean[_si, _lags > 0]
+        _peak_lag = _lags[_lags > 0][np.argmax(_pos)]
+        _ax.axvline(_peak_lag, color=f"C{_si}", lw=1, linestyle=":", alpha=0.6)
+        _ax.text(_peak_lag + 0.3, _xcorr_mean[_si].max() * 0.9, f"{_col} lag={_peak_lag}", fontsize=7)
+
+    _ax.set_xlabel("lag (timesteps)  [positive = stim leads CNR]")
+    _ax.set_ylabel("normalized cross-correlation")
+    _ax.set_title("Stimulus → CNR cross-correlation\n(peak positive lag = expected response delay)")
+    _ax.legend(fontsize=8)
+    fig_xcorr.tight_layout()
+    fig_xcorr
+    return
+
+
+@app.cell
+def _(DATA_SOURCE, DEFAULT_STIM_COLS, cnr_all, load_real, np, plt, stim_all):
+    # Second xcorr plot: all available stim features, including ones not in the model.
+    # For synthetic: derive ewma_fast + n_5 (pulse count window) from the raw light signal.
+    # For real: reload trajectories with all 9 DEFAULT_STIM_COLS.
+    if DATA_SOURCE == "synthetic":
+        _u_t = stim_all[:, 0, :]  # (N, T)
+        # derive ewma_fast (alpha=0.5) inline
+        _ef = np.empty_like(_u_t)
+        _ef[:, 0] = _u_t[:, 0]
+        for _t in range(1, _u_t.shape[1]):
+            _ef[:, _t] = 0.5 * _u_t[:, _t] + 0.5 * _ef[:, _t - 1]
+        # n_5: number of on-frames in last 5 steps
+        _n5 = np.stack([
+            np.concatenate([np.zeros((_u_t.shape[0], min(_k, 5))),
+                            np.array([(_u_t[:, max(0, _i-5):_i] > 0).sum(axis=1)
+                                      for _i in range(_k, _u_t.shape[1])]).T], axis=1)
+            for _k in [5]
+        ], axis=0)[0].astype(np.float32)
+        _all_stim = np.stack([_u_t, stim_all[:, 1, :], _ef, stim_all[:, 2, :],
+                               stim_all[:, 3, :], _n5], axis=1)
+        _all_cols = ["u_t", "m_t", "ewma_fast", "ewma_slow", "s_cum", "n_5"]
+        _cnr_all = cnr_all
+    else:
+        _cnr_all, _all_stim, _ = load_real()
+        _all_cols = DEFAULT_STIM_COLS
+
+    _n_traj2, _traj_len2 = _cnr_all.shape
+    _max_lag2 = min(50, _traj_len2 // 2)
+    _lags2 = np.arange(-_max_lag2, _max_lag2 + 1)
+    _xcorr2 = np.zeros((len(_all_cols), len(_lags2)))
+
+    for _ti in range(_n_traj2):
+        _cnr = _cnr_all[_ti] - _cnr_all[_ti].mean()
+        _cnr_norm = np.linalg.norm(_cnr) + 1e-8
+        for _si in range(len(_all_cols)):
+            _s = _all_stim[_ti, _si] - _all_stim[_ti, _si].mean()
+            _s_norm = np.linalg.norm(_s) + 1e-8
+            _full = np.correlate(_cnr, _s, mode="full") / (_cnr_norm * _s_norm)
+            _center = _traj_len2 - 1
+            _xcorr2[_si] += _full[_center - _max_lag2 : _center + _max_lag2 + 1]
+    _xcorr2 /= _n_traj2
+
+    fig_xcorr_all, _ax = plt.subplots(figsize=(12, 4))
+    for _si, _col in enumerate(_all_cols):
+        _ls = "-" if _col in DEFAULT_STIM_COLS else "--"
+        _ax.plot(_lags2, _xcorr2[_si], label=_col, alpha=0.8, linestyle=_ls)
+    _ax.axvline(0, color="black", lw=1, linestyle="--")
+    _ax.axhline(0, color="gray", lw=0.5)
+
+    for _si, _col in enumerate(_all_cols):
+        _pos = _xcorr2[_si, _lags2 > 0]
+        _peak_lag = _lags2[_lags2 > 0][np.argmax(_pos)]
+        _ax.axvline(_peak_lag, color=f"C{_si}", lw=1, linestyle=":", alpha=0.5)
+
+    _ax.set_xlabel("lag (timesteps)  [positive = stim leads CNR]")
+    _ax.set_ylabel("normalized cross-correlation")
+    _ax.set_title(f"All stim features → CNR cross-correlation ({DATA_SOURCE})\n(solid = currently in model)")
+    _ax.legend(fontsize=8)
+    fig_xcorr_all.tight_layout()
+    fig_xcorr_all
+    return
 
 
 @app.cell
