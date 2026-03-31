@@ -89,7 +89,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
         hidden_dim=int(args.get("hidden_dim", "64" if DRY_RUN else "32")),
         num_layers=int(args.get("num_layers", "2" if DRY_RUN else "2")),
         history_len=int(args.get("history_len", "15")),
-        future_len=int(args.get("future_len", "3")),
+        future_len=int(args.get("future_len", "10")),
         lr=float(args.get("lr", "1e-3")),
         epochs=int(args.get("epochs", "100" if DRY_RUN else "200")),
         batch_size=int(args.get("batch_size", "64")),
