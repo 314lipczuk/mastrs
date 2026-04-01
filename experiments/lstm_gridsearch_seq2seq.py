@@ -23,14 +23,14 @@ def _build_param_grid(dry_run):
             "tf_ratio_end": [0.0],
         }
     return {
-        "hidden_dim": [32, 64, 128],
-        "num_layers": [1, 2, 3],
+        "hidden_dim": [32, 48],
+        "num_layers": [1, 2],
         "history_len": [10, 15, 20],
         "future_len": [5, 10, 15],
         "lr": [1e-3, 5e-4, 1e-4],
-        "batch_size": [32, 64],
-        "patience": [30,50,10],
-        "epochs": [300],
+        "batch_size": [64, 128, 256],
+        "patience": [30,20],
+        "epochs": [80],
         "tf_ratio_start": [1.0],
         "tf_ratio_end": [0.0],
     }
@@ -437,7 +437,6 @@ def _run_gridsearch(source, dry_run, results_base, experiment_name, device):
     print(f"[GRIDSEARCH] Done. Results saved to {out_path}")
     print(pd.DataFrame(results).to_string(index=False))
     return pd.DataFrame(results)
-
 
 @app.cell
 def _():
