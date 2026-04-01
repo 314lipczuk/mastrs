@@ -559,7 +559,9 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
 
 
 @app.cell
-def _(DRY_RUN, EXPERIMENT_NAME, args, device, mo, results_base):
+def _(DRY_RUN, EXPERIMENT_NAME, args, device, mo, parse_bool, results_base):
+    from experiments.lstm_gridsearch_seq2seq import _run_gridsearch
+
     _gridsearch = parse_bool(args.get("gridsearch", False), default=False)
     if _gridsearch:
         _sources = args.get("gridsearch_sources", "synthetic").split(",")

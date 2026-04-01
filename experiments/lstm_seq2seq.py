@@ -20,27 +20,32 @@ def _():
     import os
     import time
     import tempfile
+    import getpass
     from datetime import datetime
     from sklearn.model_selection import train_test_split
     from torch.utils.data import DataLoader, Dataset, Subset
 
-    from experiment import ExperimentTracker
-    from utils import get_device, get_username, running_on_cluster, results_write_path, results_read_sources, parse_bool
+    from experiment import save_experiment, ExperimentTracker
+    from utils import get_device
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
     device = get_device()
     n_stim = len(STIM_COLS)
 
-    hostname = get_username()
-    is_cluster = running_on_cluster()
-    results_base = results_write_path()
-
+    hostname = getpass.getuser()
+    is_cluster = not hostname.startswith("polya")
+    results_base = (
+        "/Volumes/imaging.data/ppilip/results/models"
+        if is_cluster
+        else str(Path(__file__).resolve().parent.parent / "results")
+    )
     return (
         DEFAULT_STIM_COLS,
         DataLoader,
         Dataset,
         ExperimentTracker,
+        Path,
         STIM_COLS,
         Subset,
         device,
@@ -54,10 +59,8 @@ def _():
         np,
         optim,
         os,
-        parse_bool,
         plt,
         results_base,
-        results_read_sources,
         tempfile,
         time,
         torch,
@@ -68,11 +71,10 @@ def _():
 @app.cell
 def _(Path, mo):
     args = mo.cli_args()
-    print('test')
+
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
-    DRY_RUN = parse_bool(args.get("dry_run", True))
+    DRY_RUN = args.get("dry_run", "true").lower() == "true"
     _cli_source = args.get("source", None)
-    print('expN', EXPERIMENT_NAME)
 
     mode_selector = mo.ui.radio(
         options=["Train new model", "Load from disk"],
@@ -80,7 +82,10 @@ def _(Path, mo):
         label="Mode",
     )
 
-    _results_sources = results_read_sources(Path(__file__).resolve().parent.parent)
+    _results_sources = {
+        "Local": str(Path(__file__).resolve().parent.parent / "results"),
+        "Kingston": "/Volumes/imaging.data/ppilip/results/models",
+    }
     load_source_selector = mo.ui.dropdown(
         options=list(_results_sources.keys()),
         value="Kingston",
@@ -92,16 +97,25 @@ def _(Path, mo):
     )
 
     mo.hstack([mode_selector, source_selector, load_source_selector], gap=2)
-    return DRY_RUN, EXPERIMENT_NAME, args, load_source_selector, mode_selector, source_selector
+    return (
+        DRY_RUN,
+        EXPERIMENT_NAME,
+        args,
+        load_source_selector,
+        mode_selector,
+        source_selector,
+    )
 
 
 @app.cell
 def _(Path, load_source_selector, mo, mode_selector):
     _is_load = mode_selector.value == "Load from disk"
 
-    _results_sources = results_read_sources(Path(__file__).resolve().parent.parent)
+    _results_sources = {
+        "Local": str(Path(__file__).resolve().parent.parent / "results"),
+        "Kingston": "/Volumes/imaging.data/ppilip/results/models",
+    }
     _results_path = Path(_results_sources[load_source_selector.value])
-    print('result path:', _results_path)
 
     _experiment_dirs = []
     if _is_load and _results_path.is_dir():
@@ -272,51 +286,6 @@ def _(
     Train: {len(train_ds)} windows | Val: {len(val_ds)} | Test: {len(test_ds)}
     """)
     return F_, H, cnr_all, stim_all, test_ds, train_loader, val_loader
-
-
-@app.cell
-def _(STIM_COLS, cnr_all, np, plt, stim_all):
-    # Cross-correlation between each stim channel and CNR to find the response lag.
-    # xcorr[lag > 0]: stim at t predicts CNR at t+lag.
-    _n_traj, _traj_len = cnr_all.shape
-    _max_lag = min(50, _traj_len // 2)
-    _lags = np.arange(-_max_lag, _max_lag + 1)
-
-    _xcorr_mean = np.zeros((len(STIM_COLS), len(_lags)))
-
-    for _ti in range(_n_traj):
-        _cnr = cnr_all[_ti] - cnr_all[_ti].mean()
-        _cnr_norm = np.linalg.norm(_cnr) + 1e-8
-        for _si, _ in enumerate(STIM_COLS):
-            _s = stim_all[_ti, _si] - stim_all[_ti, _si].mean()
-            _s_norm = np.linalg.norm(_s) + 1e-8
-            _full = np.correlate(_cnr, _s, mode="full") / (_cnr_norm * _s_norm)
-            # full xcorr has length 2*T-1; center (lag=0) is at index T-1
-            _center = _traj_len - 1
-            _xcorr_mean[_si] += _full[_center - _max_lag : _center + _max_lag + 1]
-
-    _xcorr_mean /= _n_traj
-
-    fig_xcorr, _ax = plt.subplots(figsize=(12, 4))
-    for _si, _col in enumerate(STIM_COLS):
-        _ax.plot(_lags, _xcorr_mean[_si], label=_col, alpha=0.8)
-    _ax.axvline(0, color="black", lw=1, linestyle="--")
-    _ax.axhline(0, color="gray", lw=0.5)
-
-    # annotate peak positive-lag correlation for each channel
-    for _si, _col in enumerate(STIM_COLS):
-        _pos = _xcorr_mean[_si, _lags > 0]
-        _peak_lag = _lags[_lags > 0][np.argmax(_pos)]
-        _ax.axvline(_peak_lag, color=f"C{_si}", lw=1, linestyle=":", alpha=0.6)
-        _ax.text(_peak_lag + 0.3, _xcorr_mean[_si].max() * 0.9, f"{_col} lag={_peak_lag}", fontsize=7)
-
-    _ax.set_xlabel("lag (timesteps)  [positive = stim leads CNR]")
-    _ax.set_ylabel("normalized cross-correlation")
-    _ax.set_title("Stimulus → CNR cross-correlation\n(peak positive lag = expected response delay)")
-    _ax.legend(fontsize=8)
-    fig_xcorr.tight_layout()
-    fig_xcorr
-    return
 
 
 @app.cell
@@ -512,7 +481,6 @@ def _(
     optim,
     os,
     results_base,
-
     tempfile,
     time,
     torch,
@@ -688,24 +656,6 @@ def _(
 
         _bundle_ar = ExperimentBundle.load(str(_results_path / load_ar_dropdown.value))
         _bundle_bl = ExperimentBundle.load(str(_results_path / load_bl_dropdown.value))
-
-        _cfg_ar = _bundle_ar.model_config
-        _cfg_bl = _bundle_bl.model_config
-        _expected_encoder_dim = 1 + n_stim
-        _dim_mismatch = (
-            _cfg_ar.get("encoder_dim") != _expected_encoder_dim
-            or _cfg_bl.get("encoder_dim") != _expected_encoder_dim
-        )
-        mo.stop(_dim_mismatch, mo.callout(
-            mo.md(
-                f"**Dimension mismatch:** loaded model expects encoder_dim="
-                f"{_cfg_ar.get('encoder_dim')}/{_cfg_bl.get('encoder_dim')} "
-                f"but current data source has {_expected_encoder_dim}. "
-                f"Change the **Data source** dropdown to match the loaded experiment "
-                f"(`{_cfg_ar.get('data_source', '?')}`)."
-            ),
-            kind="warn",
-        ))
 
         model.load_state_dict(_bundle_ar.model_state_dict)
         model.to(device)
@@ -1139,5 +1089,4 @@ def _(
 
 
 if __name__ == "__main__":
-    print('a')
     app.run()

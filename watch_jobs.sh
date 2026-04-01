@@ -12,17 +12,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- Collect log files from active jobs (snapshot at startup) ---
-mapfile -t LOG_FILES < <(
-  squeue -u "$USER" -o "%o" 2>/dev/null \
-    | tail -n +2 \
-    | grep -v '^N/A$' \
-    | grep -v '^$' \
-    | sort -u
-)
+# --- Collect resolved log paths via scontrol ---
+mapfile -t JOB_IDS < <(squeue -u "$USER" -o "%i" --noheader 2>/dev/null)
+
+if [[ ${#JOB_IDS[@]} -eq 0 ]]; then
+  echo "No active SLURM jobs found for user: $USER"
+  exit 1
+fi
+
+LOG_FILES=()
+for jobid in "${JOB_IDS[@]}"; do
+  logpath=$(scontrol show job "$jobid" 2>/dev/null | grep -oP 'StdOut=\K\S+')
+  if [[ -n "$logpath" ]]; then
+    LOG_FILES+=("$logpath")
+  fi
+done
 
 if [[ ${#LOG_FILES[@]} -eq 0 ]]; then
-  echo "No active SLURM jobs with log files found for user: $USER"
+  echo "No log files found for ${#JOB_IDS[@]} active jobs."
   exit 1
 fi
 
@@ -37,13 +44,11 @@ fi
 SESSION="slurm_watch_$$"
 
 watch_cmd() {
-  echo "watch -n 5 'echo === $1 ===; echo; tail -n 40 \"$1\" 2>/dev/null || echo file gone'"
+  echo "watch -n 5 'echo === $1 ===; echo; tail -n 40 \"$1\" 2>/dev/null || echo file not yet created'"
 }
 
-# Create session with first pane running the watch command directly
 tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)" "$(watch_cmd "${LOG_FILES[0]}")"
 
-# Each split-window call targets the session (active pane) and runs the command directly
 for i in "${!LOG_FILES[@]}"; do
   [[ $i -eq 0 ]] && continue
   tmux split-window -t "$SESSION" "$(watch_cmd "${LOG_FILES[$i]}")"
