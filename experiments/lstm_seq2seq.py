@@ -20,30 +20,27 @@ def _():
     import os
     import time
     import tempfile
-    import getpass
     from datetime import datetime
     from sklearn.model_selection import train_test_split
     from torch.utils.data import DataLoader, Dataset, Subset
 
-    from experiment import save_experiment
-    from utils import get_device
+    from experiment import ExperimentTracker
+    from utils import get_device, get_username, running_on_cluster, results_write_path, results_read_sources, parse_bool
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
     device = get_device()
     n_stim = len(STIM_COLS)
 
-    hostname = getpass.getuser()
-    is_cluster = not hostname.startswith("polya")
-    results_base = (
-        "/Volumes/imaging.data/ppilip/results/models"
-        if is_cluster
-        else str(Path(__file__).resolve().parent.parent / "results")
-    )
+    hostname = get_username()
+    is_cluster = running_on_cluster()
+    results_base = results_write_path()
+
     return (
         DEFAULT_STIM_COLS,
         DataLoader,
         Dataset,
+        ExperimentTracker,
         STIM_COLS,
         Subset,
         device,
@@ -57,9 +54,10 @@ def _():
         np,
         optim,
         os,
+        parse_bool,
         plt,
         results_base,
-        save_experiment,
+        results_read_sources,
         tempfile,
         time,
         torch,
@@ -68,17 +66,74 @@ def _():
 
 
 @app.cell
-def _(mo):
+def _(Path, mo):
     args = mo.cli_args()
-
+    print('test')
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
-    DRY_RUN = args.get("dry_run", "true").lower() == "true"
+    DRY_RUN = parse_bool(args.get("dry_run", True))
     _cli_source = args.get("source", None)
+    print('expN', EXPERIMENT_NAME)
+
+    mode_selector = mo.ui.radio(
+        options=["Train new model", "Load from disk"],
+        value="Train new model",
+        label="Mode",
+    )
+
+    _results_sources = results_read_sources(Path(__file__).resolve().parent.parent)
+    load_source_selector = mo.ui.dropdown(
+        options=list(_results_sources.keys()),
+        value="Kingston",
+        label="Results source",
+    )
+
     source_selector = mo.ui.dropdown(
         options=["synthetic", "real"], value=_cli_source or "synthetic", label="Data source"
     )
-    source_selector
-    return DRY_RUN, EXPERIMENT_NAME, args, source_selector
+
+    mo.hstack([mode_selector, source_selector, load_source_selector], gap=2)
+    return DRY_RUN, EXPERIMENT_NAME, args, load_source_selector, mode_selector, source_selector
+
+
+@app.cell
+def _(Path, load_source_selector, mo, mode_selector):
+    _is_load = mode_selector.value == "Load from disk"
+
+    _results_sources = results_read_sources(Path(__file__).resolve().parent.parent)
+    _results_path = Path(_results_sources[load_source_selector.value])
+    print('result path:', _results_path)
+
+    _experiment_dirs = []
+    if _is_load and _results_path.is_dir():
+        for _subdir in sorted(_results_path.iterdir()):
+            if not _subdir.is_dir():
+                continue
+            _has_pt = any(_subdir.glob("*.pt"))
+            _has_figures = (_subdir / "figures").is_dir()
+            if _has_pt and _has_figures:
+                _experiment_dirs.append(_subdir.name)
+
+    if _is_load and not _experiment_dirs:
+        mo.stop(True, mo.md(f"No experiments found in `{_results_path}`."))
+
+    load_ar_dropdown = mo.ui.dropdown(
+        options=_experiment_dirs or ["(none)"],
+        value=_experiment_dirs[0] if _experiment_dirs else "(none)",
+        label="AR experiment",
+    )
+    load_bl_dropdown = mo.ui.dropdown(
+        options=_experiment_dirs or ["(none)"],
+        value=_experiment_dirs[1] if len(_experiment_dirs) > 1 else (_experiment_dirs[0] if _experiment_dirs else "(none)"),
+        label="Baseline experiment",
+    )
+    load_button = mo.ui.run_button(label="Load experiments")
+
+    mo.output.replace(
+        mo.hstack([load_ar_dropdown, load_bl_dropdown, load_button], justify="start", gap=1)
+        if _is_load
+        else mo.md("")
+    )
+    return load_ar_dropdown, load_bl_dropdown, load_button
 
 
 @app.cell
@@ -439,9 +494,16 @@ def _(config, device, mo, n_stim, nn, torch):
 def _(
     DATA_SOURCE,
     EXPERIMENT_NAME,
+    ExperimentTracker,
+    Path,
     config,
     device,
+    load_ar_dropdown,
+    load_bl_dropdown,
+    load_button,
+    load_source_selector,
     mo,
+    mode_selector,
     model,
     model_baseline,
     n_stim,
@@ -450,13 +512,23 @@ def _(
     optim,
     os,
     results_base,
-    save_experiment,
+
     tempfile,
     time,
     torch,
     train_loader,
     val_loader,
 ):
+    _model_config_shared = dict(
+        encoder_dim=1 + n_stim,
+        stim_dim=n_stim,
+        hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+        history_len=config["history_len"],
+        future_len=config["future_len"],
+        data_source=DATA_SOURCE,
+    )
+
     def _run_epoch_ar(model, loader, device, optimizer, cfg, epoch, is_train):
         if is_train:
             model.train()
@@ -498,46 +570,15 @@ def _(
                 losses.append(loss.item())
         return np.mean(losses)
 
-    def _save_incremental(model_ar, model_bl, hist_ar, hist_bl, ckpt_ar, ckpt_bl, cfg, elapsed):
-        _model_config = dict(
-            encoder_dim=1 + n_stim,
-            stim_dim=n_stim,
-            hidden_dim=cfg["hidden_dim"],
-            num_layers=cfg["num_layers"],
-            history_len=cfg["history_len"],
-            future_len=cfg["future_len"],
-            data_source=DATA_SOURCE,
-        )
-        # Temporarily load best weights for saving, then restore current state
-        _cur_ar = {k: v.clone() for k, v in model_ar.state_dict().items()}
-        _cur_bl = {k: v.clone() for k, v in model_bl.state_dict().items()}
-        model_ar.load_state_dict(torch.load(ckpt_ar, weights_only=True))
-        model_bl.load_state_dict(torch.load(ckpt_bl, weights_only=True))
-        save_experiment(
-            directory=f"{results_base}/{EXPERIMENT_NAME}_ar_ckpt",
-            model=model_ar,
-            model_config=dict(**_model_config, variant="autoregressive_tf"),
-            training_config=cfg,
-            training_results={"history": hist_ar, "train_elapsed_s": elapsed},
-            metrics={},
-            figures={},
-            name=f"{EXPERIMENT_NAME}_ar_ckpt",
-        )
-        save_experiment(
-            directory=f"{results_base}/{EXPERIMENT_NAME}_baseline_ckpt",
-            model=model_bl,
-            model_config=dict(**_model_config, variant="single_pass"),
-            training_config=cfg,
-            training_results={"history": hist_bl, "train_elapsed_s": elapsed},
-            metrics={},
-            figures={},
-            name=f"{EXPERIMENT_NAME}_baseline_ckpt",
-        )
-        model_ar.load_state_dict(_cur_ar)
-        model_bl.load_state_dict(_cur_bl)
-        print(f"[ckpt] Saved incremental checkpoint at {elapsed:.0f}s elapsed")
+    def _checkpoint_with_best_weights(tracker, mdl, best_ckpt_path, hist):
+        """Swap in best weights, checkpoint, swap back."""
+        _cur = {k: v.clone() for k, v in mdl.state_dict().items()}
+        mdl.load_state_dict(torch.load(best_ckpt_path, weights_only=True))
+        tracker.checkpoint(mdl, training_results={"history": hist})
+        mdl.load_state_dict(_cur)
 
-    def train_both(model_ar, model_bl, train_loader, val_loader, cfg, device):
+    def train_both(model_ar, model_bl, train_loader, val_loader, cfg, device,
+                   tracker_ar, tracker_bl):
         opt_ar = optim.Adam(model_ar.parameters(), lr=cfg["lr"], weight_decay=1e-5)
         opt_bl = optim.Adam(model_bl.parameters(), lr=cfg["lr"], weight_decay=1e-5)
         sched_ar = optim.lr_scheduler.ReduceLROnPlateau(opt_ar, patience=10, factor=0.5)
@@ -554,8 +595,6 @@ def _(
 
         best_ar, best_bl, wait_ar, wait_bl = float("inf"), float("inf"), 0, 0
         done_ar, done_bl = False, False
-        t0 = time.time()
-        last_save_time = t0
 
         for epoch in range(epochs):
             if not done_ar:
@@ -596,10 +635,8 @@ def _(
                 bl_str = f"BL T:{t_bl:.5f} V:{v_bl:.5f}" if not done_bl else "BL done"
                 print(f"Epoch {epoch:3d} | {ar_str} | {bl_str}")
 
-            now = time.time()
-            if now - last_save_time >= 3600:
-                _save_incremental(model_ar, model_bl, hist_ar, hist_bl, ckpt_ar, ckpt_bl, cfg, now - t0)
-                last_save_time = now
+            _checkpoint_with_best_weights(tracker_ar, model_ar, ckpt_ar, hist_ar)
+            _checkpoint_with_best_weights(tracker_bl, model_bl, ckpt_bl, hist_bl)
 
         model_ar.load_state_dict(torch.load(ckpt_ar, weights_only=True))
         model_bl.load_state_dict(torch.load(ckpt_bl, weights_only=True))
@@ -607,19 +644,100 @@ def _(
         os.remove(ckpt_bl)
         return hist_ar, hist_bl
 
-    _t0 = time.time()
-    history, history_baseline = train_both(model, model_baseline, train_loader, val_loader, config, device)
-    train_elapsed = time.time() - _t0
+    if mode_selector.value == "Train new model":
+        tracker_ar = ExperimentTracker(
+            directory=f"{results_base}/{EXPERIMENT_NAME}_ar",
+            name=f"{EXPERIMENT_NAME}_ar",
+            model_config=dict(**_model_config_shared, variant="autoregressive_tf"),
+            training_config=config,
+        )
+        tracker_bl = ExperimentTracker(
+            directory=f"{results_base}/{EXPERIMENT_NAME}_baseline",
+            name=f"{EXPERIMENT_NAME}_baseline",
+            model_config=dict(**_model_config_shared, variant="single_pass"),
+            training_config=config,
+        )
+        tracker_ar.register_start()
+        tracker_bl.register_start()
 
-    mo.md(f"""
-    **Training complete** in {train_elapsed:.0f}s
+        _t0 = time.time()
+        history, history_baseline = train_both(
+            model, model_baseline, train_loader, val_loader, config, device,
+            tracker_ar, tracker_bl,
+        )
+        train_elapsed = time.time() - _t0
 
-    | model | epochs |
-    |-------|--------|
-    | AR + teacher forcing | {len(history['train_loss'])} |
-    | Single-pass baseline | {len(history_baseline['train_loss'])} |
-    """)
-    return history, history_baseline, train_elapsed
+        mo.output.replace(mo.md(f"""
+        **Training complete** in {train_elapsed:.0f}s
+
+        | model | epochs |
+        |-------|--------|
+        | AR + teacher forcing | {len(history['train_loss'])} |
+        | Single-pass baseline | {len(history_baseline['train_loss'])} |
+        """))
+    else:
+        from experiment import ExperimentBundle
+
+        mo.stop(not load_button.value, mo.md("Select experiments and click **Load experiments**."))
+
+        _results_sources = {
+            "Local": str(Path(__file__).resolve().parent.parent / "results"),
+            "Kingston": "/Volumes/imaging.data/ppilip/results/models",
+        }
+        _results_path = Path(_results_sources[load_source_selector.value])
+
+        _bundle_ar = ExperimentBundle.load(str(_results_path / load_ar_dropdown.value))
+        _bundle_bl = ExperimentBundle.load(str(_results_path / load_bl_dropdown.value))
+
+        _cfg_ar = _bundle_ar.model_config
+        _cfg_bl = _bundle_bl.model_config
+        _expected_encoder_dim = 1 + n_stim
+        _dim_mismatch = (
+            _cfg_ar.get("encoder_dim") != _expected_encoder_dim
+            or _cfg_bl.get("encoder_dim") != _expected_encoder_dim
+        )
+        mo.stop(_dim_mismatch, mo.callout(
+            mo.md(
+                f"**Dimension mismatch:** loaded model expects encoder_dim="
+                f"{_cfg_ar.get('encoder_dim')}/{_cfg_bl.get('encoder_dim')} "
+                f"but current data source has {_expected_encoder_dim}. "
+                f"Change the **Data source** dropdown to match the loaded experiment "
+                f"(`{_cfg_ar.get('data_source', '?')}`)."
+            ),
+            kind="warn",
+        ))
+
+        model.load_state_dict(_bundle_ar.model_state_dict)
+        model.to(device)
+        model.eval()
+
+        model_baseline.load_state_dict(_bundle_bl.model_state_dict)
+        model_baseline.to(device)
+        model_baseline.eval()
+
+        history = _bundle_ar.training_results.get("history", {"train_loss": [], "val_loss": []})
+        history_baseline = _bundle_bl.training_results.get("history", {"train_loss": [], "val_loss": []})
+        train_elapsed = _bundle_ar.training_results.get("train_elapsed_s", 0.0)
+
+        _warn = ""
+        if _bundle_ar.warnings:
+            _warn += "\n**AR warnings:** " + ", ".join(_bundle_ar.warnings)
+        if _bundle_bl.warnings:
+            _warn += "\n**BL warnings:** " + ", ".join(_bundle_bl.warnings)
+
+        tracker_ar = None
+        tracker_bl = None
+
+        mo.output.replace(mo.md(f"""
+        **Loaded from disk**
+
+        | model | source | epochs |
+        |-------|--------|--------|
+        | AR | `{load_ar_dropdown.value}` | {len(history.get('train_loss', []))} |
+        | Baseline | `{load_bl_dropdown.value}` | {len(history_baseline.get('train_loss', []))} |
+        {_warn}
+        """))
+    return history, history_baseline, tracker_ar, tracker_bl, train_elapsed
 
 
 @app.cell
@@ -985,9 +1103,6 @@ def _(
 
 @app.cell
 def _(
-    DATA_SOURCE,
-    EXPERIMENT_NAME,
-    config,
     fig_loss,
     fig_recon,
     history,
@@ -995,49 +1110,34 @@ def _(
     hostname,
     is_cluster,
     mo,
+    mode_selector,
     model,
     model_baseline,
-    n_stim,
-    results_base,
-    save_experiment,
+    tracker_ar,
+    tracker_bl,
     train_elapsed,
 ):
-    _model_config = dict(
-        encoder_dim=1 + n_stim,
-        stim_dim=n_stim,
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        history_len=config["history_len"],
-        future_len=config["future_len"],
-        data_source=DATA_SOURCE,
-    )
+    mo.stop(mode_selector.value != "Train new model", mo.md("_Loaded from disk — skipping save._"))
 
-    save_experiment(
-        directory=f"{results_base}/{EXPERIMENT_NAME}_ar",
+    _bundle_ar = tracker_ar.save_final(
         model=model,
-        model_config=dict(**_model_config, variant="autoregressive_tf"),
-        training_config=config,
         training_results={"history": history, "train_elapsed_s": train_elapsed},
         metrics={},
         figures={"loss_curves": fig_loss, "reconstructions": fig_recon},
-        name=f"{EXPERIMENT_NAME}_ar",
     )
 
-    save_experiment(
-        directory=f"{results_base}/{EXPERIMENT_NAME}_baseline",
+    _bundle_bl = tracker_bl.save_final(
         model=model_baseline,
-        model_config=dict(**_model_config, variant="single_pass"),
-        training_config=config,
         training_results={"history": history_baseline, "train_elapsed_s": train_elapsed},
         metrics={},
         figures={"loss_curves": fig_loss, "reconstructions": fig_recon},
-        name=f"{EXPERIMENT_NAME}_baseline",
     )
 
     _env_label = f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
-    mo.md(f"**Saved** `{EXPERIMENT_NAME}_ar/` and `{EXPERIMENT_NAME}_baseline/` on {_env_label}")
+    mo.md(f"**Saved** on {_env_label}\n\n- `{_bundle_ar.save_dir}`\n- `{_bundle_bl.save_dir}`")
     return
 
 
 if __name__ == "__main__":
+    print('a')
     app.run()

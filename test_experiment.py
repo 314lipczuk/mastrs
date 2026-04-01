@@ -11,7 +11,7 @@ import torch.nn as nn
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
-from experiment import ExperimentBundle, save_experiment, load_experiment
+from experiment import ExperimentBundle, ExperimentTracker, save_experiment, load_experiment
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ def bundle_dir(tmp_path):
     figures = {"loss_curve": _make_figure("Loss"), "scatter": _make_figure("Scatter")}
 
     d = str(tmp_path / "test_exp")
-    save_experiment(
+    bundle = save_experiment(
         directory=d,
         model=model,
         model_config=model_config,
@@ -58,7 +58,8 @@ def bundle_dir(tmp_path):
         normalization={"erk_mu": 1.5, "erk_sigma": 0.8},
     )
     plt.close("all")
-    return d
+    # save_experiment appends a timestamp+job suffix to the directory
+    return bundle.save_dir
 
 
 @pytest.fixture
@@ -227,6 +228,172 @@ class TestLegacyFormat:
 
     def test_no_bundle_pt_needed(self, legacy_dir):
         assert not (Path(legacy_dir) / "bundle.pt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Tests: ExperimentTracker
+# ---------------------------------------------------------------------------
+
+class TestExperimentTracker:
+    def _make_tracker(self, tmp_path, interval_s=3600):
+        return ExperimentTracker(
+            directory=str(tmp_path / "tracked_exp"),
+            name="tracked_exp",
+            model_config={"input_dim": 4, "hidden_dim": 8},
+            training_config={"lr": 1e-3, "epochs": 10},
+            checkpoint_interval_s=interval_s,
+        )
+
+    def test_register_start_creates_directory(self, tmp_path):
+        tracker = self._make_tracker(tmp_path)
+        result_dir = tracker.register_start()
+        assert Path(result_dir).is_dir()
+        assert "tracked_exp" in result_dir
+
+    def test_register_start_creates_started_txt(self, tmp_path):
+        tracker = self._make_tracker(tmp_path)
+        result_dir = tracker.register_start()
+        started = Path(result_dir) / "started.txt"
+        assert started.exists()
+        content = started.read_text()
+        assert "name: tracked_exp" in content
+        assert "pid:" in content
+
+    def test_directory_has_timestamp_suffix(self, tmp_path):
+        tracker = self._make_tracker(tmp_path)
+        result_dir = tracker.register_start()
+        # Should have _YYYYMMDD_HHMMSS_jlocal suffix
+        assert "_jlocal" in result_dir or "_j" in result_dir
+
+    def test_checkpoint_before_register_raises(self, tmp_path):
+        tracker = self._make_tracker(tmp_path)
+        model = _TinyModel()
+        with pytest.raises(AssertionError, match="register_start"):
+            tracker.checkpoint(model)
+
+    def test_checkpoint_skipped_when_interval_not_elapsed(self, tmp_path):
+        tracker = self._make_tracker(tmp_path, interval_s=3600)
+        tracker.register_start()
+        model = _TinyModel()
+        saved = tracker.checkpoint(model, training_results={"loss": 0.5})
+        assert saved is False
+        assert tracker._checkpoint_count == 0
+
+    def test_checkpoint_force_saves_immediately(self, tmp_path):
+        tracker = self._make_tracker(tmp_path, interval_s=3600)
+        tracker.register_start()
+        model = _TinyModel()
+        saved = tracker.checkpoint(model, training_results={"loss": 0.5}, force=True)
+        assert saved is True
+        assert tracker._checkpoint_count == 1
+        ckpt_dir = Path(tracker.directory) / "checkpoints"
+        assert ckpt_dir.is_dir()
+        assert (ckpt_dir / "bundle.pt").exists()
+
+    def test_checkpoint_saves_when_interval_elapsed(self, tmp_path):
+        tracker = self._make_tracker(tmp_path, interval_s=0)
+        tracker.register_start()
+        model = _TinyModel()
+        saved = tracker.checkpoint(model, training_results={"loss": 0.5})
+        assert saved is True
+        assert tracker._checkpoint_count == 1
+
+    def test_checkpoint_overwrites_previous(self, tmp_path):
+        tracker = self._make_tracker(tmp_path, interval_s=0)
+        tracker.register_start()
+        model = _TinyModel()
+
+        tracker.checkpoint(model, training_results={"epoch": 1}, force=True)
+        tracker.checkpoint(model, training_results={"epoch": 5}, force=True)
+        assert tracker._checkpoint_count == 2
+
+        # Load the checkpoint — should have the latest training_results
+        ckpt_dir = Path(tracker.directory) / "checkpoints"
+        bundle = load_experiment(str(ckpt_dir))
+        assert bundle.training_results["epoch"] == 5
+
+    def test_checkpoint_contains_elapsed_time(self, tmp_path):
+        tracker = self._make_tracker(tmp_path, interval_s=0)
+        tracker.register_start()
+        model = _TinyModel()
+        tracker.checkpoint(model, training_results={"loss": 0.1}, force=True)
+
+        ckpt_dir = Path(tracker.directory) / "checkpoints"
+        bundle = load_experiment(str(ckpt_dir))
+        assert "train_elapsed_s" in bundle.training_results
+        assert bundle.training_results["train_elapsed_s"] >= 0
+
+    def test_checkpoint_preserves_model_weights(self, tmp_path):
+        tracker = self._make_tracker(tmp_path, interval_s=0)
+        tracker.register_start()
+        model = _TinyModel()
+
+        # Record weights before checkpoint
+        weights_before = model.fc.weight.clone()
+        tracker.checkpoint(model, force=True)
+        # Weights should be unchanged after checkpoint
+        assert torch.equal(model.fc.weight, weights_before)
+
+    def test_save_final_writes_to_root(self, tmp_path):
+        tracker = self._make_tracker(tmp_path)
+        tracker.register_start()
+        model = _TinyModel()
+        fig = _make_figure("final")
+
+        bundle = tracker.save_final(
+            model=model,
+            training_results={"loss": 0.01},
+            metrics={"mse": 0.05},
+            figures={"loss_curve": fig},
+        )
+        plt.close(fig)
+
+        assert (Path(tracker.directory) / "bundle.pt").exists()
+        assert (Path(tracker.directory) / "figures" / "loss_curve.png").exists()
+        assert bundle.name == "tracked_exp"
+        assert bundle.metrics["mse"] == pytest.approx(0.05)
+
+    def test_save_final_before_register_raises(self, tmp_path):
+        tracker = self._make_tracker(tmp_path)
+        model = _TinyModel()
+        with pytest.raises(AssertionError, match="register_start"):
+            tracker.save_final(model, {}, {}, {})
+
+    def test_checkpoint_and_final_coexist(self, tmp_path):
+        tracker = self._make_tracker(tmp_path, interval_s=0)
+        tracker.register_start()
+        model = _TinyModel()
+
+        tracker.checkpoint(model, training_results={"epoch": 3}, force=True)
+
+        fig = _make_figure("final")
+        tracker.save_final(model, {"epoch": 10}, {"mse": 0.01}, {"fig": fig})
+        plt.close(fig)
+
+        # Both should exist
+        root = Path(tracker.directory)
+        assert (root / "bundle.pt").exists()
+        assert (root / "checkpoints" / "bundle.pt").exists()
+
+        # Final bundle has final data
+        final = load_experiment(str(root))
+        assert final.training_results["epoch"] == 10
+
+        # Checkpoint has intermediate data
+        ckpt = load_experiment(str(root / "checkpoints"))
+        assert ckpt.training_results["epoch"] == 3
+
+    def test_two_trackers_get_different_directories(self, tmp_path):
+        t1 = self._make_tracker(tmp_path)
+        d1 = t1.register_start()
+        # Small delay not needed — timestamp includes seconds, but
+        # _make_experiment_directory uses the same base so they should differ
+        # if called at different times. Force a different name to be safe.
+        import time as _time
+        _time.sleep(1)
+        t2 = self._make_tracker(tmp_path)
+        d2 = t2.register_start()
+        assert d1 != d2
 
 
 # ---------------------------------------------------------------------------

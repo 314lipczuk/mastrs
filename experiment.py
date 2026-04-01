@@ -30,6 +30,8 @@ from __future__ import annotations
 import importlib
 import io
 import contextlib
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -173,6 +175,7 @@ class ExperimentBundle:
     metrics: dict
     figures: dict[str, Figure | np.ndarray]
     normalization: dict | None = None
+    save_dir: str | None = None
     warnings: list[str] = field(default_factory=list)
 
     def summary(self) -> None:
@@ -217,6 +220,7 @@ class ExperimentBundle:
     def save(self, directory: str) -> None:
         d = Path(directory)
         d.mkdir(parents=True, exist_ok=True)
+        self.save_dir = str(d)
 
         # Save figures as PNGs
         fig_dir = d / "figures"
@@ -439,6 +443,152 @@ class ExperimentBundle:
 # Convenience functions
 # ---------------------------------------------------------------------------
 
+def _make_experiment_directory(directory: str) -> str:
+    """Append a timestamp and SLURM job ID suffix to the directory name.
+
+    Turns e.g. "results/my_exp" into "results/my_exp_20260401_143012_j12345"
+    (or "_local" when not running under SLURM).
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slurm_id = os.environ.get("SLURM_JOB_ID", "local")
+    return f"{directory}_{ts}_j{slurm_id}"
+
+
+class ExperimentTracker:
+    """Manages an experiment directory with periodic checkpointing.
+
+    Creates a unique timestamped directory on ``register_start()``.
+    Call ``checkpoint()`` during training (e.g. every epoch) — it will
+    save an intermediate bundle to a ``checkpoints/`` subdirectory if
+    enough wall-clock time has elapsed since the last save.
+    Call ``save_final()`` at the end to write the completed bundle to
+    the experiment root.
+
+    Usage::
+
+        tracker = ExperimentTracker(
+            directory="results/my_exp",
+            name="my_exp",
+            model_config={...},
+            training_config=config,
+            checkpoint_interval_s=3600,
+        )
+        tracker.register_start()
+
+        for epoch in range(epochs):
+            train(...)
+            tracker.checkpoint(model, {"history": hist})
+
+        tracker.save_final(model, training_results, metrics, figures)
+    """
+
+    def __init__(
+        self,
+        directory: str,
+        name: str,
+        model_config: dict,
+        training_config: dict,
+        checkpoint_interval_s: float = 3600,
+        normalization: dict | None = None,
+    ):
+        self.base_directory = directory
+        self.directory: str | None = None
+        self.name = name
+        self.model_config = model_config
+        self.training_config = training_config
+        self.checkpoint_interval_s = checkpoint_interval_s
+        self.normalization = normalization
+        self._start_time: float | None = None
+        self._last_checkpoint_time: float | None = None
+        self._checkpoint_count = 0
+
+    def register_start(self) -> str:
+        """Create the experiment directory and record the start time.
+
+        Returns the resolved directory path.
+        """
+        self.directory = _make_experiment_directory(self.base_directory)
+        Path(self.directory).mkdir(parents=True, exist_ok=True)
+
+        self._start_time = time.time()
+        self._last_checkpoint_time = self._start_time
+
+        (Path(self.directory) / "started.txt").write_text(
+            f"name: {self.name}\n"
+            f"started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"slurm_job_id: {os.environ.get('SLURM_JOB_ID', 'local')}\n"
+            f"pid: {os.getpid()}\n"
+        )
+        print(f"[experiment] Started {self.name} → {self.directory}")
+        return self.directory
+
+    def checkpoint(
+        self,
+        model: nn.Module,
+        training_results: dict | None = None,
+        metrics: dict | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Save a checkpoint if enough time has passed (or force=True).
+
+        Overwrites the previous checkpoint each time (keeps only the latest).
+        Returns True if a checkpoint was written.
+        """
+        assert self.directory is not None, "Call register_start() first"
+
+        now = time.time()
+        if not force and (now - self._last_checkpoint_time) < self.checkpoint_interval_s:
+            return False
+
+        ckpt_dir = str(Path(self.directory) / "checkpoints")
+        elapsed = now - self._start_time
+
+        bundle = ExperimentBundle(
+            name=f"{self.name}_ckpt",
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            model_type=_model_type_string(model),
+            model_config=self.model_config,
+            model_state_dict=model.state_dict(),
+            training_config=self.training_config,
+            training_results={**(training_results or {}), "train_elapsed_s": elapsed},
+            metrics=metrics or {},
+            figures={},
+            normalization=self.normalization,
+        )
+        bundle.save(ckpt_dir)
+
+        self._last_checkpoint_time = now
+        self._checkpoint_count += 1
+        print(f"[ckpt] #{self._checkpoint_count} at {elapsed:.0f}s → {ckpt_dir}")
+        return True
+
+    def save_final(
+        self,
+        model: nn.Module,
+        training_results: dict,
+        metrics: dict,
+        figures: dict[str, Figure],
+    ) -> ExperimentBundle:
+        """Write the final experiment bundle to the experiment root."""
+        assert self.directory is not None, "Call register_start() first"
+
+        bundle = ExperimentBundle(
+            name=self.name,
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            model_type=_model_type_string(model),
+            model_config=self.model_config,
+            model_state_dict=model.state_dict(),
+            training_config=self.training_config,
+            training_results=training_results,
+            metrics=metrics,
+            figures=figures,
+            normalization=self.normalization,
+        )
+        bundle.save(self.directory)
+        print(f"[experiment] Final save → {self.directory}")
+        return bundle
+
+
 def save_experiment(
     directory: str,
     model: nn.Module,
@@ -452,8 +602,11 @@ def save_experiment(
 ) -> ExperimentBundle:
     """Save a complete experiment to a directory.
 
+    A timestamp and SLURM job ID are appended to the directory name
+    so that concurrent or repeated runs never overwrite each other.
+
     Args:
-        directory: path to save to (e.g. "results/my_exp")
+        directory: base path to save to (e.g. "results/my_exp")
         model: trained PyTorch model
         model_config: constructor kwargs that reproduce the model
         training_config: hyperparameters (lr, epochs, batch_size, etc.)
@@ -466,6 +619,8 @@ def save_experiment(
     Returns:
         The saved ExperimentBundle.
     """
+    directory = _make_experiment_directory(directory)
+
     bundle = ExperimentBundle(
         name=name,
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -479,6 +634,7 @@ def save_experiment(
         normalization=normalization,
     )
     bundle.save(directory)
+    print(f"[save_experiment] Saved to {directory}")
     return bundle
 
 

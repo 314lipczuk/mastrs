@@ -20,6 +20,7 @@ EXCLUDES=(
     "*.egg-info/"
     ".git/"
     cluster_results/
+    results/
 )
 
 # ── Build exclude flags ──────────────────────────────────────────────────────

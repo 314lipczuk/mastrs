@@ -45,8 +45,6 @@ def launch(job: Job, local: bool = False):
             "submit.sh",
             job.name,
             job.notebook,
-            "--headless",
-            "--",
             *cli_args,
         ]
         print(f"[sbatch] {' '.join(cmd)}")
@@ -59,8 +57,8 @@ JOBS = [
     Job(
         notebook="experiments/lstm_seq2seq.py",
         name="lstm_seq2seq_synthetic",
-        params=dict(source="synthetic", dry_run="false"),
-        time="24:00:00",
+        params=dict(source="synthetic", dry_run="true"),
+        time="04:00:00",
         mem="16G",
     ),
     #Job(

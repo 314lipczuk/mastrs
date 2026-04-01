@@ -47,7 +47,7 @@ def _run_single(source, config, results_base, experiment_name, device):
     from sklearn.model_selection import train_test_split
     from torch.utils.data import DataLoader, Subset
 
-    from experiment import save_experiment
+    from experiment import ExperimentTracker
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
 
     n_stim = len(STIM_COLS)
@@ -263,7 +263,13 @@ def _run_single(source, config, results_base, experiment_name, device):
                 losses.append(loss.item())
         return np.mean(losses)
 
-    def train_both(m_ar, m_bl, train_l, val_l, cfg):
+    def _checkpoint_with_best_weights(tracker, mdl, best_ckpt_path, hist):
+        _cur = {k: v.clone() for k, v in mdl.state_dict().items()}
+        mdl.load_state_dict(torch.load(best_ckpt_path, weights_only=True))
+        tracker.checkpoint(mdl, training_results={"history": hist})
+        mdl.load_state_dict(_cur)
+
+    def train_both(m_ar, m_bl, train_l, val_l, cfg, tracker_ar, tracker_bl):
         opt_ar = optim.Adam(m_ar.parameters(), lr=cfg["lr"], weight_decay=1e-5)
         opt_bl = optim.Adam(m_bl.parameters(), lr=cfg["lr"], weight_decay=1e-5)
         sched_ar = optim.lr_scheduler.ReduceLROnPlateau(opt_ar, patience=10, factor=0.5)
@@ -313,17 +319,14 @@ def _run_single(source, config, results_base, experiment_name, device):
             if done_ar and done_bl:
                 break
 
+            _checkpoint_with_best_weights(tracker_ar, m_ar, ckpt_ar, hist_ar)
+            _checkpoint_with_best_weights(tracker_bl, m_bl, ckpt_bl, hist_bl)
+
         m_ar.load_state_dict(torch.load(ckpt_ar, weights_only=True))
         m_bl.load_state_dict(torch.load(ckpt_bl, weights_only=True))
         os.remove(ckpt_ar)
         os.remove(ckpt_bl)
         return hist_ar, hist_bl, best_ar, best_bl
-
-    t0 = time.time()
-    history_ar, history_bl, best_val_ar, best_val_bl = train_both(
-        model, model_baseline, train_loader, val_loader, config
-    )
-    elapsed = time.time() - t0
 
     model_config = dict(
         encoder_dim=encoder_dim,
@@ -335,26 +338,40 @@ def _run_single(source, config, results_base, experiment_name, device):
         data_source=source,
     )
 
-    save_experiment(
+    tracker_ar = ExperimentTracker(
         directory=f"{results_base}/{experiment_name}_ar",
-        model=model,
+        name=f"{experiment_name}_ar",
         model_config=dict(**model_config, variant="autoregressive_tf"),
         training_config=config,
+    )
+    tracker_bl = ExperimentTracker(
+        directory=f"{results_base}/{experiment_name}_baseline",
+        name=f"{experiment_name}_baseline",
+        model_config=dict(**model_config, variant="single_pass"),
+        training_config=config,
+    )
+    tracker_ar.register_start()
+    tracker_bl.register_start()
+
+    t0 = time.time()
+    history_ar, history_bl, best_val_ar, best_val_bl = train_both(
+        model, model_baseline, train_loader, val_loader, config,
+        tracker_ar, tracker_bl,
+    )
+    elapsed = time.time() - t0
+
+    tracker_ar.save_final(
+        model=model,
         training_results={"history": history_ar, "train_elapsed_s": elapsed},
         metrics={"best_val_loss": best_val_ar},
         figures={},
-        name=f"{experiment_name}_ar",
     )
 
-    save_experiment(
-        directory=f"{results_base}/{experiment_name}_baseline",
+    tracker_bl.save_final(
         model=model_baseline,
-        model_config=dict(**model_config, variant="single_pass"),
-        training_config=config,
         training_results={"history": history_bl, "train_elapsed_s": elapsed},
         metrics={"best_val_loss": best_val_bl},
         figures={},
-        name=f"{experiment_name}_baseline",
     )
 
     return best_val_ar, best_val_bl, elapsed
@@ -438,30 +455,27 @@ def _():
     import os
     import time
     import tempfile
-    import getpass
     from datetime import datetime
     from sklearn.model_selection import train_test_split
     from torch.utils.data import DataLoader, Dataset, Subset
 
-    from experiment import save_experiment
-    from utils import get_device
+    from experiment import ExperimentTracker
+    from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
     device = get_device()
     n_stim = len(STIM_COLS)
 
-    hostname = getpass.getuser()
-    is_cluster = not hostname.startswith("polya")
-    results_base = (
-        "/Volumes/imaging.data/ppilip/results/models"
-        if is_cluster
-        else str(Path(__file__).resolve().parent.parent / "results")
-    )
+    hostname = get_username()
+    is_cluster = running_on_cluster()
+    results_base = results_write_path()
+
     return (
         DEFAULT_STIM_COLS,
         DataLoader,
         Dataset,
+        ExperimentTracker,
         STIM_COLS,
         Subset,
         device,
@@ -475,9 +489,9 @@ def _():
         np,
         optim,
         os,
+        parse_bool,
         plt,
         results_base,
-        save_experiment,
         tempfile,
         time,
         torch,
@@ -490,7 +504,7 @@ def _(mo):
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
-    DRY_RUN = args.get("dry_run", "true").lower() == "true"
+    DRY_RUN = parse_bool(args.get("dry_run", True))
     _cli_source = args.get("source", None)
     source_selector = mo.ui.dropdown(
         options=["synthetic", "real"],
@@ -546,7 +560,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
 
 @app.cell
 def _(DRY_RUN, EXPERIMENT_NAME, args, device, mo, results_base):
-    _gridsearch = args.get("gridsearch", "false").lower() == "true"
+    _gridsearch = parse_bool(args.get("gridsearch", False), default=False)
     if _gridsearch:
         _sources = args.get("gridsearch_sources", "synthetic").split(",")
         for _src in _sources:
@@ -913,21 +927,36 @@ def _(config, device, mo, n_stim, nn, torch):
 
 @app.cell
 def _(
+    DATA_SOURCE,
+    EXPERIMENT_NAME,
+    ExperimentTracker,
     config,
     device,
     mo,
     model,
     model_baseline,
+    n_stim,
     nn,
     np,
     optim,
     os,
+    results_base,
     tempfile,
     time,
     torch,
     train_loader,
     val_loader,
 ):
+    _model_config_shared = dict(
+        encoder_dim=1 + n_stim,
+        stim_dim=n_stim,
+        hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+        history_len=config["history_len"],
+        future_len=config["future_len"],
+        data_source=DATA_SOURCE,
+    )
+
     def _run_epoch_ar(model, loader, device, optimizer, cfg, epoch, is_train):
         if is_train:
             model.train()
@@ -981,7 +1010,14 @@ def _(
                 losses.append(loss.item())
         return np.mean(losses)
 
-    def train_both(model_ar, model_bl, train_loader, val_loader, cfg, device):
+    def _checkpoint_with_best_weights(tracker, mdl, best_ckpt_path, hist):
+        _cur = {k: v.clone() for k, v in mdl.state_dict().items()}
+        mdl.load_state_dict(torch.load(best_ckpt_path, weights_only=True))
+        tracker.checkpoint(mdl, training_results={"history": hist})
+        mdl.load_state_dict(_cur)
+
+    def train_both(model_ar, model_bl, train_loader, val_loader, cfg, device,
+                   tracker_ar, tracker_bl):
         opt_ar = optim.Adam(model_ar.parameters(), lr=cfg["lr"], weight_decay=1e-5)
         opt_bl = optim.Adam(model_bl.parameters(), lr=cfg["lr"], weight_decay=1e-5)
         sched_ar = optim.lr_scheduler.ReduceLROnPlateau(opt_ar, patience=10, factor=0.5)
@@ -1046,15 +1082,34 @@ def _(
                 bl_str = f"BL T:{t_bl:.5f} V:{v_bl:.5f}" if not done_bl else "BL done"
                 print(f"Epoch {epoch:3d} | {ar_str} | {bl_str}")
 
+            _checkpoint_with_best_weights(tracker_ar, model_ar, ckpt_ar, hist_ar)
+            _checkpoint_with_best_weights(tracker_bl, model_bl, ckpt_bl, hist_bl)
+
         model_ar.load_state_dict(torch.load(ckpt_ar, weights_only=True))
         model_bl.load_state_dict(torch.load(ckpt_bl, weights_only=True))
         os.remove(ckpt_ar)
         os.remove(ckpt_bl)
         return hist_ar, hist_bl
 
+    tracker_ar = ExperimentTracker(
+        directory=f"{results_base}/{EXPERIMENT_NAME}_ar",
+        name=f"{EXPERIMENT_NAME}_ar",
+        model_config=dict(**_model_config_shared, variant="autoregressive_tf"),
+        training_config=config,
+    )
+    tracker_bl = ExperimentTracker(
+        directory=f"{results_base}/{EXPERIMENT_NAME}_baseline",
+        name=f"{EXPERIMENT_NAME}_baseline",
+        model_config=dict(**_model_config_shared, variant="single_pass"),
+        training_config=config,
+    )
+    tracker_ar.register_start()
+    tracker_bl.register_start()
+
     _t0 = time.time()
     history, history_baseline = train_both(
-        model, model_baseline, train_loader, val_loader, config, device
+        model, model_baseline, train_loader, val_loader, config, device,
+        tracker_ar, tracker_bl,
     )
     train_elapsed = time.time() - _t0
 
@@ -1066,7 +1121,7 @@ def _(
     | AR + teacher forcing | {len(history["train_loss"])} |
     | Single-pass baseline | {len(history_baseline["train_loss"])} |
     """)
-    return history, history_baseline, train_elapsed
+    return history, history_baseline, tracker_ar, tracker_bl, train_elapsed
 
 
 @app.cell
@@ -1543,9 +1598,6 @@ def _(
 
 @app.cell
 def _(
-    DATA_SOURCE,
-    EXPERIMENT_NAME,
-    config,
     fig_loss,
     fig_recon,
     history,
@@ -1555,51 +1607,29 @@ def _(
     mo,
     model,
     model_baseline,
-    n_stim,
-    results_base,
-    save_experiment,
+    tracker_ar,
+    tracker_bl,
     train_elapsed,
 ):
-    _model_config = dict(
-        encoder_dim=1 + n_stim,
-        stim_dim=n_stim,
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        history_len=config["history_len"],
-        future_len=config["future_len"],
-        data_source=DATA_SOURCE,
-    )
-
-    save_experiment(
-        directory=f"{results_base}/{EXPERIMENT_NAME}_ar",
+    _bundle_ar = tracker_ar.save_final(
         model=model,
-        model_config=dict(**_model_config, variant="autoregressive_tf"),
-        training_config=config,
         training_results={"history": history, "train_elapsed_s": train_elapsed},
         metrics={},
         figures={"loss_curves": fig_loss, "reconstructions": fig_recon},
-        name=f"{EXPERIMENT_NAME}_ar",
     )
 
-    save_experiment(
-        directory=f"{results_base}/{EXPERIMENT_NAME}_baseline",
+    _bundle_bl = tracker_bl.save_final(
         model=model_baseline,
-        model_config=dict(**_model_config, variant="single_pass"),
-        training_config=config,
-        training_results={
-            "history": history_baseline,
-            "train_elapsed_s": train_elapsed,
-        },
+        training_results={"history": history_baseline, "train_elapsed_s": train_elapsed},
         metrics={},
         figures={"loss_curves": fig_loss, "reconstructions": fig_recon},
-        name=f"{EXPERIMENT_NAME}_baseline",
     )
 
     _env_label = (
         f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
     )
     mo.md(
-        f"**Saved** `{EXPERIMENT_NAME}_ar/` and `{EXPERIMENT_NAME}_baseline/` on {_env_label}"
+        f"**Saved** on {_env_label}\n\n- `{_bundle_ar.save_dir}`\n- `{_bundle_bl.save_dir}`"
     )
     return
 
@@ -1613,28 +1643,18 @@ if __name__ == "__main__":
     _parser.add_argument("--results_base", default="")
     _ns, _remaining = _parser.parse_known_args()
 
-    _GRIDSEARCH = _ns.gridsearch.lower() == "true"
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from utils import parse_bool, results_write_path, get_device
+
+    _GRIDSEARCH = parse_bool(_ns.gridsearch, default=False)
     _SOURCES = _ns.gridsearch_sources.split(",")
-    _DRY_RUN = _ns.dry_run.lower() == "true"
+    _DRY_RUN = parse_bool(_ns.dry_run, default=True)
     _NAME = _ns.name
     _RESULTS_BASE = _ns.results_base
 
     if _GRIDSEARCH:
-        import getpass
-        import sys
-
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from utils import get_device
-
-        hostname = getpass.getuser()
-        is_cluster = not hostname.startswith("polya")
-        results_base = (
-            "/Volumes/imaging.data/ppilip/results/models"
-            if is_cluster
-            else str(Path(__file__).resolve().parent.parent / "results")
-        )
-        if _RESULTS_BASE:
-            results_base = _RESULTS_BASE
+        results_base = _RESULTS_BASE or results_write_path()
         device = get_device()
 
         for source in _SOURCES:

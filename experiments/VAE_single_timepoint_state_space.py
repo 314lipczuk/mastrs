@@ -28,7 +28,7 @@ def _():
     from model.dl.cvae import ConditionalBetaVAE
     from eval_cvae import evaluate
     from experiment import save_experiment
-    from utils import get_device
+    from utils import get_device, parse_bool
 
     device = get_device()
     return (
@@ -46,6 +46,7 @@ def _():
         os,
         pd,
         plt,
+        parse_bool,
         save_experiment,
         tempfile,
         time,
@@ -55,11 +56,11 @@ def _():
 
 
 @app.cell
-def _(mo):
+def _(mo, parse_bool):
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "default_name")
-    DRY_RUN = args.get("dry_run", "true").lower() == "true"
+    DRY_RUN = parse_bool(args.get("dry_run", True))
 
     config = dict(
         hidden_dim=int(args.get("hidden_dim", "32")),

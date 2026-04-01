@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# SLURM/SSH jobs get a minimal PATH; ensure uv is available
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+source "$HOME/.bashrc" 2>/dev/null || source "$HOME/.profile" 2>/dev/null || true
+
 # ── Args: NAME NOTEBOOK [-- marimo cli args...] ──────────────────────────────
 NAME="${1:?Usage: submit.sh NAME NOTEBOOK [-- --key value ...]}"
 NOTEBOOK="${2:?Usage: submit.sh NAME NOTEBOOK [-- --key value ...]}"
@@ -21,6 +25,6 @@ echo "GPU        : $(nvidia-smi --query-gpu=name,memory.total --format=csv,nohea
 echo "══════════════════════════════════════════════════════"
 
 uv sync
-uv run marimo run "$NOTEBOOK" -- --port 0 --name "$NAME" "$@"
+PYTHONUNBUFFERED=1 uv run marimo export html "$NOTEBOOK" -o "/mnt/imaging.data/ppilip/${NAME}.html" -- --name "$NAME" "$@"
 
 echo "Job finished: $(date)"
