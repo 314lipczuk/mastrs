@@ -378,16 +378,24 @@ def _run_single(source, config, results_base, experiment_name, device):
 
 
 def _run_gridsearch(source, dry_run, results_base, experiment_name, device):
+    import os
     import time
+    from datetime import datetime
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slurm_id = os.environ.get("SLURM_JOB_ID", "local")
+    gs_dir = f"{results_base}/{experiment_name}_gridsearch_{source}_{ts}_j{slurm_id}"
+    os.makedirs(gs_dir, exist_ok=True)
 
     grid = _build_param_grid(dry_run)
     keys, values = zip(*grid.items())
     total = len(list(itertools.product(*values)))
-    out_path = f"{results_base}/{experiment_name}_gridsearch_{source}.csv"
+    out_path = f"{gs_dir}/results.csv"
 
     print(
         f"[GRIDSEARCH] {source} | {len(keys)} params | {total} combinations | dry_run={dry_run}"
     )
+    print(f"[GRIDSEARCH] Directory: {gs_dir}")
     print(f"[GRIDSEARCH] Grid: {dict(zip(keys, [[v for v in vs] for vs in values]))}")
 
     results = []
@@ -402,7 +410,7 @@ def _run_gridsearch(source, dry_run, results_base, experiment_name, device):
         print(f"[GRIDSEARCH] ({i + 1}/{total}) {name}")
         try:
             best_ar, best_bl, elapsed = _run_single(
-                source, cfg, results_base, name, device
+                source, cfg, gs_dir, name, device
             )
             results.append(
                 {
@@ -436,7 +444,7 @@ def _run_gridsearch(source, dry_run, results_base, experiment_name, device):
     pd.DataFrame(results).to_csv(out_path, index=False)
     print(f"[GRIDSEARCH] Done. Results saved to {out_path}")
     print(pd.DataFrame(results).to_string(index=False))
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), gs_dir
 
 @app.cell
 def _():
@@ -560,14 +568,136 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
 @app.cell
 def _(DRY_RUN, EXPERIMENT_NAME, args, device, mo, parse_bool, results_base):
     from experiments.lstm_gridsearch_seq2seq import _run_gridsearch
+    import pandas as pd
 
     _gridsearch = parse_bool(args.get("gridsearch", False), default=False)
+    gs_results_df = None
+    gs_directory = None
     if _gridsearch:
         _sources = args.get("gridsearch_sources", "synthetic").split(",")
         for _src in _sources:
-            _run_gridsearch(_src, DRY_RUN, results_base, EXPERIMENT_NAME, device)
-    mo.stop(_gridsearch, mo.md("Gridsearch complete."))
-    return
+            gs_results_df, gs_directory = _run_gridsearch(
+                _src, DRY_RUN, results_base, EXPERIMENT_NAME, device
+            )
+    mo.stop(_gridsearch, mo.md(f"Gridsearch complete. Results in `{gs_directory}`"))
+    return gs_directory, gs_results_df
+
+
+@app.cell
+def _(gs_results_df, mo, np, plt):
+    mo.stop(gs_results_df is None)
+
+    df = gs_results_df.dropna(subset=["best_val_ar", "best_val_bl"]).copy()
+    df["best_val_min"] = df[["best_val_ar", "best_val_bl"]].min(axis=1)
+    df_sorted = df.sort_values("best_val_min")
+
+    n_show = min(15, len(df_sorted))
+    top = df_sorted.head(n_show)
+    labels = [
+        f"h{int(r.hidden_dim)}_l{int(r.num_layers)}_H{int(r.history_len)}_F{int(r.future_len)}_lr{r.lr}_bs{int(r.batch_size)}"
+        for r in top.itertuples()
+    ]
+
+    fig_top, _ax = plt.subplots(figsize=(12, max(4, n_show * 0.35)))
+    _y = np.arange(n_show)
+    _ax.barh(_y - 0.15, top["best_val_ar"].values, height=0.3, label="AR", color="#4c72b0")
+    _ax.barh(_y + 0.15, top["best_val_bl"].values, height=0.3, label="Baseline", color="#dd8452")
+    _ax.set_yticks(_y)
+    _ax.set_yticklabels(labels, fontsize=8)
+    _ax.set_xlabel("Best validation loss")
+    _ax.set_title(f"Top {n_show} configurations (lower is better)")
+    _ax.legend()
+    _ax.invert_yaxis()
+    fig_top.tight_layout()
+
+    mo.md("## Grid Search Results — Top Configurations")
+    return df, df_sorted, fig_top
+
+
+@app.cell
+def _(df, mo, np, plt):
+    mo.stop(df is None or len(df) == 0)
+
+    hp_cols = ["hidden_dim", "num_layers", "history_len", "future_len", "lr", "batch_size"]
+    hp_cols = [c for c in hp_cols if df[c].nunique() > 1]
+
+    _n_hp = len(hp_cols)
+    fig_hp, _axes = plt.subplots(1, _n_hp, figsize=(4 * _n_hp, 4), squeeze=False)
+    _axes = _axes[0]
+
+    for _i, _col in enumerate(hp_cols):
+        _grouped = df.groupby(_col)["best_val_min"].agg(["mean", "std", "min"]).reset_index()
+        _x = _grouped[_col].values.astype(float)
+        _axes[_i].errorbar(_x, _grouped["mean"], yerr=_grouped["std"], fmt="o-", capsize=4, label="mean +/- std")
+        _axes[_i].scatter(_x, _grouped["min"], marker="^", color="green", zorder=5, label="best")
+        _axes[_i].set_xlabel(_col)
+        _axes[_i].set_ylabel("Val loss" if _i == 0 else "")
+        _axes[_i].legend(fontsize=7)
+        _axes[_i].set_title(_col)
+
+    fig_hp.suptitle("Hyperparameter effect on validation loss", y=1.02)
+    fig_hp.tight_layout()
+
+    mo.md("## Hyperparameter Effects")
+    return fig_hp,
+
+
+@app.cell
+def _(df, mo, np, plt):
+    mo.stop(df is None or len(df) == 0)
+
+    if df["hidden_dim"].nunique() > 1 and df["num_layers"].nunique() > 1:
+        pivot = df.pivot_table(
+            values="best_val_min",
+            index="num_layers",
+            columns="hidden_dim",
+            aggfunc="mean",
+        )
+        fig_heat, _ax = plt.subplots(figsize=(6, 4))
+        _im = _ax.imshow(pivot.values, cmap="viridis_r", aspect="auto")
+        _ax.set_xticks(range(len(pivot.columns)))
+        _ax.set_xticklabels(pivot.columns)
+        _ax.set_yticks(range(len(pivot.index)))
+        _ax.set_yticklabels(pivot.index)
+        _ax.set_xlabel("hidden_dim")
+        _ax.set_ylabel("num_layers")
+        _ax.set_title("Mean val loss: hidden_dim × num_layers")
+        for _i in range(len(pivot.index)):
+            for _j in range(len(pivot.columns)):
+                _ax.text(_j, _i, f"{pivot.values[_i, _j]:.5f}", ha="center", va="center", fontsize=9, color="white")
+        fig_heat.colorbar(_im, ax=_ax)
+        fig_heat.tight_layout()
+    else:
+        fig_heat = None
+
+    mo.md("## Architecture Heatmap")
+    return fig_heat,
+
+
+@app.cell
+def _(df, mo, np, plt):
+    mo.stop(df is None or len(df) == 0)
+
+    _complexity = df["hidden_dim"] * df["num_layers"]
+    fig_scatter, _ax = plt.subplots(figsize=(8, 5))
+    _sc = _ax.scatter(
+        df["elapsed_s"] / 60,
+        df["best_val_min"],
+        s=_complexity * 2,
+        c=df["lr"],
+        cmap="coolwarm",
+        alpha=0.7,
+        edgecolors="k",
+        linewidths=0.5,
+    )
+    _ax.set_xlabel("Training time (minutes)")
+    _ax.set_ylabel("Best validation loss")
+    _ax.set_title("Training time vs performance (size = hidden_dim × num_layers, color = lr)")
+    fig_scatter.colorbar(_sc, ax=_ax, label="Learning rate")
+    fig_scatter.tight_layout()
+
+    mo.md("## Cost vs Performance")
+    return fig_scatter,
 
 
 @app.cell

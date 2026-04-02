@@ -20,26 +20,22 @@ def _():
     import os
     import time
     import tempfile
-    import getpass
     from datetime import datetime
     from sklearn.model_selection import train_test_split
     from torch.utils.data import DataLoader, Dataset, Subset
 
-    from experiment import save_experiment, ExperimentTracker
-    from utils import get_device
+    from experiment import ExperimentTracker
+    from utils import get_device, get_username, running_on_cluster, results_write_path, results_read_sources, parse_bool, experiment_mode_widget, experiment_mode_state
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
     device = get_device()
     n_stim = len(STIM_COLS)
 
-    hostname = getpass.getuser()
-    is_cluster = not hostname.startswith("polya")
-    results_base = (
-        "/Volumes/imaging.data/ppilip/results/models"
-        if is_cluster
-        else str(Path(__file__).resolve().parent.parent / "results")
-    )
+    hostname = get_username()
+    is_cluster = running_on_cluster()
+    results_base = results_write_path()
+
     return (
         DEFAULT_STIM_COLS,
         DataLoader,
@@ -59,6 +55,9 @@ def _():
         np,
         optim,
         os,
+        experiment_mode_state,
+        experiment_mode_widget,
+        parse_bool,
         plt,
         results_base,
         tempfile,
@@ -69,85 +68,42 @@ def _():
 
 
 @app.cell
-def _(Path, mo):
+def _(Path, experiment_mode_widget, mo, parse_bool):
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
-    DRY_RUN = args.get("dry_run", "true").lower() == "true"
+    DRY_RUN = parse_bool(args.get("dry_run", True))
     _cli_source = args.get("source", None)
 
-    mode_selector = mo.ui.radio(
-        options=["Train new model", "Load from disk"],
-        value="Train new model",
-        label="Mode",
-    )
-
-    _results_sources = {
-        "Local": str(Path(__file__).resolve().parent.parent / "results"),
-        "Kingston": "/Volumes/imaging.data/ppilip/results/models",
-    }
-    load_source_selector = mo.ui.dropdown(
-        options=list(_results_sources.keys()),
-        value="Kingston",
-        label="Results source",
+    _mode_widget, mode_ctx = experiment_mode_widget(
+        mo,
+        experiment_name_default=EXPERIMENT_NAME,
+        project_root=Path(__file__).resolve().parent.parent,
+        experiment_labels=["AR experiment", "Baseline experiment"],
     )
 
     source_selector = mo.ui.dropdown(
         options=["synthetic", "real"], value=_cli_source or "synthetic", label="Data source"
     )
 
-    mo.hstack([mode_selector, source_selector, load_source_selector], gap=2)
+    mo.vstack([
+        mo.hstack([source_selector], gap=2),
+        _mode_widget,
+    ])
     return (
         DRY_RUN,
         EXPERIMENT_NAME,
         args,
-        load_source_selector,
-        mode_selector,
+        mode_ctx,
         source_selector,
     )
 
 
 @app.cell
-def _(Path, load_source_selector, mo, mode_selector):
-    _is_load = mode_selector.value == "Load from disk"
-
-    _results_sources = {
-        "Local": str(Path(__file__).resolve().parent.parent / "results"),
-        "Kingston": "/Volumes/imaging.data/ppilip/results/models",
-    }
-    _results_path = Path(_results_sources[load_source_selector.value])
-
-    _experiment_dirs = []
-    if _is_load and _results_path.is_dir():
-        for _subdir in sorted(_results_path.iterdir()):
-            if not _subdir.is_dir():
-                continue
-            _has_pt = any(_subdir.glob("*.pt"))
-            _has_figures = (_subdir / "figures").is_dir()
-            if _has_pt and _has_figures:
-                _experiment_dirs.append(_subdir.name)
-
-    if _is_load and not _experiment_dirs:
-        mo.stop(True, mo.md(f"No experiments found in `{_results_path}`."))
-
-    load_ar_dropdown = mo.ui.dropdown(
-        options=_experiment_dirs or ["(none)"],
-        value=_experiment_dirs[0] if _experiment_dirs else "(none)",
-        label="AR experiment",
-    )
-    load_bl_dropdown = mo.ui.dropdown(
-        options=_experiment_dirs or ["(none)"],
-        value=_experiment_dirs[1] if len(_experiment_dirs) > 1 else (_experiment_dirs[0] if _experiment_dirs else "(none)"),
-        label="Baseline experiment",
-    )
-    load_button = mo.ui.run_button(label="Load experiments")
-
-    mo.output.replace(
-        mo.hstack([load_ar_dropdown, load_bl_dropdown, load_button], justify="start", gap=1)
-        if _is_load
-        else mo.md("")
-    )
-    return load_ar_dropdown, load_bl_dropdown, load_button
+def _(experiment_mode_state, mo, mode_ctx):
+    _load_widget, mode = experiment_mode_state(mo, mode_ctx)
+    _load_widget
+    return (mode,)
 
 
 @app.cell
@@ -194,6 +150,19 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
 
 
 @app.cell
+def _(mo, mode):
+    load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
+    train_button = mo.ui.run_button(label="Start training")
+
+    mo.output.replace(
+        mo.hstack([load_data_button, train_button], gap=1)
+        if mode.is_train
+        else mo.md("")
+    )
+    return load_data_button, train_button
+
+
+@app.cell
 def _(
     DATA_SOURCE,
     DRY_RUN,
@@ -202,6 +171,7 @@ def _(
     STIM_COLS,
     Subset,
     config,
+    load_data_button,
     load_real,
     load_synthetic,
     mo,
@@ -210,6 +180,7 @@ def _(
     torch,
     train_test_split,
 ):
+    mo.stop(not load_data_button.value, mo.md("Click **Load data & prepare datasets** to continue."))
     H = config["history_len"]
     F_ = config["future_len"]
     total_window = H + F_
@@ -467,12 +438,8 @@ def _(
     Path,
     config,
     device,
-    load_ar_dropdown,
-    load_bl_dropdown,
-    load_button,
-    load_source_selector,
     mo,
-    mode_selector,
+    mode,
     model,
     model_baseline,
     n_stim,
@@ -484,6 +451,7 @@ def _(
     tempfile,
     time,
     torch,
+    train_button,
     train_loader,
     val_loader,
 ):
@@ -612,7 +580,9 @@ def _(
         os.remove(ckpt_bl)
         return hist_ar, hist_bl
 
-    if mode_selector.value == "Train new model":
+    if mode.is_train:
+        mo.stop(not train_button.value, mo.md("Click **Start training** when ready."))
+
         tracker_ar = ExperimentTracker(
             directory=f"{results_base}/{EXPERIMENT_NAME}_ar",
             name=f"{EXPERIMENT_NAME}_ar",
@@ -635,27 +605,65 @@ def _(
         )
         train_elapsed = time.time() - _t0
 
-        mo.output.replace(mo.md(f"""
-        **Training complete** in {train_elapsed:.0f}s
+        _models_md = mo.md(f"""
+**Training complete** in {train_elapsed:.0f}s
 
-        | model | epochs |
-        |-------|--------|
-        | AR + teacher forcing | {len(history['train_loss'])} |
-        | Single-pass baseline | {len(history_baseline['train_loss'])} |
-        """))
+| model | epochs |
+|-------|--------|
+| AR + teacher forcing | {len(history['train_loss'])} |
+| Single-pass baseline | {len(history_baseline['train_loss'])} |
+""")
+        _config_md = mo.md(f"""
+**Config**
+
+| param | value |
+|-------|-------|
+| hidden_dim | {config['hidden_dim']} |
+| num_layers | {config['num_layers']} |
+| history / future | {config['history_len']} / {config['future_len']} |
+| lr | {config['lr']} |
+| batch_size | {config['batch_size']} |
+| patience | {config['patience']} |
+""")
+        _metrics_md = mo.md(f"""
+**Metrics**
+
+| model | final train | final val |
+|-------|-------------|-----------|
+| AR | {history['train_loss'][-1]:.4f} | {history['val_loss'][-1]:.4f} |
+| Baseline | {history_baseline['train_loss'][-1]:.4f} | {history_baseline['val_loss'][-1]:.4f} |
+""")
+        mo.output.replace(mo.hstack([_models_md, _config_md, _metrics_md], gap=2))
     else:
         from experiment import ExperimentBundle
 
-        mo.stop(not load_button.value, mo.md("Select experiments and click **Load experiments**."))
+        mo.stop(not mode.load_button_clicked, mo.md("Select experiments and click **Load experiments**."))
 
-        _results_sources = {
-            "Local": str(Path(__file__).resolve().parent.parent / "results"),
-            "Kingston": "/Volumes/imaging.data/ppilip/results/models",
-        }
-        _results_path = Path(_results_sources[load_source_selector.value])
+        _sel = mode.selected_experiments
+        _ar_name = _sel["AR experiment"]
+        _bl_name = _sel["Baseline experiment"]
+        mo.stop(not _ar_name or not _bl_name, mo.md("Select both AR and Baseline experiments."))
 
-        _bundle_ar = ExperimentBundle.load(str(_results_path / load_ar_dropdown.value))
-        _bundle_bl = ExperimentBundle.load(str(_results_path / load_bl_dropdown.value))
+        _bundle_ar = ExperimentBundle.load(str(mode.results_path / _ar_name))
+        _bundle_bl = ExperimentBundle.load(str(mode.results_path / _bl_name))
+
+        _cfg_ar = _bundle_ar.model_config
+        _cfg_bl = _bundle_bl.model_config
+        _expected_encoder_dim = 1 + n_stim
+        _dim_mismatch = (
+            _cfg_ar.get("encoder_dim") != _expected_encoder_dim
+            or _cfg_bl.get("encoder_dim") != _expected_encoder_dim
+        )
+        mo.stop(_dim_mismatch, mo.callout(
+            mo.md(
+                f"**Dimension mismatch:** loaded model expects encoder_dim="
+                f"{_cfg_ar.get('encoder_dim')}/{_cfg_bl.get('encoder_dim')} "
+                f"but current data source has {_expected_encoder_dim}. "
+                f"Change the **Data source** dropdown to match the loaded experiment "
+                f"(`{_cfg_ar.get('data_source', '?')}`)."
+            ),
+            kind="warn",
+        ))
 
         model.load_state_dict(_bundle_ar.model_state_dict)
         model.to(device)
@@ -669,24 +677,53 @@ def _(
         history_baseline = _bundle_bl.training_results.get("history", {"train_loss": [], "val_loss": []})
         train_elapsed = _bundle_ar.training_results.get("train_elapsed_s", 0.0)
 
-        _warn = ""
-        if _bundle_ar.warnings:
-            _warn += "\n**AR warnings:** " + ", ".join(_bundle_ar.warnings)
-        if _bundle_bl.warnings:
-            _warn += "\n**BL warnings:** " + ", ".join(_bundle_bl.warnings)
-
         tracker_ar = None
         tracker_bl = None
 
-        mo.output.replace(mo.md(f"""
-        **Loaded from disk**
+        _models_md = mo.md(f"""
+**Loaded from disk**
 
-        | model | source | epochs |
-        |-------|--------|--------|
-        | AR | `{load_ar_dropdown.value}` | {len(history.get('train_loss', []))} |
-        | Baseline | `{load_bl_dropdown.value}` | {len(history_baseline.get('train_loss', []))} |
-        {_warn}
-        """))
+| model | source | epochs |
+|-------|--------|--------|
+| AR | `{_ar_name}` | {len(history.get('train_loss', []))} |
+| Baseline | `{_bl_name}` | {len(history_baseline.get('train_loss', []))} |
+""")
+        _cfg_display = _bundle_ar.training_config or {}
+        _config_md = mo.md(f"""
+**Config**
+
+| param | value |
+|-------|-------|
+| hidden_dim | {_cfg_ar.get('hidden_dim', '?')} |
+| num_layers | {_cfg_ar.get('num_layers', '?')} |
+| history / future | {_cfg_ar.get('history_len', '?')} / {_cfg_ar.get('future_len', '?')} |
+| lr | {_cfg_display.get('lr', '?')} |
+| batch_size | {_cfg_display.get('batch_size', '?')} |
+| data_source | {_cfg_ar.get('data_source', '?')} |
+""")
+        _ar_final_t = history['train_loss'][-1] if history.get('train_loss') else '?'
+        _ar_final_v = history['val_loss'][-1] if history.get('val_loss') else '?'
+        _bl_final_t = history_baseline['train_loss'][-1] if history_baseline.get('train_loss') else '?'
+        _bl_final_v = history_baseline['val_loss'][-1] if history_baseline.get('val_loss') else '?'
+        _metrics_md = mo.md(f"""
+**Metrics**
+
+| model | final train | final val |
+|-------|-------------|-----------|
+| AR | {_ar_final_t:.4f if isinstance(_ar_final_t, float) else _ar_final_t} | {_ar_final_v:.4f if isinstance(_ar_final_v, float) else _ar_final_v} |
+| Baseline | {_bl_final_t:.4f if isinstance(_bl_final_t, float) else _bl_final_t} | {_bl_final_v:.4f if isinstance(_bl_final_v, float) else _bl_final_v} |
+""")
+        _warnings = []
+        if _bundle_ar.warnings:
+            _warnings.append(mo.callout(mo.md("**AR warnings:** " + ", ".join(_bundle_ar.warnings)), kind="warn"))
+        if _bundle_bl.warnings:
+            _warnings.append(mo.callout(mo.md("**BL warnings:** " + ", ".join(_bundle_bl.warnings)), kind="warn"))
+
+        _output = mo.vstack([
+            mo.hstack([_models_md, _config_md, _metrics_md], gap=2),
+            *_warnings,
+        ])
+        mo.output.replace(_output)
     return history, history_baseline, tracker_ar, tracker_bl, train_elapsed
 
 
@@ -1060,14 +1097,14 @@ def _(
     hostname,
     is_cluster,
     mo,
-    mode_selector,
+    mode,
     model,
     model_baseline,
     tracker_ar,
     tracker_bl,
     train_elapsed,
 ):
-    mo.stop(mode_selector.value != "Train new model", mo.md("_Loaded from disk — skipping save._"))
+    mo.stop(not mode.is_train, mo.md("_Loaded from disk — skipping save._"))
 
     _bundle_ar = tracker_ar.save_final(
         model=model,

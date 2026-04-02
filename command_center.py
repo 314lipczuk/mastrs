@@ -10,20 +10,22 @@ def _():
     import socket
     from pathlib import Path
     import os
+    import getpass
 
-    from utils import get_username, running_on_cluster, results_read_sources
-
-    return Path, get_username, mo, results_read_sources, running_on_cluster
+    return Path, getpass, mo
 
 
 @app.cell(hide_code=True)
-def _(Path, get_username, mo, results_read_sources, running_on_cluster):
-    hostname = get_username()
+def _(Path, getpass, mo):
+    hostname = getpass.getuser()
 
-    is_cluster = running_on_cluster()
+    is_cluster = not hostname.startswith("polya")
     env_label = f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
 
-    results_sources = results_read_sources(Path.cwd())
+    results_sources = {
+        "Local": str(Path.cwd() / "results"),
+        "Kingston": str('/Volumes/imaging.data/ppilip/results/models')
+    }
 
     source_selector = mo.ui.dropdown(
         options=list(results_sources.keys()),
@@ -32,7 +34,7 @@ def _(Path, get_username, mo, results_read_sources, running_on_cluster):
     )
 
     mo.vstack([
-        mo.md(f"# Command Center\n\nEnvironment: {env_label}"),
+        mo.md(f"# Experiment control\n\nEnvironment: {env_label}"),
         source_selector,
     ])
     return results_sources, source_selector

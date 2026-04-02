@@ -54,39 +54,34 @@ def launch(job: Job, local: bool = False):
 # ── Experiment definitions ────────────────────────────────────────────────────
 
 JOBS = [
-    Job(
-        notebook="experiments/lstm_seq2seq.py",
-        name="lstm_seq2seq_synthetic",
-        params=dict(source="synthetic", dry_run="true"),
-        time="04:00:00",
-        mem="16G",
-    ),
+    #Job(
+    #    notebook="experiments/lstm_seq2seq.py",
+    #    name="lstm_seq2seq_synthetic",
+    #    params=dict(source="synthetic", dry_run="false"),
+    #    time="18:00:00",
+    #    mem="16G",
+    #),
     #Job(
     #    notebook="experiments/lstm_seq2seq.py",
     #    name="lstm_seq2seq_real",
     #    params=dict(source="real", dry_run="false"),
-    #    time="24:00:00",
+    #    time="18:00:00",
     #    mem="16G",
     #),
-    #Job(
-    #    notebook="experiments/lstm_gridsearch_seq2seq.py",
-    #    name="lstm_gridsearch_synthetic",
-    #    params=dict(gridsearch="true", gridsearch_sources="synthetic", dry_run="false"),
-    #    time="23:00:00",
-    #    mem="32G",
-    #),
-    #Job(
-    #    notebook="experiments/lstm_gridsearch_seq2seq.py",
-    #    name="lstm_gridsearch_real",
-    #    params=dict(gridsearch="true", gridsearch_sources="real", dry_run="false"),
-    #    time="23:00:00",
-    #    mem="32G",
-    #),
-    #Job(
-    #    notebook="experiments/VAE_single_timepoint_state_space.py",
-    #    name="VAE_ss_H16-8_L3_b1",
-    #    params=dict(hidden_dims="16,8", latent_dim="3", beta="1.0", dry_run="false"),
-    #),
+    Job(
+        notebook="experiments/lstm_gridsearch_seq2seq.py",
+        name="lstm_gridsearch_synthetic_smaller",
+        params=dict(gridsearch="true", gridsearch_sources="synthetic", dry_run="false"),
+        time="15:00:00",
+        mem="32G",
+    ),
+    Job(
+        notebook="experiments/lstm_gridsearch_seq2seq.py",
+        name="lstm_gridsearch_real_smaller",
+        params=dict(gridsearch="true", gridsearch_sources="real", dry_run="false"),
+        time="15:00:00",
+        mem="32G",
+    ),
 ]
 
 if __name__ == "__main__":
