@@ -1,6 +1,9 @@
 import subprocess
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
+
+from utils import results_write_path
 
 
 @dataclass
@@ -21,6 +24,10 @@ def launch(job: Job, local: bool = False):
     """
     assert os.path.exists(job.notebook), f"Notebook not found: {job.notebook}"
 
+    ts = datetime.now().strftime("%Y-%m-%d_%H.%M.%S")
+    exp_dir = f"{results_write_path()}/{job.name}_{ts}"
+    os.makedirs(exp_dir, exist_ok=True)
+
     # Build the marimo cli args: --key value pairs
     cli_args = []
     for k, v in job.params.items():
@@ -29,7 +36,7 @@ def launch(job: Job, local: bool = False):
     if local:
         cmd = [
             "uv", "run", "marimo", "run", job.notebook,
-            "--", "--name", job.name, *cli_args,
+            "--", "--name", job.name, "--results-dir", exp_dir, *cli_args,
         ]
         print(f"[local] {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
@@ -40,11 +47,12 @@ def launch(job: Job, local: bool = False):
             f"--partition={job.partition}",
             f"--time={job.time}",
             f"--mem={job.mem}",
-            f"--output=/mnt/imaging.data/ppilip/{job.name}_%j.log",
-            f"--error=/mnt/imaging.data/ppilip/{job.name}_%j.log",
+            f"--output={exp_dir}/slurm.log",
+            f"--error={exp_dir}/slurm.log",
             "submit.sh",
             job.name,
             job.notebook,
+            exp_dir,
             *cli_args,
         ]
         print(f"[sbatch] {' '.join(cmd)}")
@@ -65,6 +73,13 @@ JOBS = [
         notebook="experiments/lstm_seq2seq.py",
         name="lstm_seq2seq_real",
         params=dict(source="real", dry_run="false"),
+        time="18:00:00",
+        mem="16G",
+    ),
+    Job(
+        notebook="experiments/lstm_seq2seq.py",
+        name="sanitycheck",
+        params=dict(source="real", dry_run="true"),
         time="18:00:00",
         mem="16G",
     ),

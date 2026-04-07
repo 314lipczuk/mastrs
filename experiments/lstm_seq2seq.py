@@ -80,7 +80,7 @@ def _(mo, parse_bool):
     return DRY_RUN, EXPERIMENT_NAME, args, source_selector
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     DATA_SOURCE = source_selector.value
 
@@ -125,9 +125,10 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
 
 @app.cell
 def _(mo):
+    _headless = "name" in mo.cli_args()
     load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
     train_button = mo.ui.run_button(label="Start training")
-    mo.hstack([load_data_button, train_button], gap=1)
+    mo.hstack([load_data_button, train_button], gap=1) if not _headless else None
     return load_data_button, train_button
 
 
@@ -149,7 +150,8 @@ def _(
     torch,
     train_test_split,
 ):
-    mo.stop(not load_data_button.value, mo.md("Click **Load data & prepare datasets** to continue."))
+    _headless = "name" in mo.cli_args()
+    mo.stop(not _headless and not load_data_button.value, mo.md("Click **Load data & prepare datasets** to continue."))
     H = config["history_len"]
     F_ = config["future_len"]
     total_window = H + F_
@@ -483,10 +485,12 @@ def _(
         os.remove(ckpt_bl)
         return hist_ar, hist_bl
 
-    mo.stop(not train_button.value, mo.md("Click **Start training** when ready."))
+    _headless = "name" in mo.cli_args()
+    mo.stop(not _headless and not train_button.value, mo.md("Click **Start training** when ready."))
 
+    _exp_dir = mo.cli_args().get("results-dir", f"{results_base}/{EXPERIMENT_NAME}")
     tracker = ExperimentTracker(
-        directory=f"{results_base}/{EXPERIMENT_NAME}",
+        directory=_exp_dir,
         name=EXPERIMENT_NAME,
         model_config=_model_config_shared,
         training_config=config,

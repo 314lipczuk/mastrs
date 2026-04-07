@@ -8,7 +8,6 @@ with app.setup:
     from pathlib import Path
     import base64
     import io
-    import re
     import numpy as np
     import matplotlib.pyplot as plt
     from matplotlib.figure import Figure
@@ -22,7 +21,6 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
     RESULTS_PATH = Path("/Volumes/imaging.data/ppilip/results/models")
-    LOGS_PATH = Path("/Volumes/imaging.data/ppilip")
     experiment_dirs = discover_experiments(RESULTS_PATH)
 
     mo.stop(not experiment_dirs, mo.md(f"No experiments found in `{RESULTS_PATH}`."))
@@ -34,7 +32,7 @@ def _():
     )
     load_button = mo.ui.run_button(label="Load")
     mo.hstack([experiment_dropdown, load_button], justify="start", gap=1)
-    return LOGS_PATH, RESULTS_PATH, experiment_dropdown, load_button
+    return RESULTS_PATH, experiment_dropdown, load_button
 
 
 @app.cell(hide_code=True)
@@ -306,19 +304,10 @@ def _(bundle):
     return
 
 
-@app.cell(column=1, hide_code=True)
-def _(LOGS_PATH, experiment_dropdown):
-    _exp_name = experiment_dropdown.value
-    _match = re.search(r"_j(\d+)", _exp_name)
-
-    log_file = None
-    _log_content = None
-    if _match:
-        _job_id = _match.group(1)
-        _candidates = sorted(LOGS_PATH.glob(f"*_{_job_id}.log"))
-        if _candidates:
-            log_file = _candidates[0]
-            _log_content = log_file.read_text()
+@app.cell(column=1)
+def _(exp_dir):
+    _log_file = exp_dir / "slurm.log"
+    _log_content = _log_file.read_text() if _log_file.exists() else None
 
     mo.stop(
         _log_content is None,
@@ -329,13 +318,13 @@ def _(LOGS_PATH, experiment_dropdown):
         mo.md("## Training log"),
         mo.plain_text(_log_content),
     ])
-    return (log_file,)
+    return
 
 
-@app.cell(hide_code=True)
-def _(log_file):
-    _html_file = log_file.with_suffix(".html") if log_file else None
-    _html_exists = _html_file is not None and _html_file.exists()
+@app.cell
+def _(exp_dir):
+    _html_file = exp_dir / "notebook.html"
+    _html_exists = _html_file.exists()
 
     open_html_button = mo.ui.run_button(
         label="Open notebook HTML",
@@ -346,12 +335,11 @@ def _(log_file):
     return (open_html_button,)
 
 
-@app.cell(hide_code=True)
-def _(log_file, open_html_button):
+@app.cell
+def _(exp_dir, open_html_button):
     mo.stop(not open_html_button.value)
 
-    _html_file = log_file.with_suffix(".html")
-    subprocess.Popen(["open", str(_html_file)])
+    subprocess.Popen(["open", str(exp_dir / "notebook.html")])
     return
 
 

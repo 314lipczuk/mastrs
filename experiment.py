@@ -625,7 +625,10 @@ class ExperimentTracker:
             assert self.directory is not None
             Path(self.directory).mkdir(parents=True, exist_ok=True)
         else:
-            self.directory = _make_experiment_directory(self.base_directory)
+            if Path(self.base_directory).is_dir():
+                self.directory = self.base_directory
+            else:
+                self.directory = _make_experiment_directory(self.base_directory)
             Path(self.directory).mkdir(parents=True, exist_ok=True)
 
         self._start_time = time.time()

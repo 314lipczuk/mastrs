@@ -10,10 +10,11 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 source "$HOME/.bashrc" 2>/dev/null || source "$HOME/.profile" 2>/dev/null || true
 
-# ── Args: NAME NOTEBOOK [-- marimo cli args...] ──────────────────────────────
-NAME="${1:?Usage: submit.sh NAME NOTEBOOK [-- --key value ...]}"
-NOTEBOOK="${2:?Usage: submit.sh NAME NOTEBOOK [-- --key value ...]}"
-shift 2
+# ── Args: NAME NOTEBOOK EXP_DIR [-- marimo cli args...] ──────────────────────
+NAME="${1:?Usage: submit.sh NAME NOTEBOOK EXP_DIR [-- --key value ...]}"
+NOTEBOOK="${2:?Usage: submit.sh NAME NOTEBOOK EXP_DIR [-- --key value ...]}"
+EXP_DIR="${3:?Usage: submit.sh NAME NOTEBOOK EXP_DIR [-- --key value ...]}"
+shift 3
 
 echo "══════════════════════════════════════════════════════"
 echo "Experiment : $NAME"
@@ -25,6 +26,6 @@ echo "GPU        : $(nvidia-smi --query-gpu=name,memory.total --format=csv,nohea
 echo "══════════════════════════════════════════════════════"
 
 uv sync
-PYTHONUNBUFFERED=1 uv run marimo export html "$NOTEBOOK" -o "/mnt/imaging.data/ppilip/${NAME}.html" -- --name "$NAME" "$@"
+PYTHONUNBUFFERED=1 uv run marimo export html "$NOTEBOOK" -o "$EXP_DIR/notebook.html" -- --name "$NAME" --results-dir "$EXP_DIR" "$@"
 
 echo "Job finished: $(date)"
