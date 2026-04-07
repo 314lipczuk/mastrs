@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import importlib
 import io
+import json
 import contextlib
 import os
+import platform
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -160,6 +162,79 @@ def _prepare_config_for_load(model_config: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Training statistics
+# ---------------------------------------------------------------------------
+
+def _get_device_name() -> str:
+    """Return the name of the active compute device."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(0)
+    if torch.backends.mps.is_available():
+        return f"Apple MPS ({platform.processor()})"
+    return "CPU"
+
+
+def compute_training_stats(
+    train_elapsed_s: float,
+    history: dict,
+    n_train_samples: int,
+    n_val_samples: int = 0,
+    model: nn.Module | None = None,
+    device_name: str | None = None,
+) -> dict:
+    """Compute standardized training statistics from a training run.
+
+    Args:
+        train_elapsed_s: total wall-clock training time in seconds.
+        history: dict with at least 'train_loss' and optionally 'val_loss' as lists.
+        n_train_samples: number of samples in training set.
+        n_val_samples: number of samples in validation set.
+        model: trained model (used to count parameters).
+        device_name: override device name string. Auto-detected if None.
+
+    Returns:
+        Dict of training statistics ready to be stored in training_results.
+    """
+    train_loss = history.get("train_loss", [])
+    val_loss = history.get("val_loss", [])
+    epochs = len(train_loss)
+
+    stats: dict = {
+        "train_elapsed_s": round(train_elapsed_s, 2),
+        "epochs_completed": epochs,
+        "time_per_epoch_s": round(train_elapsed_s / max(epochs, 1), 3),
+        "n_train_samples": n_train_samples,
+        "n_val_samples": n_val_samples,
+        "total_samples_seen": n_train_samples * epochs,
+        "samples_per_second": round(n_train_samples * epochs / max(train_elapsed_s, 1e-6), 1),
+        "device": device_name or _get_device_name(),
+    }
+
+    if model is not None:
+        stats["n_model_parameters"] = sum(p.numel() for p in model.parameters())
+
+    if train_loss:
+        stats["final_train_loss"] = round(train_loss[-1], 6)
+    if val_loss:
+        stats["final_val_loss"] = round(val_loss[-1], 6)
+        stats["best_val_loss"] = round(min(val_loss), 6)
+        stats["best_epoch"] = int(np.argmin(val_loss))
+
+        # Convergence epoch: first epoch reaching within 5% of best improvement
+        first_val = val_loss[0]
+        best_val = min(val_loss)
+        improvement = first_val - best_val
+        if improvement > 0:
+            threshold = first_val - 0.95 * improvement
+            convergence = next(
+                (i for i, v in enumerate(val_loss) if v <= threshold), epochs - 1
+            )
+            stats["convergence_epoch_95pct"] = convergence
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # ExperimentBundle
 # ---------------------------------------------------------------------------
 
@@ -188,14 +263,46 @@ class ExperimentBundle:
             for k, v in self.training_config.items():
                 print(f"    {k}: {v}")
             print()
-        if self.training_results:
-            print("  Training results:")
-            for k, v in self.training_results.items():
-                if isinstance(v, (list, np.ndarray)) and len(v) > 5:
-                    print(f"    {k}: [{len(v)} values]")
-                else:
-                    print(f"    {k}: {v}")
+        # Display training stats (from compute_training_stats) prominently
+        stats = self.training_results.get("stats", {})
+        if stats:
+            print("  Training stats:")
+            elapsed = stats.get("train_elapsed_s", 0)
+            if elapsed >= 3600:
+                time_str = f"{elapsed / 3600:.1f}h"
+            elif elapsed >= 60:
+                time_str = f"{elapsed / 60:.1f}m"
+            else:
+                time_str = f"{elapsed:.1f}s"
+            print(f"    Wall time        : {time_str}")
+            print(f"    Epochs           : {stats.get('epochs_completed', '?')}")
+            print(f"    Time/epoch       : {stats.get('time_per_epoch_s', '?')}s")
+            if "n_model_parameters" in stats:
+                print(f"    Parameters       : {stats['n_model_parameters']:,}")
+            print(f"    Train samples    : {stats.get('n_train_samples', '?'):,}")
+            print(f"    Val samples      : {stats.get('n_val_samples', '?'):,}")
+            print(f"    Total seen       : {stats.get('total_samples_seen', '?'):,}")
+            print(f"    Throughput       : {stats.get('samples_per_second', '?')} samples/s")
+            print(f"    Device           : {stats.get('device', '?')}")
+            if "best_val_loss" in stats:
+                print(f"    Best val loss    : {stats['best_val_loss']:.6f} (epoch {stats.get('best_epoch', '?')})")
+            if "final_train_loss" in stats:
+                print(f"    Final train loss : {stats['final_train_loss']:.6f}")
+            if "final_val_loss" in stats:
+                print(f"    Final val loss   : {stats['final_val_loss']:.6f}")
+            if "convergence_epoch_95pct" in stats:
+                print(f"    95% convergence  : epoch {stats['convergence_epoch_95pct']}")
             print()
+        if self.training_results:
+            other_results = {k: v for k, v in self.training_results.items() if k != "stats"}
+            if other_results:
+                print("  Training results:")
+                for k, v in other_results.items():
+                    if isinstance(v, (list, np.ndarray)) and len(v) > 5:
+                        print(f"    {k}: [{len(v)} values]")
+                    else:
+                        print(f"    {k}: {v}")
+                print()
         # Print scalar metrics
         scalar_metrics = {
             k: v for k, v in self.metrics.items()
@@ -449,7 +556,7 @@ def _make_experiment_directory(directory: str) -> str:
     Turns e.g. "results/my_exp" into "results/my_exp_20260401_143012_j12345"
     (or "_local" when not running under SLURM).
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     slurm_id = os.environ.get("SLURM_JOB_ID", "local")
     return f"{directory}_{ts}_j{slurm_id}"
 
@@ -501,14 +608,25 @@ class ExperimentTracker:
         self._start_time: float | None = None
         self._last_checkpoint_time: float | None = None
         self._checkpoint_count = 0
+        self._parent: ExperimentTracker | None = None
+        self._variant: str | None = None
+        self._subexperiments: dict[str, ExperimentTracker] = {}
 
     def register_start(self) -> str:
         """Create the experiment directory and record the start time.
 
+        For sub-experiments (created via ``make_subexperiment``), the directory
+        is a subdirectory of the parent — no timestamp suffix is appended.
+
         Returns the resolved directory path.
         """
-        self.directory = _make_experiment_directory(self.base_directory)
-        Path(self.directory).mkdir(parents=True, exist_ok=True)
+        if self._parent is not None:
+            # Sub-experiment: directory was pre-assigned by make_subexperiment
+            assert self.directory is not None
+            Path(self.directory).mkdir(parents=True, exist_ok=True)
+        else:
+            self.directory = _make_experiment_directory(self.base_directory)
+            Path(self.directory).mkdir(parents=True, exist_ok=True)
 
         self._start_time = time.time()
         self._last_checkpoint_time = self._start_time
@@ -519,6 +637,11 @@ class ExperimentTracker:
             f"slurm_job_id: {os.environ.get('SLURM_JOB_ID', 'local')}\n"
             f"pid: {os.getpid()}\n"
         )
+
+        # Write initial manifest for parent experiments with sub-experiments
+        if self._parent is None and self._subexperiments:
+            self._write_manifest()
+
         print(f"[experiment] Started {self.name} → {self.directory}")
         return self.directory
 
@@ -585,8 +708,81 @@ class ExperimentTracker:
             normalization=self.normalization,
         )
         bundle.save(self.directory)
+
+        # Update parent manifest if this is a sub-experiment
+        if self._parent is not None:
+            self._parent._write_manifest()
+
         print(f"[experiment] Final save → {self.directory}")
         return bundle
+
+    def make_subexperiment(
+        self,
+        variant: str,
+        model_config: dict,
+        training_config: dict | None = None,
+        checkpoint_interval_s: float | None = None,
+        normalization: dict | None = None,
+    ) -> "ExperimentTracker":
+        """Create a sub-experiment that saves into a subdirectory.
+
+        The child tracker works like a normal ``ExperimentTracker`` — it has
+        its own ``register_start()``, ``checkpoint()``, and ``save_final()``.
+        Its directory is ``self.directory / variant`` (no timestamp suffix).
+
+        Args:
+            variant: subdirectory name (e.g. "ar", "baseline").
+            model_config: model constructor kwargs for this variant.
+            training_config: override parent's training config (default: inherit).
+            checkpoint_interval_s: override parent's interval (default: inherit).
+            normalization: override parent's normalization (default: inherit).
+
+        Returns:
+            A child ExperimentTracker.
+        """
+        assert self.directory is not None, "Call register_start() on the parent first"
+
+        child = ExperimentTracker(
+            directory=str(Path(self.directory) / variant),
+            name=f"{self.name}_{variant}",
+            model_config=model_config,
+            training_config=training_config if training_config is not None else self.training_config,
+            checkpoint_interval_s=checkpoint_interval_s if checkpoint_interval_s is not None else self.checkpoint_interval_s,
+            normalization=normalization if normalization is not None else self.normalization,
+        )
+        child._parent = self
+        child._variant = variant
+        # Pre-assign directory so register_start() doesn't append a timestamp
+        child.directory = str(Path(self.directory) / variant)
+        self._subexperiments[variant] = child
+        return child
+
+    def _write_manifest(self) -> None:
+        """Write experiment.json to the experiment directory."""
+        assert self.directory is not None
+
+        subexps = {}
+        for variant, child in self._subexperiments.items():
+            child_dir = Path(child.directory) if child.directory else None
+            has_bundle = child_dir is not None and (child_dir / "bundle.pt").exists()
+            subexps[variant] = {
+                "name": child.name,
+                "model_config": _prepare_config_for_save(child.model_config),
+                "training_config": child.training_config,
+                "status": "completed" if has_bundle else "started",
+            }
+
+        manifest = {
+            "name": self.name,
+            "variants": list(self._subexperiments.keys()),
+            "shared_config": self.training_config,
+            "created": datetime.now().isoformat(),
+            "subexperiments": subexps,
+        }
+
+        (Path(self.directory) / "experiment.json").write_text(
+            json.dumps(manifest, indent=2, default=str)
+        )
 
 
 def save_experiment(
@@ -650,3 +846,37 @@ def load_experiment(directory: str) -> ExperimentBundle:
         for w in bundle.warnings:
             print(f"  ⚠ {w}")
     return bundle
+
+
+def load_experiment_group(directory: str) -> dict[str, ExperimentBundle]:
+    """Load all sub-experiments from a grouped experiment directory.
+
+    Reads ``experiment.json`` to discover variants, then loads each
+    variant's ``ExperimentBundle`` from its subdirectory.
+
+    Returns:
+        Dict mapping variant name to ExperimentBundle.
+
+    Raises:
+        FileNotFoundError: if ``experiment.json`` is missing.
+    """
+    d = Path(directory)
+    manifest_path = d / "experiment.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"No experiment.json in {d}. Use load_experiment() for single-bundle experiments."
+        )
+
+    manifest = json.loads(manifest_path.read_text())
+    bundles: dict[str, ExperimentBundle] = {}
+
+    for variant in manifest.get("variants", []):
+        variant_dir = d / variant
+        if variant_dir.is_dir() and (variant_dir / "bundle.pt").exists():
+            bundles[variant] = ExperimentBundle.load(str(variant_dir))
+        else:
+            print(f"  ⚠ Variant '{variant}' listed in manifest but not found on disk")
+
+    if bundles:
+        print(f"Loaded {len(bundles)} variant(s) from {d.name}: {list(bundles.keys())}")
+    return bundles

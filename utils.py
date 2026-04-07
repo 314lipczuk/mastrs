@@ -1,4 +1,5 @@
 import getpass
+import types
 from pathlib import Path
 
 import torch
@@ -82,8 +83,6 @@ def experiment_mode_widget(
 
     Default mode: "Train" in CLI (run mode), "Load" in editor.
     """
-    import dataclasses
-
     if experiment_labels is None:
         experiment_labels = ["Experiment"]
 
@@ -97,23 +96,25 @@ def experiment_mode_widget(
     )
 
     _sources = results_read_sources(project_root)
+    _source_keys = list(_sources.keys())
+    _default_source = "Kingston" if "Kingston" in _source_keys else _source_keys[0]
     source_selector = mo.ui.dropdown(
-        options=list(_sources.keys()),
-        value=list(_sources.keys())[0],
+        options=_source_keys,
+        value=_default_source,
         label="Results source",
     )
 
     widget = mo.hstack([mode_selector, source_selector], gap=2)
 
-    @dataclasses.dataclass(frozen=True)
-    class _ModeContext:
-        mode_selector: object = mode_selector
-        source_selector: object = source_selector
-        experiment_name: str = experiment_name_default
-        experiment_labels: tuple = tuple(experiment_labels)
-        sources: dict = dataclasses.field(default_factory=lambda: _sources)
+    _ctx = types.SimpleNamespace(
+        mode_selector=mode_selector,
+        source_selector=source_selector,
+        experiment_name=experiment_name_default,
+        experiment_labels=tuple(experiment_labels),
+        sources=_sources,
+    )
 
-    return widget, _ModeContext()
+    return widget, _ctx
 
 
 def experiment_mode_state(mo, ctx):
@@ -128,20 +129,26 @@ def experiment_mode_state(mo, ctx):
         selected_experiment, selected_experiment_path (single-slot shortcut),
         results_source, results_path
     """
-    import dataclasses
-
     _is_load = ctx.mode_selector.value == "Load from disk"
     _source_key = ctx.source_selector.value
     _sources = ctx.sources
     _results_path = Path(_sources[_source_key])
 
     # Scan for loadable experiments (sorted newest-first)
+    # Detects: finished (bundle.pt), checkpointed, manifested, grouped, or started-only
     _experiment_dirs = []
     if _is_load and _results_path.is_dir():
         for subdir in _results_path.iterdir():
             if not subdir.is_dir():
                 continue
-            if any(subdir.glob("*.pt")) and (subdir / "figures").is_dir():
+            has_final = (subdir / "bundle.pt").exists()
+            has_checkpoint = (subdir / "checkpoints" / "bundle.pt").exists()
+            has_manifest = (subdir / "experiment.json").exists()
+            has_started = (subdir / "started.txt").exists()
+            has_sub_bundles = any(
+                sub.glob("bundle.pt") for sub in subdir.iterdir() if sub.is_dir()
+            )
+            if has_final or has_checkpoint or has_manifest or has_sub_bundles or has_started:
                 _experiment_dirs.append(subdir)
         _experiment_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         _experiment_dirs = [d.name for d in _experiment_dirs]
@@ -167,20 +174,20 @@ def experiment_mode_state(mo, ctx):
         else mo.md("")
     )
 
-    @dataclasses.dataclass(frozen=True)
     class _ModeState:
-        is_train: bool = not _is_load
-        is_load: bool = _is_load
-        experiment_name: str = ctx.experiment_name
-        load_button: object = load_button
-        experiment_labels: tuple = ctx.experiment_labels
-        _dropdowns: dict = dataclasses.field(default_factory=lambda: _dropdowns)
-        results_source: str = _source_key
-        results_path: Path = _results_path
+        def __init__(self):
+            self.is_train = not _is_load
+            self.is_load = _is_load
+            self.experiment_name = ctx.experiment_name
+            self._load_button = load_button
+            self.experiment_labels = ctx.experiment_labels
+            self._dropdowns = _dropdowns
+            self.results_source = _source_key
+            self.results_path = _results_path
 
         @property
         def load_button_clicked(self):
-            return self.load_button.value if self.is_load else False
+            return self._load_button.value if self.is_load else False
 
         @property
         def selected_experiments(self):

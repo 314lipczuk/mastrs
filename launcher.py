@@ -54,34 +54,34 @@ def launch(job: Job, local: bool = False):
 # ── Experiment definitions ────────────────────────────────────────────────────
 
 JOBS = [
-    #Job(
-    #    notebook="experiments/lstm_seq2seq.py",
-    #    name="lstm_seq2seq_synthetic",
-    #    params=dict(source="synthetic", dry_run="false"),
-    #    time="18:00:00",
-    #    mem="16G",
-    #),
-    #Job(
-    #    notebook="experiments/lstm_seq2seq.py",
-    #    name="lstm_seq2seq_real",
-    #    params=dict(source="real", dry_run="false"),
-    #    time="18:00:00",
-    #    mem="16G",
-    #),
     Job(
-        notebook="experiments/lstm_gridsearch_seq2seq.py",
-        name="lstm_gridsearch_synthetic_smaller",
-        params=dict(gridsearch="true", gridsearch_sources="synthetic", dry_run="false"),
-        time="15:00:00",
-        mem="32G",
+        notebook="experiments/lstm_seq2seq.py",
+        name="lstm_seq2seq_synthetic",
+        params=dict(source="synthetic", dry_run="false"),
+        time="18:00:00",
+        mem="16G",
     ),
     Job(
-        notebook="experiments/lstm_gridsearch_seq2seq.py",
-        name="lstm_gridsearch_real_smaller",
-        params=dict(gridsearch="true", gridsearch_sources="real", dry_run="false"),
-        time="15:00:00",
-        mem="32G",
+        notebook="experiments/lstm_seq2seq.py",
+        name="lstm_seq2seq_real",
+        params=dict(source="real", dry_run="false"),
+        time="18:00:00",
+        mem="16G",
     ),
+    #Job(
+    #    notebook="experiments/lstm_gridsearch_seq2seq.py",
+    #    name="lstm_gridsearch_synthetic_smaller",
+    #    params=dict(gridsearch="true", gridsearch_sources="synthetic", dry_run="false"),
+    #    time="15:00:00",
+    #    mem="32G",
+    #),
+    #Job(
+    #    notebook="experiments/lstm_gridsearch_seq2seq.py",
+    #    name="lstm_gridsearch_real_smaller",
+    #    params=dict(gridsearch="true", gridsearch_sources="real", dry_run="false"),
+    #    time="15:00:00",
+    #    mem="32G",
+    #),
 ]
 
 if __name__ == "__main__":

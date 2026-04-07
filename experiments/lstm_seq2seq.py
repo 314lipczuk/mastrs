@@ -4,7 +4,7 @@ __generated_with = "0.21.1"
 app = marimo.App(width="full")
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
     import sys
     from pathlib import Path
@@ -24,7 +24,7 @@ def _():
     from sklearn.model_selection import train_test_split
     from torch.utils.data import DataLoader, Dataset, Subset
 
-    from experiment import ExperimentTracker
+    from experiment import ExperimentTracker, compute_training_stats, load_experiment_group
     from utils import get_device, get_username, running_on_cluster, results_write_path, results_read_sources, parse_bool, experiment_mode_widget, experiment_mode_state
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
@@ -35,7 +35,6 @@ def _():
     hostname = get_username()
     is_cluster = running_on_cluster()
     results_base = results_write_path()
-
     return (
         DEFAULT_STIM_COLS,
         DataLoader,
@@ -44,9 +43,13 @@ def _():
         Path,
         STIM_COLS,
         Subset,
+        compute_training_stats,
         device,
+        experiment_mode_state,
+        experiment_mode_widget,
         hostname,
         is_cluster,
+        load_experiment_group,
         load_real,
         load_synthetic,
         mo,
@@ -55,8 +58,6 @@ def _():
         np,
         optim,
         os,
-        experiment_mode_state,
-        experiment_mode_widget,
         parse_bool,
         plt,
         results_base,
@@ -79,7 +80,7 @@ def _(Path, experiment_mode_widget, mo, parse_bool):
         mo,
         experiment_name_default=EXPERIMENT_NAME,
         project_root=Path(__file__).resolve().parent.parent,
-        experiment_labels=["AR experiment", "Baseline experiment"],
+        experiment_labels=["Experiment"],
     )
 
     source_selector = mo.ui.dropdown(
@@ -90,13 +91,7 @@ def _(Path, experiment_mode_widget, mo, parse_bool):
         mo.hstack([source_selector], gap=2),
         _mode_widget,
     ])
-    return (
-        DRY_RUN,
-        EXPERIMENT_NAME,
-        args,
-        mode_ctx,
-        source_selector,
-    )
+    return DRY_RUN, EXPERIMENT_NAME, args, mode_ctx, source_selector
 
 
 @app.cell
@@ -106,22 +101,46 @@ def _(experiment_mode_state, mo, mode_ctx):
     return (mode,)
 
 
-@app.cell
-def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
+@app.cell(hide_code=True)
+def _(DRY_RUN, EXPERIMENT_NAME, args, mo, mode, source_selector):
     DATA_SOURCE = source_selector.value
 
+    # When loading from disk, inherit config from the loaded experiment bundle
+    _loaded_cfg = {}
+    if mode.is_load and mode.load_button_clicked and mode.selected_experiment_path:
+        from experiment import ExperimentBundle as _EB, load_experiment_group as _leg
+        _exp_path = mode.selected_experiment_path
+        try:
+            if (_exp_path / "experiment.json").exists():
+                _bundles = _leg(str(_exp_path))
+                _b = next(iter(_bundles.values()))
+            else:
+                _b = _EB.load(str(_exp_path))
+            _loaded_cfg = {**(_b.training_config or {}), **(_b.model_config or {})}
+            if _b.model_config.get("data_source"):
+                DATA_SOURCE = _b.model_config["data_source"]
+        except Exception:
+            pass
+
+    def _get(key, default):
+        if _loaded_cfg and key in _loaded_cfg:
+            return _loaded_cfg[key]
+        return args.get(key, default)
+
     config = dict(
-        hidden_dim=int(args.get("hidden_dim", "32" if DRY_RUN else "32")),
-        num_layers=int(args.get("num_layers", "2" if DRY_RUN else "2")),
-        history_len=int(args.get("history_len", "15")),
-        future_len=int(args.get("future_len", "10")),
-        lr=float(args.get("lr", "1e-3")),
-        epochs=int(args.get("epochs", "50" if DRY_RUN else "200")),
-        batch_size=int(args.get("batch_size", "64")),
-        patience=int(args.get("patience", "20" if DRY_RUN else "50")),
-        tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
-        tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
+        hidden_dim=int(_get("hidden_dim", "16" if DRY_RUN else "32")),
+        num_layers=int(_get("num_layers", "2")),
+        history_len=int(_get("history_len", "15")),
+        future_len=int(_get("future_len", "10")),
+        lr=float(_get("lr", "1e-3")),
+        epochs=int(_get("epochs", "50" if DRY_RUN else "200")),
+        batch_size=int(_get("batch_size", "64")),
+        patience=int(_get("patience", "20" if DRY_RUN else "50")),
+        tf_ratio_start=float(_get("tf_ratio_start", "1.0")),
+        tf_ratio_end=float(_get("tf_ratio_end", "0.0")),
     )
+
+    _source_label = f"**{DATA_SOURCE}** (from loaded experiment)" if _loaded_cfg else DATA_SOURCE
 
     mo.md(f"""
     # LSTM Encoder-Decoder: `{EXPERIMENT_NAME}`
@@ -133,7 +152,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
 
     | param | value |
     |-------|-------|
-    | source | {DATA_SOURCE} |
+    | source | {_source_label} |
     | hidden_dim | {config['hidden_dim']} |
     | num_layers | {config['num_layers']} |
     | history_len | {config['history_len']} |
@@ -154,11 +173,10 @@ def _(mo, mode):
     load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
     train_button = mo.ui.run_button(label="Start training")
 
-    mo.output.replace(
-        mo.hstack([load_data_button, train_button], gap=1)
-        if mode.is_train
-        else mo.md("")
-    )
+    _buttons = [load_data_button]
+    if mode.is_train:
+        _buttons.append(train_button)
+    mo.output.replace(mo.hstack(_buttons, gap=1))
     return load_data_button, train_button
 
 
@@ -175,6 +193,7 @@ def _(
     load_real,
     load_synthetic,
     mo,
+    mode,
     n_stim,
     np,
     torch,
@@ -233,12 +252,12 @@ def _(
     tr_ids, te_ids = train_test_split(traj_ids, test_size=0.2, random_state=42)
     tr_ids, va_ids = train_test_split(tr_ids, test_size=0.125, random_state=42)
 
-    stride = 15 if not DRY_RUN else 15
+    stride = 15
     train_ds = Seq2SeqDataset(cnr_all[tr_ids], stim_all[tr_ids], H, F_, stride=stride)
     val_ds = Seq2SeqDataset(cnr_all[va_ids], stim_all[va_ids], H, F_, stride=stride)
     test_ds = Seq2SeqDataset(cnr_all[te_ids], stim_all[te_ids], H, F_, stride=stride)
 
-    if DRY_RUN:
+    if DRY_RUN and mode.is_train:
         n_dry = 5000
         train_ds = Subset(train_ds, range(min(n_dry, len(train_ds))))
         val_ds = Subset(val_ds, range(min(n_dry, len(val_ds))//4))
@@ -435,9 +454,9 @@ def _(
     DATA_SOURCE,
     EXPERIMENT_NAME,
     ExperimentTracker,
-    Path,
     config,
     device,
+    load_experiment_group,
     mo,
     mode,
     model,
@@ -583,17 +602,18 @@ def _(
     if mode.is_train:
         mo.stop(not train_button.value, mo.md("Click **Start training** when ready."))
 
-        tracker_ar = ExperimentTracker(
-            directory=f"{results_base}/{EXPERIMENT_NAME}_ar",
-            name=f"{EXPERIMENT_NAME}_ar",
-            model_config=dict(**_model_config_shared, variant="autoregressive_tf"),
+        tracker = ExperimentTracker(
+            directory=f"{results_base}/{EXPERIMENT_NAME}",
+            name=EXPERIMENT_NAME,
+            model_config=_model_config_shared,
             training_config=config,
         )
-        tracker_bl = ExperimentTracker(
-            directory=f"{results_base}/{EXPERIMENT_NAME}_baseline",
-            name=f"{EXPERIMENT_NAME}_baseline",
-            model_config=dict(**_model_config_shared, variant="single_pass"),
-            training_config=config,
+        tracker.register_start()
+        tracker_ar = tracker.make_subexperiment(
+            "ar", model_config=dict(**_model_config_shared, variant="autoregressive_tf"),
+        )
+        tracker_bl = tracker.make_subexperiment(
+            "baseline", model_config=dict(**_model_config_shared, variant="single_pass"),
         )
         tracker_ar.register_start()
         tracker_bl.register_start()
@@ -606,46 +626,52 @@ def _(
         train_elapsed = time.time() - _t0
 
         _models_md = mo.md(f"""
-**Training complete** in {train_elapsed:.0f}s
+    **Training complete** in {train_elapsed:.0f}s
 
-| model | epochs |
-|-------|--------|
-| AR + teacher forcing | {len(history['train_loss'])} |
-| Single-pass baseline | {len(history_baseline['train_loss'])} |
-""")
+    | model | epochs |
+    |-------|--------|
+    | AR + teacher forcing | {len(history['train_loss'])} |
+    | Single-pass baseline | {len(history_baseline['train_loss'])} |
+    """)
         _config_md = mo.md(f"""
-**Config**
+    **Config**
 
-| param | value |
-|-------|-------|
-| hidden_dim | {config['hidden_dim']} |
-| num_layers | {config['num_layers']} |
-| history / future | {config['history_len']} / {config['future_len']} |
-| lr | {config['lr']} |
-| batch_size | {config['batch_size']} |
-| patience | {config['patience']} |
-""")
+    | param | value |
+    |-------|-------|
+    | hidden_dim | {config['hidden_dim']} |
+    | num_layers | {config['num_layers']} |
+    | history / future | {config['history_len']} / {config['future_len']} |
+    | lr | {config['lr']} |
+    | batch_size | {config['batch_size']} |
+    | patience | {config['patience']} |
+    """)
         _metrics_md = mo.md(f"""
-**Metrics**
+    **Metrics**
 
-| model | final train | final val |
-|-------|-------------|-----------|
-| AR | {history['train_loss'][-1]:.4f} | {history['val_loss'][-1]:.4f} |
-| Baseline | {history_baseline['train_loss'][-1]:.4f} | {history_baseline['val_loss'][-1]:.4f} |
-""")
+    | model | final train | final val |
+    |-------|-------------|-----------|
+    | AR | {history['train_loss'][-1]:.4f} | {history['val_loss'][-1]:.4f} |
+    | Baseline | {history_baseline['train_loss'][-1]:.4f} | {history_baseline['val_loss'][-1]:.4f} |
+    """)
         mo.output.replace(mo.hstack([_models_md, _config_md, _metrics_md], gap=2))
     else:
         from experiment import ExperimentBundle
 
         mo.stop(not mode.load_button_clicked, mo.md("Select experiments and click **Load experiments**."))
 
-        _sel = mode.selected_experiments
-        _ar_name = _sel["AR experiment"]
-        _bl_name = _sel["Baseline experiment"]
-        mo.stop(not _ar_name or not _bl_name, mo.md("Select both AR and Baseline experiments."))
+        _exp_name = mode.selected_experiment
+        mo.stop(not _exp_name, mo.md("Select an experiment."))
+        _exp_path = mode.selected_experiment_path
 
-        _bundle_ar = ExperimentBundle.load(str(mode.results_path / _ar_name))
-        _bundle_bl = ExperimentBundle.load(str(mode.results_path / _bl_name))
+        if (_exp_path / "experiment.json").exists():
+            _bundles = load_experiment_group(str(_exp_path))
+            mo.stop("ar" not in _bundles or "baseline" not in _bundles,
+                     mo.md(f"Expected 'ar' and 'baseline' variants, got: {list(_bundles.keys())}"))
+            _bundle_ar = _bundles["ar"]
+            _bundle_bl = _bundles["baseline"]
+        else:
+            _bundle_ar = ExperimentBundle.load(str(_exp_path))
+            _bundle_bl = _bundle_ar  # single flat experiment fallback
 
         _cfg_ar = _bundle_ar.model_config
         _cfg_bl = _bundle_bl.model_config
@@ -681,38 +707,38 @@ def _(
         tracker_bl = None
 
         _models_md = mo.md(f"""
-**Loaded from disk**
+    **Loaded from disk**
 
-| model | source | epochs |
-|-------|--------|--------|
-| AR | `{_ar_name}` | {len(history.get('train_loss', []))} |
-| Baseline | `{_bl_name}` | {len(history_baseline.get('train_loss', []))} |
-""")
+    | model | source | epochs |
+    |-------|--------|--------|
+    | AR | `{_exp_name}` | {len(history.get('train_loss', []))} |
+    | Baseline | `{_exp_name}` | {len(history_baseline.get('train_loss', []))} |
+    """)
         _cfg_display = _bundle_ar.training_config or {}
         _config_md = mo.md(f"""
-**Config**
+    **Config**
 
-| param | value |
-|-------|-------|
-| hidden_dim | {_cfg_ar.get('hidden_dim', '?')} |
-| num_layers | {_cfg_ar.get('num_layers', '?')} |
-| history / future | {_cfg_ar.get('history_len', '?')} / {_cfg_ar.get('future_len', '?')} |
-| lr | {_cfg_display.get('lr', '?')} |
-| batch_size | {_cfg_display.get('batch_size', '?')} |
-| data_source | {_cfg_ar.get('data_source', '?')} |
-""")
+    | param | value |
+    |-------|-------|
+    | hidden_dim | {_cfg_ar.get('hidden_dim', '?')} |
+    | num_layers | {_cfg_ar.get('num_layers', '?')} |
+    | history / future | {_cfg_ar.get('history_len', '?')} / {_cfg_ar.get('future_len', '?')} |
+    | lr | {_cfg_display.get('lr', '?')} |
+    | batch_size | {_cfg_display.get('batch_size', '?')} |
+    | data_source | {_cfg_ar.get('data_source', '?')} |
+    """)
         _ar_final_t = history['train_loss'][-1] if history.get('train_loss') else '?'
         _ar_final_v = history['val_loss'][-1] if history.get('val_loss') else '?'
         _bl_final_t = history_baseline['train_loss'][-1] if history_baseline.get('train_loss') else '?'
         _bl_final_v = history_baseline['val_loss'][-1] if history_baseline.get('val_loss') else '?'
         _metrics_md = mo.md(f"""
-**Metrics**
+    **Metrics**
 
-| model | final train | final val |
-|-------|-------------|-----------|
-| AR | {_ar_final_t:.4f if isinstance(_ar_final_t, float) else _ar_final_t} | {_ar_final_v:.4f if isinstance(_ar_final_v, float) else _ar_final_v} |
-| Baseline | {_bl_final_t:.4f if isinstance(_bl_final_t, float) else _bl_final_t} | {_bl_final_v:.4f if isinstance(_bl_final_v, float) else _bl_final_v} |
-""")
+    | model | final train | final val |
+    |-------|-------------|-----------|
+    | AR | {_ar_final_t:.4f if isinstance(_ar_final_t, float) else _ar_final_t} | {_ar_final_v:.4f if isinstance(_ar_final_v, float) else _ar_final_v} |
+    | Baseline | {_bl_final_t:.4f if isinstance(_bl_final_t, float) else _bl_final_t} | {_bl_final_v:.4f if isinstance(_bl_final_v, float) else _bl_final_v} |
+    """)
         _warnings = []
         if _bundle_ar.warnings:
             _warnings.append(mo.callout(mo.md("**AR warnings:** " + ", ".join(_bundle_ar.warnings)), kind="warn"))
@@ -814,9 +840,9 @@ def _(F_, H, device, model, model_baseline, np, plt, test_ds, torch):
     return (fig_recon,)
 
 
-@app.cell(hide_code=True)
-def _(DataLoader, F_, device, model, model_baseline, np, plt, test_ds, torch):
-    # --- collect full test-set predictions ---
+@app.cell
+def _(DataLoader, device, model, model_baseline, np, test_ds, torch):
+    # --- collect full test-set predictions (shared across eval cells) ---
     _last_cnr, _actual_all, _pred_ar_all, _pred_bl_all = [], [], [], []
     _pred_ar_nz, _pred_bl_nz, _fut_stim_all = [], [], []
 
@@ -835,35 +861,63 @@ def _(DataLoader, F_, device, model, model_baseline, np, plt, test_ds, torch):
             _pred_bl_nz.append(model_baseline(_enc_d, _zero_d).cpu().numpy())
             _fut_stim_all.append(_stim_d[:, :, 0].mean(dim=1).cpu().numpy())
 
-    _last = np.concatenate(_last_cnr)
-    _act  = np.concatenate(_actual_all)   # (N, F) — deltas
-    _ar   = np.concatenate(_pred_ar_all)  # (N, F) — predicted deltas
-    _bl   = np.concatenate(_pred_bl_all)
-    _ar0  = np.concatenate(_pred_ar_nz)
-    _bl0  = np.concatenate(_pred_bl_nz)
-    _stim = np.concatenate(_fut_stim_all)
+    test_last = np.concatenate(_last_cnr)
+    test_act  = np.concatenate(_actual_all)   # (N, F) — deltas
+    test_ar   = np.concatenate(_pred_ar_all)  # (N, F) — predicted deltas
+    test_bl   = np.concatenate(_pred_bl_all)
+    test_ar0  = np.concatenate(_pred_ar_nz)
+    test_bl0  = np.concatenate(_pred_bl_nz)
+    test_stim = np.concatenate(_fut_stim_all)
 
     # reconstruct absolute CNR for plots that need it
-    _act_abs = _last[:, None] + np.cumsum(_act, axis=1)
-    _ar_abs  = _last[:, None] + np.cumsum(_ar,  axis=1)
-    _bl_abs  = _last[:, None] + np.cumsum(_bl,  axis=1)
+    test_act_abs = test_last[:, None] + np.cumsum(test_act, axis=1)
+    test_ar_abs  = test_last[:, None] + np.cumsum(test_ar,  axis=1)
+    test_bl_abs  = test_last[:, None] + np.cumsum(test_bl,  axis=1)
 
-    _stim_on = _stim > _stim.mean()
+    test_stim_on = test_stim > test_stim.mean()
+    return (
+        test_act,
+        test_act_abs,
+        test_ar,
+        test_ar0,
+        test_ar_abs,
+        test_bl,
+        test_bl0,
+        test_bl_abs,
+        test_last,
+        test_stim,
+        test_stim_on,
+    )
 
+
+@app.cell(hide_code=True)
+def _(
+    F_,
+    np,
+    plt,
+    test_act,
+    test_act_abs,
+    test_ar,
+    test_ar0,
+    test_ar_abs,
+    test_bl,
+    test_bl0,
+    test_bl_abs,
+    test_last,
+    test_stim_on,
+):
     fig_diag, _ax = plt.subplots(2, 3, figsize=(18, 10))
 
-    # 1. actual delta distribution — centered at 0 means "no systematic trend"
-    _ax[0, 0].hist(_act[:, 0], bins=60, alpha=0.6, color="navy", label=f"step1 μ={_act[:,0].mean():.3f}")
-    _ax[0, 0].hist(_act[:, -1], bins=60, alpha=0.6, color="steelblue", label=f"step{_act.shape[1]} μ={_act[:,-1].mean():.3f}")
+    _ax[0, 0].hist(test_act[:, 0], bins=60, alpha=0.6, color="navy", label=f"step1 μ={test_act[:,0].mean():.3f}")
+    _ax[0, 0].hist(test_act[:, -1], bins=60, alpha=0.6, color="steelblue", label=f"step{test_act.shape[1]} μ={test_act[:,-1].mean():.3f}")
     _ax[0, 0].axvline(0, color="black", lw=1, linestyle="--")
     _ax[0, 0].set_xlabel("actual delta CNR")
     _ax[0, 0].set_title("Actual delta distribution (target)")
     _ax[0, 0].legend(fontsize=8)
 
-    # 2. calibration on deltas (step 1)
-    for _pred, _color, _lbl in [(_ar[:, 0], "tab:red", "AR"), (_bl[:, 0], "tab:blue", "BL")]:
-        _ax[0, 1].scatter(_act[:, 0], _pred, s=3, alpha=0.15, color=_color, label=_lbl)
-    _lim2 = [_act[:, 0].min(), _act[:, 0].max()]
+    for _pred, _color, _lbl in [(test_ar[:, 0], "tab:red", "AR"), (test_bl[:, 0], "tab:blue", "BL")]:
+        _ax[0, 1].scatter(test_act[:, 0], _pred, s=3, alpha=0.15, color=_color, label=_lbl)
+    _lim2 = [test_act[:, 0].min(), test_act[:, 0].max()]
     _ax[0, 1].plot(_lim2, _lim2, "k--", lw=1)
     _ax[0, 1].axvline(0, color="gray", lw=0.5)
     _ax[0, 1].axhline(0, color="gray", lw=0.5)
@@ -872,39 +926,35 @@ def _(DataLoader, F_, device, model, model_baseline, np, plt, test_ds, torch):
     _ax[0, 1].set_title("Delta calibration (step 1)")
     _ax[0, 1].legend(fontsize=8, markerscale=4)
 
-    # 3. residual histograms per step (on deltas)
     for _i in range(min(F_, 3)):
-        _ax[0, 2].hist(_act[:, _i] - _ar[:, _i], bins=60, alpha=0.4, color="tab:red", label=f"AR step{_i+1}")
-        _ax[0, 2].hist(_act[:, _i] - _bl[:, _i], bins=60, alpha=0.4, color="tab:blue", label=f"BL step{_i+1}")
+        _ax[0, 2].hist(test_act[:, _i] - test_ar[:, _i], bins=60, alpha=0.4, color="tab:red", label=f"AR step{_i+1}")
+        _ax[0, 2].hist(test_act[:, _i] - test_bl[:, _i], bins=60, alpha=0.4, color="tab:blue", label=f"BL step{_i+1}")
     _ax[0, 2].axvline(0, color="black", lw=1)
     _ax[0, 2].set_xlabel("actual delta − predicted delta")
     _ax[0, 2].set_title("Residual distribution (deltas)")
     _ax[0, 2].legend(fontsize=7)
 
-    # 4. stimulus ablation
-    _sens_ar = np.abs(_ar - _ar0).mean(axis=1)
-    _sens_bl = np.abs(_bl - _bl0).mean(axis=1)
+    _sens_ar = np.abs(test_ar - test_ar0).mean(axis=1)
+    _sens_bl = np.abs(test_bl - test_bl0).mean(axis=1)
     _ax[1, 0].hist(_sens_ar, bins=60, alpha=0.6, color="tab:red", label=f"AR (mean={_sens_ar.mean():.4f})")
     _ax[1, 0].hist(_sens_bl, bins=60, alpha=0.6, color="tab:blue", label=f"BL (mean={_sens_bl.mean():.4f})")
     _ax[1, 0].set_xlabel("|pred(stim) − pred(zero stim)|")
     _ax[1, 0].set_title("Stimulus sensitivity (ablation)")
     _ax[1, 0].legend(fontsize=8)
 
-    # 5. mean absolute prediction by step, stim ON vs OFF
     _steps = np.arange(1, F_ + 1)
-    for _mask, _ls, _lbl in [(_stim_on, "-", "stim ON"), (~_stim_on, "--", "stim OFF")]:
-        _ax[1, 1].plot(_steps, _act_abs[_mask].mean(axis=0), color="navy", ls=_ls, label=f"actual {_lbl}")
-        _ax[1, 1].plot(_steps, _ar_abs[_mask].mean(axis=0),  color="tab:red",  ls=_ls, label=f"AR {_lbl}")
-        _ax[1, 1].plot(_steps, _bl_abs[_mask].mean(axis=0),  color="tab:blue", ls=_ls, label=f"BL {_lbl}")
+    for _mask, _ls, _lbl in [(test_stim_on, "-", "stim ON"), (~test_stim_on, "--", "stim OFF")]:
+        _ax[1, 1].plot(_steps, test_act_abs[_mask].mean(axis=0), color="navy", ls=_ls, label=f"actual {_lbl}")
+        _ax[1, 1].plot(_steps, test_ar_abs[_mask].mean(axis=0),  color="tab:red",  ls=_ls, label=f"AR {_lbl}")
+        _ax[1, 1].plot(_steps, test_bl_abs[_mask].mean(axis=0),  color="tab:blue", ls=_ls, label=f"BL {_lbl}")
     _ax[1, 1].set_xlabel("future step")
     _ax[1, 1].set_ylabel("mean CNR (absolute)")
     _ax[1, 1].set_title("Mean prediction: stim ON vs OFF")
     _ax[1, 1].legend(fontsize=7)
 
-    # 6. reconstructed absolute ratio to last CNR
-    _ratio_ar  = _ar_abs[:, 0]  / np.where(np.abs(_last) > 1e-8, _last, 1e-8)
-    _ratio_bl  = _bl_abs[:, 0]  / np.where(np.abs(_last) > 1e-8, _last, 1e-8)
-    _ratio_act = _act_abs[:, 0] / np.where(np.abs(_last) > 1e-8, _last, 1e-8)
+    _ratio_ar  = test_ar_abs[:, 0]  / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
+    _ratio_bl  = test_bl_abs[:, 0]  / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
+    _ratio_act = test_act_abs[:, 0] / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
     _bins = np.linspace(0, 2, 60)
     _ax[1, 2].hist(_ratio_act, bins=_bins, alpha=0.4, color="navy",     label=f"actual (μ={_ratio_act.mean():.2f})")
     _ax[1, 2].hist(_ratio_ar,  bins=_bins, alpha=0.5, color="tab:red",  label=f"AR pred (μ={_ratio_ar.mean():.2f})")
@@ -918,7 +968,7 @@ def _(DataLoader, F_, device, model, model_baseline, np, plt, test_ds, torch):
     fig_diag.suptitle("Diagnostic plots", fontsize=13)
     fig_diag.tight_layout()
     fig_diag
-    return
+    return (fig_diag,)
 
 
 @app.cell
@@ -1001,6 +1051,220 @@ def _(DataLoader, np, plt, test_ds):
 
     fig_cond.tight_layout()
     fig_cond
+    return
+
+
+@app.cell
+def _(np, test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
+    mse_per_step_ar = np.mean((test_ar - test_act) ** 2, axis=0)
+    mse_per_step_bl = np.mean((test_bl - test_act) ** 2, axis=0)
+    mse_per_step_zero = np.mean(test_act ** 2, axis=0)
+    _act_mean = test_act.mean(axis=0)
+    mse_per_step_mean = np.mean((test_act - _act_mean) ** 2, axis=0)
+
+    _ss_tot = np.sum((test_act - _act_mean) ** 2, axis=0)
+    _ss_tot = np.where(_ss_tot > 0, _ss_tot, 1e-8)
+    r2_per_step_ar = 1 - np.sum((test_ar - test_act) ** 2, axis=0) / _ss_tot
+    r2_per_step_bl = 1 - np.sum((test_bl - test_act) ** 2, axis=0) / _ss_tot
+
+    mae_cum_ar = np.mean(np.abs(test_ar_abs - test_act_abs), axis=0)
+    mae_cum_bl = np.mean(np.abs(test_bl_abs - test_act_abs), axis=0)
+    mae_cum_ar_std = np.std(np.abs(test_ar_abs - test_act_abs), axis=0)
+    mae_cum_bl_std = np.std(np.abs(test_bl_abs - test_act_abs), axis=0)
+
+    mse_window_ar = np.mean((test_ar - test_act) ** 2, axis=1)
+    mse_window_bl = np.mean((test_bl - test_act) ** 2, axis=1)
+
+    overall_mse_ar = float(np.mean(mse_window_ar))
+    overall_mse_bl = float(np.mean(mse_window_bl))
+    overall_mse_zero = float(np.mean(test_act ** 2))
+    overall_mse_mean = float(mse_per_step_mean.mean())
+    _ss_tot_all = np.sum((test_act - test_act.mean()) ** 2)
+    overall_r2_ar = float(1 - np.sum((test_ar - test_act) ** 2) / max(_ss_tot_all, 1e-8))
+    overall_r2_bl = float(1 - np.sum((test_bl - test_act) ** 2) / max(_ss_tot_all, 1e-8))
+    ar_win_rate = float(np.mean(mse_window_ar < mse_window_bl))
+
+    eval_metrics = {
+        "test_mse_ar": overall_mse_ar,
+        "test_mse_bl": overall_mse_bl,
+        "test_mse_persist_last": overall_mse_zero,
+        "test_mse_predict_mean": overall_mse_mean,
+        "test_r2_ar": overall_r2_ar,
+        "test_r2_bl": overall_r2_bl,
+        "ar_win_rate": ar_win_rate,
+        "mse_per_step_ar": mse_per_step_ar.tolist(),
+        "mse_per_step_bl": mse_per_step_bl.tolist(),
+        "r2_per_step_ar": r2_per_step_ar.tolist(),
+        "r2_per_step_bl": r2_per_step_bl.tolist(),
+    }
+    return (
+        ar_win_rate,
+        eval_metrics,
+        mae_cum_ar,
+        mae_cum_ar_std,
+        mae_cum_bl,
+        mae_cum_bl_std,
+        mse_per_step_ar,
+        mse_per_step_bl,
+        mse_per_step_mean,
+        mse_per_step_zero,
+        mse_window_ar,
+        mse_window_bl,
+        overall_mse_ar,
+        overall_mse_bl,
+        overall_mse_mean,
+        overall_mse_zero,
+        overall_r2_ar,
+        overall_r2_bl,
+        r2_per_step_ar,
+        r2_per_step_bl,
+    )
+
+
+@app.cell
+def _(
+    F_,
+    mo,
+    mse_per_step_ar,
+    mse_per_step_bl,
+    mse_per_step_mean,
+    mse_per_step_zero,
+    np,
+    plt,
+    r2_per_step_ar,
+    r2_per_step_bl,
+):
+    _steps = np.arange(1, F_ + 1)
+    _w = 0.2
+
+    fig_step_metrics, (_ax_mse, _ax_r2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    _ax_mse.bar(_steps - 1.5 * _w, mse_per_step_zero, _w, label="Persist last", color="#aaa")
+    _ax_mse.bar(_steps - 0.5 * _w, mse_per_step_mean, _w, label="Predict mean", color="#ccc")
+    _ax_mse.bar(_steps + 0.5 * _w, mse_per_step_bl,   _w, label="Baseline", color="#dd8452")
+    _ax_mse.bar(_steps + 1.5 * _w, mse_per_step_ar,   _w, label="AR", color="#4c72b0")
+    _ax_mse.set_xlabel("Forecast step")
+    _ax_mse.set_ylabel("MSE")
+    _ax_mse.set_title("Per-step MSE vs naive baselines")
+    _ax_mse.set_xticks(_steps)
+    _ax_mse.legend(fontsize=8)
+
+    _ax_r2.plot(_steps, r2_per_step_ar, "o-", color="#4c72b0", label="AR")
+    _ax_r2.plot(_steps, r2_per_step_bl, "s-", color="#dd8452", label="Baseline")
+    _ax_r2.axhline(0, color="black", lw=1, linestyle="--", label="R²=0 (naive)")
+    _ax_r2.set_xlabel("Forecast step")
+    _ax_r2.set_ylabel("R²")
+    _ax_r2.set_title("Per-step R² (variance explained)")
+    _ax_r2.set_xticks(_steps)
+    _ax_r2.legend(fontsize=8)
+
+    fig_step_metrics.tight_layout()
+
+    mo.md("## Per-step forecast quality")
+    return (fig_step_metrics,)
+
+
+@app.cell
+def _(
+    mo,
+    overall_mse_ar,
+    overall_mse_bl,
+    overall_mse_mean,
+    overall_mse_zero,
+    plt,
+):
+    _names = ["Persist last\n(zero delta)", "Predict\nmean delta", "Baseline", "AR"]
+    _vals = [overall_mse_zero, overall_mse_mean, overall_mse_bl, overall_mse_ar]
+    _colors = ["#aaa", "#ccc", "#dd8452", "#4c72b0"]
+
+    fig_baselines, _ax = plt.subplots(figsize=(8, 5))
+    _bars = _ax.bar(_names, _vals, color=_colors, edgecolor="black", linewidth=0.5)
+    for _bar, _v in zip(_bars, _vals):
+        _ax.text(_bar.get_x() + _bar.get_width() / 2, _v, f"{_v:.6f}",
+                 ha="center", va="bottom", fontsize=9)
+    _ax.set_ylabel("Overall MSE")
+    _ax.set_title("Model vs naive baselines")
+    fig_baselines.tight_layout()
+
+    _pct_ar = (1 - overall_mse_ar / overall_mse_zero) * 100
+    _pct_bl = (1 - overall_mse_bl / overall_mse_zero) * 100
+
+    mo.vstack([
+        fig_baselines,
+        mo.md(f"""
+    **AR** achieves **{_pct_ar:.1f}%** lower MSE than persist-last baseline.
+    **Baseline** achieves **{_pct_bl:.1f}%** lower MSE than persist-last baseline.
+    """),
+    ])
+    return (fig_baselines,)
+
+
+@app.cell
+def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std, mo, np, plt):
+    _steps = np.arange(1, F_ + 1)
+
+    fig_cumulative, _ax = plt.subplots(figsize=(8, 5))
+    _ax.plot(_steps, mae_cum_ar, "o-", color="#4c72b0", label="AR")
+    _ax.fill_between(_steps, mae_cum_ar - mae_cum_ar_std, mae_cum_ar + mae_cum_ar_std,
+                     alpha=0.15, color="#4c72b0")
+    _ax.plot(_steps, mae_cum_bl, "s-", color="#dd8452", label="Baseline")
+    _ax.fill_between(_steps, mae_cum_bl - mae_cum_bl_std, mae_cum_bl + mae_cum_bl_std,
+                     alpha=0.15, color="#dd8452")
+    _ax.set_xlabel("Forecast step")
+    _ax.set_ylabel("MAE (absolute CNR)")
+    _ax.set_title("Cumulative trajectory error (absolute CNR)")
+    _ax.legend()
+    fig_cumulative.tight_layout()
+
+    mo.md("## Cumulative error in reconstructed CNR")
+    return (fig_cumulative,)
+
+
+@app.cell
+def _(ar_win_rate, mo, mse_window_ar, mse_window_bl, plt, test_stim):
+    fig_head2head, _ax = plt.subplots(figsize=(7, 7))
+    _sc = _ax.scatter(
+        mse_window_bl, mse_window_ar,
+        s=8, alpha=0.3, c=test_stim, cmap="viridis", edgecolors="none",
+    )
+    _lim = [0, max(mse_window_ar.max(), mse_window_bl.max()) * 1.05]
+    _ax.plot(_lim, _lim, "k--", lw=1, label="y = x")
+    _ax.set_xlim(_lim)
+    _ax.set_ylim(_lim)
+    _ax.set_xlabel("Baseline per-window MSE")
+    _ax.set_ylabel("AR per-window MSE")
+    _ax.set_title("AR vs Baseline head-to-head")
+    _ax.text(0.05, 0.95, f"AR wins {ar_win_rate * 100:.1f}% of windows",
+             transform=_ax.transAxes, fontsize=11, va="top",
+             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+    _ax.legend(loc="lower right")
+    fig_head2head.colorbar(_sc, ax=_ax, label="Mean stimulus intensity")
+    fig_head2head.tight_layout()
+
+    mo.md("## AR vs Baseline head-to-head")
+    return (fig_head2head,)
+
+
+@app.cell
+def _(
+    ar_win_rate,
+    mo,
+    overall_mse_ar,
+    overall_mse_bl,
+    overall_mse_mean,
+    overall_mse_zero,
+    overall_r2_ar,
+    overall_r2_bl,
+):
+    mo.md(f"""
+    ## Evaluation summary
+
+    | Metric | AR | Baseline | Persist-last | Predict-mean |
+    |--------|---:|--------:|-----------:|-----------:|
+    | **Overall MSE** | {overall_mse_ar:.6f} | {overall_mse_bl:.6f} | {overall_mse_zero:.6f} | {overall_mse_mean:.6f} |
+    | **Overall R²** | {overall_r2_ar:.4f} | {overall_r2_bl:.4f} | — | — |
+    | **AR win rate** | {ar_win_rate * 100:.1f}% | — | — | — |
+    """)
     return
 
 
@@ -1090,8 +1354,16 @@ def _(
 
 @app.cell
 def _(
+    Path,
+    compute_training_stats,
+    eval_metrics,
+    fig_baselines,
+    fig_cumulative,
+    fig_diag,
+    fig_head2head,
     fig_loss,
     fig_recon,
+    fig_step_metrics,
     history,
     history_baseline,
     hostname,
@@ -1103,25 +1375,53 @@ def _(
     tracker_ar,
     tracker_bl,
     train_elapsed,
+    train_loader,
+    val_loader,
 ):
     mo.stop(not mode.is_train, mo.md("_Loaded from disk — skipping save._"))
 
+    _stats_ar = compute_training_stats(
+        train_elapsed_s=train_elapsed,
+        history=history,
+        n_train_samples=len(train_loader.dataset),
+        n_val_samples=len(val_loader.dataset),
+        model=model,
+    )
+    _stats_bl = compute_training_stats(
+        train_elapsed_s=train_elapsed,
+        history=history_baseline,
+        n_train_samples=len(train_loader.dataset),
+        n_val_samples=len(val_loader.dataset),
+        model=model_baseline,
+    )
+
+    _figures = {
+        "loss_curves": fig_loss,
+        "reconstructions": fig_recon,
+        "diagnostics": fig_diag,
+        "step_metrics": fig_step_metrics,
+        "baselines": fig_baselines,
+        "cumulative_error": fig_cumulative,
+        "head_to_head": fig_head2head,
+    }
+
     _bundle_ar = tracker_ar.save_final(
         model=model,
-        training_results={"history": history, "train_elapsed_s": train_elapsed},
-        metrics={},
-        figures={"loss_curves": fig_loss, "reconstructions": fig_recon},
+        training_results={"history": history, "train_elapsed_s": train_elapsed, "stats": _stats_ar},
+        metrics=eval_metrics,
+        figures=_figures,
     )
 
     _bundle_bl = tracker_bl.save_final(
         model=model_baseline,
-        training_results={"history": history_baseline, "train_elapsed_s": train_elapsed},
-        metrics={},
-        figures={"loss_curves": fig_loss, "reconstructions": fig_recon},
+        training_results={"history": history_baseline, "train_elapsed_s": train_elapsed, "stats": _stats_bl},
+        metrics=eval_metrics,
+        figures=_figures,
     )
 
     _env_label = f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
-    mo.md(f"**Saved** on {_env_label}\n\n- `{_bundle_ar.save_dir}`\n- `{_bundle_bl.save_dir}`")
+    _parent_dir = str(Path(_bundle_ar.save_dir).parent)
+    mo.md(f"**Saved** on {_env_label}\n\n`{_parent_dir}`")
     return
 
 

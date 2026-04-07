@@ -27,7 +27,7 @@ def _():
 
     from model.dl.cvae import ConditionalBetaVAE
     from eval_cvae import evaluate
-    from experiment import save_experiment
+    from experiment import save_experiment, compute_training_stats
     from utils import get_device, parse_bool
 
     device = get_device()
@@ -36,6 +36,7 @@ def _():
         DataLoader,
         Dataset,
         Subset,
+        compute_training_stats,
         datetime,
         device,
         evaluate,
@@ -486,6 +487,7 @@ def _(
 @app.cell
 def _(
     EXPERIMENT_NAME,
+    compute_training_stats,
     config,
     fig_loss,
     history,
@@ -494,8 +496,18 @@ def _(
     result,
     save_experiment,
     train_elapsed,
+    train_loader,
     traj_len,
+    val_loader,
 ):
+    stats = compute_training_stats(
+        train_elapsed_s=train_elapsed,
+        history=history,
+        n_train_samples=len(train_loader.dataset),
+        n_val_samples=len(val_loader.dataset),
+        model=model,
+    )
+
     output_dir = f"results/{EXPERIMENT_NAME}"
 
     save_experiment(
@@ -514,6 +526,7 @@ def _(
         training_results={
             "history": history,
             "train_elapsed_s": train_elapsed,
+            "stats": stats,
         },
         metrics=result.metrics,
         figures={"loss_curves": fig_loss, **result.figures},

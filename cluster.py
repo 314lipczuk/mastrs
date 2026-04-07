@@ -195,7 +195,7 @@ class Machine(abc.ABC):
 
     def upload(self, job: Job, archive: pathlib.Path) -> str:
         """SCP the bundle onto the machine, return the remote working dir."""
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
         run_id = f"{job.target_file.stem}_{ts}"
         remote_dir = f"{self.remote_base}/{run_id}"
         _ssh(self.name, f"mkdir -p {remote_dir}")

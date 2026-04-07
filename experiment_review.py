@@ -21,7 +21,11 @@ def _(Path, mo):
     experiment_dirs = []
     if RESULTS_PATH.is_dir():
         for subdir in sorted(RESULTS_PATH.iterdir(), reverse=True):
-            if subdir.is_dir() and (subdir / "bundle.pt").exists():
+            if not subdir.is_dir():
+                continue
+            has_final = (subdir / "bundle.pt").exists()
+            has_checkpoint = (subdir / "checkpoints" / "bundle.pt").exists()
+            if has_final or has_checkpoint:
                 experiment_dirs.append(subdir.name)
 
     mo.stop(not experiment_dirs, mo.md(f"No experiments found in `{RESULTS_PATH}`."))
@@ -43,8 +47,16 @@ def _(RESULTS_PATH, experiment_dropdown, load_button, mo):
     mo.stop(not load_button.value, mo.md("Select an experiment and click **Load**."))
 
     _exp_dir = RESULTS_PATH / experiment_dropdown.value
-    bundle = ExperimentBundle.load(str(_exp_dir))
-    return (bundle,)
+    _has_final = (_exp_dir / "bundle.pt").exists()
+    _has_checkpoint = (_exp_dir / "checkpoints" / "bundle.pt").exists()
+
+    is_incomplete = not _has_final and _has_checkpoint
+
+    if _has_final:
+        bundle = ExperimentBundle.load(str(_exp_dir))
+    else:
+        bundle = ExperimentBundle.load(str(_exp_dir / "checkpoints"))
+    return bundle, is_incomplete
 
 
 @app.cell(hide_code=True)
@@ -107,8 +119,13 @@ def _(bundle, mo):
 
 
 @app.cell(hide_code=True)
-def _(bundle, mo):
-    _rows = []    
+def _(bundle, is_incomplete, mo):
+    _rows = []
+    if is_incomplete:
+        _rows.append(mo.callout(
+            mo.md("This experiment **did not finish**. Loaded from the latest checkpoint."),
+            kind="warn",
+        ))
     if bundle.warnings:
         _rows.append(mo.callout(
             mo.md("\n".join(f"- {w}" for w in bundle.warnings)),
@@ -144,12 +161,6 @@ def _(RESULTS_PATH, base64, experiment_dropdown, mo):
     return
 
 
-@app.cell
-def _(rows):
-    rows
-    return
-
-
 @app.cell(hide_code=True)
 def _(bundle, mo):
     from interactive_viz import get_views
@@ -167,12 +178,14 @@ def _(LOGS_PATH, experiment_dropdown, mo):
     _exp_name = experiment_dropdown.value
     _match = re.search(r"_j(\d+)$", _exp_name)
 
+    log_file = None
     _log_content = None
     if _match:
         _job_id = _match.group(1)
         _candidates = sorted(LOGS_PATH.glob(f"*_{_job_id}.log"))
         if _candidates:
-            _log_content = _candidates[0].read_text()
+            log_file = _candidates[0]
+            _log_content = log_file.read_text()
 
     mo.stop(
         _log_content is None,
@@ -183,11 +196,31 @@ def _(LOGS_PATH, experiment_dropdown, mo):
         mo.md("## Training log"),
         mo.plain_text(_log_content),
     ])
-    return
+    return (log_file,)
 
 
-@app.cell
-def _():
+@app.cell(hide_code=True)
+def _(log_file, mo):
+    _html_file = log_file.with_suffix(".html") if log_file else None
+    _html_exists = _html_file is not None and _html_file.exists()
+
+    open_html_button = mo.ui.run_button(
+        label="Open notebook HTML",
+        disabled=not _html_exists,
+    )
+    _status = f"`{_html_file.name}`" if _html_exists else "_No HTML export found_"
+    mo.hstack([open_html_button, mo.md(_status)], justify="start", gap=1, align="center")
+    return (open_html_button,)
+
+
+@app.cell(hide_code=True)
+def _(log_file, mo, open_html_button):
+    import subprocess
+
+    mo.stop(not open_html_button.value)
+
+    _html_file = log_file.with_suffix(".html")
+    subprocess.Popen(["open", str(_html_file)])
     return
 
 
