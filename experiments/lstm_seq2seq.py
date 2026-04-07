@@ -24,8 +24,8 @@ def _():
     from sklearn.model_selection import train_test_split
     from torch.utils.data import DataLoader, Dataset, Subset
 
-    from experiment import ExperimentTracker, compute_training_stats, load_experiment_group
-    from utils import get_device, get_username, running_on_cluster, results_write_path, results_read_sources, parse_bool, experiment_mode_widget, experiment_mode_state
+    from experiment import ExperimentTracker, compute_training_stats
+    from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
@@ -36,7 +36,6 @@ def _():
     is_cluster = running_on_cluster()
     results_base = results_write_path()
     return (
-        DEFAULT_STIM_COLS,
         DataLoader,
         Dataset,
         ExperimentTracker,
@@ -45,11 +44,8 @@ def _():
         Subset,
         compute_training_stats,
         device,
-        experiment_mode_state,
-        experiment_mode_widget,
         hostname,
         is_cluster,
-        load_experiment_group,
         load_real,
         load_synthetic,
         mo,
@@ -69,78 +65,37 @@ def _():
 
 
 @app.cell
-def _(Path, experiment_mode_widget, mo, parse_bool):
+def _(mo, parse_bool):
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
     DRY_RUN = parse_bool(args.get("dry_run", True))
     _cli_source = args.get("source", None)
 
-    _mode_widget, mode_ctx = experiment_mode_widget(
-        mo,
-        experiment_name_default=EXPERIMENT_NAME,
-        project_root=Path(__file__).resolve().parent.parent,
-        experiment_labels=["Experiment"],
-    )
-
     source_selector = mo.ui.dropdown(
         options=["synthetic", "real"], value=_cli_source or "synthetic", label="Data source"
     )
 
-    mo.vstack([
-        mo.hstack([source_selector], gap=2),
-        _mode_widget,
-    ])
-    return DRY_RUN, EXPERIMENT_NAME, args, mode_ctx, source_selector
-
-
-@app.cell
-def _(experiment_mode_state, mo, mode_ctx):
-    _load_widget, mode = experiment_mode_state(mo, mode_ctx)
-    _load_widget
-    return (mode,)
+    mo.hstack([source_selector], gap=2)
+    return DRY_RUN, EXPERIMENT_NAME, args, source_selector
 
 
 @app.cell(hide_code=True)
-def _(DRY_RUN, EXPERIMENT_NAME, args, mo, mode, source_selector):
+def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     DATA_SOURCE = source_selector.value
 
-    # When loading from disk, inherit config from the loaded experiment bundle
-    _loaded_cfg = {}
-    if mode.is_load and mode.load_button_clicked and mode.selected_experiment_path:
-        from experiment import ExperimentBundle as _EB, load_experiment_group as _leg
-        _exp_path = mode.selected_experiment_path
-        try:
-            if (_exp_path / "experiment.json").exists():
-                _bundles = _leg(str(_exp_path))
-                _b = next(iter(_bundles.values()))
-            else:
-                _b = _EB.load(str(_exp_path))
-            _loaded_cfg = {**(_b.training_config or {}), **(_b.model_config or {})}
-            if _b.model_config.get("data_source"):
-                DATA_SOURCE = _b.model_config["data_source"]
-        except Exception:
-            pass
-
-    def _get(key, default):
-        if _loaded_cfg and key in _loaded_cfg:
-            return _loaded_cfg[key]
-        return args.get(key, default)
-
     config = dict(
-        hidden_dim=int(_get("hidden_dim", "16" if DRY_RUN else "32")),
-        num_layers=int(_get("num_layers", "2")),
-        history_len=int(_get("history_len", "15")),
-        future_len=int(_get("future_len", "10")),
-        lr=float(_get("lr", "1e-3")),
-        epochs=int(_get("epochs", "50" if DRY_RUN else "200")),
-        batch_size=int(_get("batch_size", "64")),
-        patience=int(_get("patience", "20" if DRY_RUN else "50")),
-        tf_ratio_start=float(_get("tf_ratio_start", "1.0")),
-        tf_ratio_end=float(_get("tf_ratio_end", "0.0")),
+        hidden_dim=int(args.get("hidden_dim", "16" if DRY_RUN else "32")),
+        num_layers=int(args.get("num_layers", "2")),
+        history_len=int(args.get("history_len", "15")),
+        future_len=int(args.get("future_len", "10")),
+        lr=float(args.get("lr", "1e-3")),
+        epochs=int(args.get("epochs", "50" if DRY_RUN else "200")),
+        batch_size=int(args.get("batch_size", "64")),
+        patience=int(args.get("patience", "20" if DRY_RUN else "50")),
+        tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
+        tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
     )
-
-    _source_label = f"**{DATA_SOURCE}** (from loaded experiment)" if _loaded_cfg else DATA_SOURCE
 
     mo.md(f"""
     # LSTM Encoder-Decoder: `{EXPERIMENT_NAME}`
@@ -152,7 +107,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, mode, source_selector):
 
     | param | value |
     |-------|-------|
-    | source | {_source_label} |
+    | source | {DATA_SOURCE} |
     | hidden_dim | {config['hidden_dim']} |
     | num_layers | {config['num_layers']} |
     | history_len | {config['history_len']} |
@@ -169,14 +124,10 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, mode, source_selector):
 
 
 @app.cell
-def _(mo, mode):
+def _(mo):
     load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
     train_button = mo.ui.run_button(label="Start training")
-
-    _buttons = [load_data_button]
-    if mode.is_train:
-        _buttons.append(train_button)
-    mo.output.replace(mo.hstack(_buttons, gap=1))
+    mo.hstack([load_data_button, train_button], gap=1)
     return load_data_button, train_button
 
 
@@ -193,7 +144,6 @@ def _(
     load_real,
     load_synthetic,
     mo,
-    mode,
     n_stim,
     np,
     torch,
@@ -257,7 +207,7 @@ def _(
     val_ds = Seq2SeqDataset(cnr_all[va_ids], stim_all[va_ids], H, F_, stride=stride)
     test_ds = Seq2SeqDataset(cnr_all[te_ids], stim_all[te_ids], H, F_, stride=stride)
 
-    if DRY_RUN and mode.is_train:
+    if DRY_RUN:
         n_dry = 5000
         train_ds = Subset(train_ds, range(min(n_dry, len(train_ds))))
         val_ds = Subset(val_ds, range(min(n_dry, len(val_ds))//4))
@@ -275,71 +225,7 @@ def _(
 
     Train: {len(train_ds)} windows | Val: {len(val_ds)} | Test: {len(test_ds)}
     """)
-    return F_, H, cnr_all, stim_all, test_ds, train_loader, val_loader
-
-
-@app.cell
-def _(DATA_SOURCE, DEFAULT_STIM_COLS, cnr_all, load_real, np, plt, stim_all):
-    # Second xcorr plot: all available stim features, including ones not in the model.
-    # For synthetic: derive ewma_fast + n_5 (pulse count window) from the raw light signal.
-    # For real: reload trajectories with all 9 DEFAULT_STIM_COLS.
-    if DATA_SOURCE == "synthetic":
-        _u_t = stim_all[:, 0, :]  # (N, T)
-        # derive ewma_fast (alpha=0.5) inline
-        _ef = np.empty_like(_u_t)
-        _ef[:, 0] = _u_t[:, 0]
-        for _t in range(1, _u_t.shape[1]):
-            _ef[:, _t] = 0.5 * _u_t[:, _t] + 0.5 * _ef[:, _t - 1]
-        # n_5: number of on-frames in last 5 steps
-        _n5 = np.stack([
-            np.concatenate([np.zeros((_u_t.shape[0], min(_k, 5))),
-                            np.array([(_u_t[:, max(0, _i-5):_i] > 0).sum(axis=1)
-                                      for _i in range(_k, _u_t.shape[1])]).T], axis=1)
-            for _k in [5]
-        ], axis=0)[0].astype(np.float32)
-        _all_stim = np.stack([_u_t, stim_all[:, 1, :], _ef, stim_all[:, 2, :],
-                               stim_all[:, 3, :], _n5], axis=1)
-        _all_cols = ["u_t", "m_t", "ewma_fast", "ewma_slow", "s_cum", "n_5"]
-        _cnr_all = cnr_all
-    else:
-        _cnr_all, _all_stim, _ = load_real()
-        _all_cols = DEFAULT_STIM_COLS
-
-    _n_traj2, _traj_len2 = _cnr_all.shape
-    _max_lag2 = min(50, _traj_len2 // 2)
-    _lags2 = np.arange(-_max_lag2, _max_lag2 + 1)
-    _xcorr2 = np.zeros((len(_all_cols), len(_lags2)))
-
-    for _ti in range(_n_traj2):
-        _cnr = _cnr_all[_ti] - _cnr_all[_ti].mean()
-        _cnr_norm = np.linalg.norm(_cnr) + 1e-8
-        for _si in range(len(_all_cols)):
-            _s = _all_stim[_ti, _si] - _all_stim[_ti, _si].mean()
-            _s_norm = np.linalg.norm(_s) + 1e-8
-            _full = np.correlate(_cnr, _s, mode="full") / (_cnr_norm * _s_norm)
-            _center = _traj_len2 - 1
-            _xcorr2[_si] += _full[_center - _max_lag2 : _center + _max_lag2 + 1]
-    _xcorr2 /= _n_traj2
-
-    fig_xcorr_all, _ax = plt.subplots(figsize=(12, 4))
-    for _si, _col in enumerate(_all_cols):
-        _ls = "-" if _col in DEFAULT_STIM_COLS else "--"
-        _ax.plot(_lags2, _xcorr2[_si], label=_col, alpha=0.8, linestyle=_ls)
-    _ax.axvline(0, color="black", lw=1, linestyle="--")
-    _ax.axhline(0, color="gray", lw=0.5)
-
-    for _si, _col in enumerate(_all_cols):
-        _pos = _xcorr2[_si, _lags2 > 0]
-        _peak_lag = _lags2[_lags2 > 0][np.argmax(_pos)]
-        _ax.axvline(_peak_lag, color=f"C{_si}", lw=1, linestyle=":", alpha=0.5)
-
-    _ax.set_xlabel("lag (timesteps)  [positive = stim leads CNR]")
-    _ax.set_ylabel("normalized cross-correlation")
-    _ax.set_title(f"All stim features → CNR cross-correlation ({DATA_SOURCE})\n(solid = currently in model)")
-    _ax.legend(fontsize=8)
-    fig_xcorr_all.tight_layout()
-    fig_xcorr_all
-    return
+    return F_, H, test_ds, train_loader, val_loader
 
 
 @app.cell
@@ -456,9 +342,7 @@ def _(
     ExperimentTracker,
     config,
     device,
-    load_experiment_group,
     mo,
-    mode,
     model,
     model_baseline,
     n_stim,
@@ -599,33 +483,32 @@ def _(
         os.remove(ckpt_bl)
         return hist_ar, hist_bl
 
-    if mode.is_train:
-        mo.stop(not train_button.value, mo.md("Click **Start training** when ready."))
+    mo.stop(not train_button.value, mo.md("Click **Start training** when ready."))
 
-        tracker = ExperimentTracker(
-            directory=f"{results_base}/{EXPERIMENT_NAME}",
-            name=EXPERIMENT_NAME,
-            model_config=_model_config_shared,
-            training_config=config,
-        )
-        tracker.register_start()
-        tracker_ar = tracker.make_subexperiment(
-            "ar", model_config=dict(**_model_config_shared, variant="autoregressive_tf"),
-        )
-        tracker_bl = tracker.make_subexperiment(
-            "baseline", model_config=dict(**_model_config_shared, variant="single_pass"),
-        )
-        tracker_ar.register_start()
-        tracker_bl.register_start()
+    tracker = ExperimentTracker(
+        directory=f"{results_base}/{EXPERIMENT_NAME}",
+        name=EXPERIMENT_NAME,
+        model_config=_model_config_shared,
+        training_config=config,
+    )
+    tracker.register_start()
+    tracker_ar = tracker.make_subexperiment(
+        "ar", model_config=dict(**_model_config_shared, variant="autoregressive_tf"),
+    )
+    tracker_bl = tracker.make_subexperiment(
+        "baseline", model_config=dict(**_model_config_shared, variant="single_pass"),
+    )
+    tracker_ar.register_start()
+    tracker_bl.register_start()
 
-        _t0 = time.time()
-        history, history_baseline = train_both(
-            model, model_baseline, train_loader, val_loader, config, device,
-            tracker_ar, tracker_bl,
-        )
-        train_elapsed = time.time() - _t0
+    _t0 = time.time()
+    history, history_baseline = train_both(
+        model, model_baseline, train_loader, val_loader, config, device,
+        tracker_ar, tracker_bl,
+    )
+    train_elapsed = time.time() - _t0
 
-        _models_md = mo.md(f"""
+    _models_md = mo.md(f"""
     **Training complete** in {train_elapsed:.0f}s
 
     | model | epochs |
@@ -633,7 +516,7 @@ def _(
     | AR + teacher forcing | {len(history['train_loss'])} |
     | Single-pass baseline | {len(history_baseline['train_loss'])} |
     """)
-        _config_md = mo.md(f"""
+    _config_md = mo.md(f"""
     **Config**
 
     | param | value |
@@ -645,7 +528,7 @@ def _(
     | batch_size | {config['batch_size']} |
     | patience | {config['patience']} |
     """)
-        _metrics_md = mo.md(f"""
+    _metrics_md = mo.md(f"""
     **Metrics**
 
     | model | final train | final val |
@@ -653,103 +536,7 @@ def _(
     | AR | {history['train_loss'][-1]:.4f} | {history['val_loss'][-1]:.4f} |
     | Baseline | {history_baseline['train_loss'][-1]:.4f} | {history_baseline['val_loss'][-1]:.4f} |
     """)
-        mo.output.replace(mo.hstack([_models_md, _config_md, _metrics_md], gap=2))
-    else:
-        from experiment import ExperimentBundle
-
-        mo.stop(not mode.load_button_clicked, mo.md("Select experiments and click **Load experiments**."))
-
-        _exp_name = mode.selected_experiment
-        mo.stop(not _exp_name, mo.md("Select an experiment."))
-        _exp_path = mode.selected_experiment_path
-
-        if (_exp_path / "experiment.json").exists():
-            _bundles = load_experiment_group(str(_exp_path))
-            mo.stop("ar" not in _bundles or "baseline" not in _bundles,
-                     mo.md(f"Expected 'ar' and 'baseline' variants, got: {list(_bundles.keys())}"))
-            _bundle_ar = _bundles["ar"]
-            _bundle_bl = _bundles["baseline"]
-        else:
-            _bundle_ar = ExperimentBundle.load(str(_exp_path))
-            _bundle_bl = _bundle_ar  # single flat experiment fallback
-
-        _cfg_ar = _bundle_ar.model_config
-        _cfg_bl = _bundle_bl.model_config
-        _expected_encoder_dim = 1 + n_stim
-        _dim_mismatch = (
-            _cfg_ar.get("encoder_dim") != _expected_encoder_dim
-            or _cfg_bl.get("encoder_dim") != _expected_encoder_dim
-        )
-        mo.stop(_dim_mismatch, mo.callout(
-            mo.md(
-                f"**Dimension mismatch:** loaded model expects encoder_dim="
-                f"{_cfg_ar.get('encoder_dim')}/{_cfg_bl.get('encoder_dim')} "
-                f"but current data source has {_expected_encoder_dim}. "
-                f"Change the **Data source** dropdown to match the loaded experiment "
-                f"(`{_cfg_ar.get('data_source', '?')}`)."
-            ),
-            kind="warn",
-        ))
-
-        model.load_state_dict(_bundle_ar.model_state_dict)
-        model.to(device)
-        model.eval()
-
-        model_baseline.load_state_dict(_bundle_bl.model_state_dict)
-        model_baseline.to(device)
-        model_baseline.eval()
-
-        history = _bundle_ar.training_results.get("history", {"train_loss": [], "val_loss": []})
-        history_baseline = _bundle_bl.training_results.get("history", {"train_loss": [], "val_loss": []})
-        train_elapsed = _bundle_ar.training_results.get("train_elapsed_s", 0.0)
-
-        tracker_ar = None
-        tracker_bl = None
-
-        _models_md = mo.md(f"""
-    **Loaded from disk**
-
-    | model | source | epochs |
-    |-------|--------|--------|
-    | AR | `{_exp_name}` | {len(history.get('train_loss', []))} |
-    | Baseline | `{_exp_name}` | {len(history_baseline.get('train_loss', []))} |
-    """)
-        _cfg_display = _bundle_ar.training_config or {}
-        _config_md = mo.md(f"""
-    **Config**
-
-    | param | value |
-    |-------|-------|
-    | hidden_dim | {_cfg_ar.get('hidden_dim', '?')} |
-    | num_layers | {_cfg_ar.get('num_layers', '?')} |
-    | history / future | {_cfg_ar.get('history_len', '?')} / {_cfg_ar.get('future_len', '?')} |
-    | lr | {_cfg_display.get('lr', '?')} |
-    | batch_size | {_cfg_display.get('batch_size', '?')} |
-    | data_source | {_cfg_ar.get('data_source', '?')} |
-    """)
-        _ar_final_t = history['train_loss'][-1] if history.get('train_loss') else '?'
-        _ar_final_v = history['val_loss'][-1] if history.get('val_loss') else '?'
-        _bl_final_t = history_baseline['train_loss'][-1] if history_baseline.get('train_loss') else '?'
-        _bl_final_v = history_baseline['val_loss'][-1] if history_baseline.get('val_loss') else '?'
-        _metrics_md = mo.md(f"""
-    **Metrics**
-
-    | model | final train | final val |
-    |-------|-------------|-----------|
-    | AR | {_ar_final_t:.4f if isinstance(_ar_final_t, float) else _ar_final_t} | {_ar_final_v:.4f if isinstance(_ar_final_v, float) else _ar_final_v} |
-    | Baseline | {_bl_final_t:.4f if isinstance(_bl_final_t, float) else _bl_final_t} | {_bl_final_v:.4f if isinstance(_bl_final_v, float) else _bl_final_v} |
-    """)
-        _warnings = []
-        if _bundle_ar.warnings:
-            _warnings.append(mo.callout(mo.md("**AR warnings:** " + ", ".join(_bundle_ar.warnings)), kind="warn"))
-        if _bundle_bl.warnings:
-            _warnings.append(mo.callout(mo.md("**BL warnings:** " + ", ".join(_bundle_bl.warnings)), kind="warn"))
-
-        _output = mo.vstack([
-            mo.hstack([_models_md, _config_md, _metrics_md], gap=2),
-            *_warnings,
-        ])
-        mo.output.replace(_output)
+    mo.output.replace(mo.hstack([_models_md, _config_md, _metrics_md], gap=2))
     return history, history_baseline, tracker_ar, tracker_bl, train_elapsed
 
 
@@ -1217,6 +1004,7 @@ def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std, mo, np, plt):
     fig_cumulative.tight_layout()
 
     mo.md("## Cumulative error in reconstructed CNR")
+    _ax
     return (fig_cumulative,)
 
 
@@ -1242,6 +1030,7 @@ def _(ar_win_rate, mo, mse_window_ar, mse_window_bl, plt, test_stim):
     fig_head2head.tight_layout()
 
     mo.md("## AR vs Baseline head-to-head")
+    _ax
     return (fig_head2head,)
 
 
@@ -1369,7 +1158,6 @@ def _(
     hostname,
     is_cluster,
     mo,
-    mode,
     model,
     model_baseline,
     tracker_ar,
@@ -1378,7 +1166,6 @@ def _(
     train_loader,
     val_loader,
 ):
-    mo.stop(not mode.is_train, mo.md("_Loaded from disk — skipping save._"))
 
     _stats_ar = compute_training_stats(
         train_elapsed_s=train_elapsed,

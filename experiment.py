@@ -834,6 +834,41 @@ def save_experiment(
     return bundle
 
 
+def is_experiment_dir(directory: Path) -> bool:
+    """Check whether a directory contains a loadable experiment.
+
+    Recognizes:
+    - Standard bundles (``bundle.pt``)
+    - In-progress experiments (``checkpoints/bundle.pt``)
+    - Grouped experiments (``experiment.json`` with variant subdirs)
+    - Legacy format (any ``.pt`` file at the top level)
+    """
+    if not directory.is_dir():
+        return False
+    if (directory / "bundle.pt").exists():
+        return True
+    if (directory / "checkpoints" / "bundle.pt").exists():
+        return True
+    if (directory / "experiment.json").exists():
+        return True
+    if any(directory.glob("*.pt")):
+        return True
+    return False
+
+
+def discover_experiments(results_path: str | Path) -> list[str]:
+    """Return directory names under *results_path* that contain loadable experiments.
+
+    Results are sorted by directory creation time, newest first.
+    """
+    results_path = Path(results_path)
+    if not results_path.is_dir():
+        return []
+    experiment_subdirs = [d for d in results_path.iterdir() if is_experiment_dir(d)]
+    experiment_subdirs.sort(key=lambda d: d.stat().st_birthtime, reverse=True)
+    return [d.name for d in experiment_subdirs]
+
+
 def load_experiment(directory: str) -> ExperimentBundle:
     """Load an experiment from a directory.
 
