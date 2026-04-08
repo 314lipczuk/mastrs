@@ -307,6 +307,13 @@ def _(bundle):
     return
 
 
+@app.cell(hide_code=True)
+def _(bundle):
+    H_eval = bundle.training_config["history_len"]
+    F_eval = bundle.training_config["future_len"]
+    return F_eval, H_eval
+
+
 @app.cell(column=1)
 def _(bundle):
     bundle.model_type = 'experiments.lstm_seq2seq.Seq2Seq'
@@ -332,17 +339,13 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(bundle, dev, m):
+def _(F_eval, H_eval, dev, m):
     mo.stop(True)
 
-    H_eval = bundle.training_config["history_len"]
-    F_eval = bundle.training_config["future_len"]
     total_eval = H_eval + F_eval
 
     cnr_real, stim_real, _cond_real = load_real(window_size=total_eval, stride=13)
-    #cnr_real, stim_real, _cond_real = load_(window_size=total_eval, stride=13)
     print('cnr_r shape:', cnr_real.shape)
-    # Build windows inline (same logic as Seq2SeqDataset)
     _samples = []
 
     for i in range(len(cnr_real)):
@@ -354,11 +357,10 @@ def _(bundle, dev, m):
             full_window = cnr_real[i, t : t + total_eval]
             dec_target = np.diff(full_window)[H_eval - 1 : H_eval - 1 + F_eval]
             enc_in = np.concatenate([enc_cnr[:, np.newaxis], enc_stim.T], axis=-1)
-            light_window = stim_real[i, 0, t : t + total_eval]  # u_t channel
+            light_window = stim_real[i, 0, t : t + total_eval]
             _samples.append((enc_in, dec_stim.T, dec_target, full_window, light_window))
             t += 2
 
-    # Run inference
     _preds_all, _targets_all, _windows_all, _light_all = [], [], [], []
     with torch.no_grad():
         for _enc, _dec, _tgt, _win, _light in _samples:
@@ -377,7 +379,7 @@ def _(bundle, dev, m):
 
     mo.md(f"**Real data:** {len(_samples)} windows (H={H_eval}, F={F_eval}), "
            f"MSE = {np.mean((preds_real - targets_real)**2):.6f}")
-    return F_eval, H_eval, light_real, preds_real, targets_real, windows_real
+    return light_real, preds_real, targets_real, windows_real
 
 
 @app.cell(hide_code=True)
@@ -534,49 +536,65 @@ def _(F_eval, H_eval, dev, m):
     from experiments.seq2seq_data import load_real as _load_real
 
     _total = H_eval + F_eval
-    _cnr_abl, _stim_abl, _ = _load_real(window_size=_total, stride=100)
+    _cnr_abl, _stim_abl, _ = _load_real(window_size=_total, stride=50)
 
-    # _stim_features derives temporally-stateful channels (s_cum, recency,
-    # ewma, etc.) from raw light.  Naively zeroing all 9 decoder channels
-    # creates inputs the model never saw during training (e.g. s_cum=0
-    # right after a long stimulation history).  Instead, recompute features
-    # over [real history light | zero future light] so derived channels
-    # decay naturally.
     from experiments.seq2seq_data import _stim_features
+
+    _S = {name: i for i, name in enumerate(STIM_COLS)}
 
     _samples_abl = []
     for _i in range(len(_cnr_abl)):
         _t = 0
         while _t + _total <= _cnr_abl.shape[1]:
-            _enc_cnr = _cnr_abl[_i, _t : _t + H_eval]
+            _enc_cnr  = _cnr_abl[_i, _t : _t + H_eval]
             _enc_stim = _stim_abl[_i, :, _t : _t + H_eval]
             _dec_stim = _stim_abl[_i, :, _t + H_eval : _t + _total]
             _full_win = _cnr_abl[_i, _t : _t + _total]
-            _dec_tgt = np.diff(_full_win)[H_eval - 1 : H_eval - 1 + F_eval]
-            _enc_in = np.concatenate([_enc_cnr[:, np.newaxis], _enc_stim.T], axis=-1)
+            _dec_tgt  = np.diff(_full_win)[H_eval - 1 : H_eval - 1 + F_eval]
+            _enc_in   = np.concatenate([_enc_cnr[:, np.newaxis], _enc_stim.T], axis=-1)
             _light_win = _stim_abl[_i, 0, _t : _t + _total]
 
-            # Recompute stim features with zero future light
+            # Build zeroed-future stim features.
+            # Recompute over [history light | zero future] so that window-local
+            # channels (n_5, slope_5, burst_pos, m_t, u_t) are handled correctly.
             _hist_light = _stim_abl[_i, 0, _t : _t + H_eval]
             _full_light = np.concatenate([_hist_light, np.zeros(F_eval)])[np.newaxis, :]
-            _full_feats = _stim_features(_full_light)  # (1, 9, H+F)
-            _dec_stim_zeroed = _full_feats[0, :, H_eval:].T  # (F, 9)
+            _full_feats = _stim_features(_full_light)          # (1, 9, H+F)
+            _dec_stim_zeroed = _full_feats[0, :, H_eval:].T.copy()  # (F, 9)
 
-            print('light',_full_light.shape,'\n', _full_light)
-            print('features', _full_feats.shape,'\n', _full_feats)
+            # The precomputed stim features were derived from the full trajectory,
+            # so their boundary state (end of history) may differ from the window-
+            # recomputed values.  Correct the stateful decay channels by
+            # propagating forward from the precomputed encoder boundary value.
+
+            # s_cum: no new stimulation -> stays flat at history-end value
+            _dec_stim_zeroed[:, _S["s_cum"]] = _enc_stim[_S["s_cum"], -1]
+
+            # ewma_fast (alpha=0.5): x=0 future -> ewma[t] = (1-alpha)^t * enc_boundary
+            _dec_stim_zeroed[:, _S["ewma_fast"]] = (
+                _enc_stim[_S["ewma_fast"], -1] * (0.5 ** np.arange(1, F_eval + 1))
+            )
+
+            # ewma_slow (alpha=0.1): same, decay factor (1-0.1)=0.9
+            _dec_stim_zeroed[:, _S["ewma_slow"]] = (
+                _enc_stim[_S["ewma_slow"], -1] * (0.9 ** np.arange(1, F_eval + 1))
+            )
+
+            # recency (tau=5): each step adds 1 to dt -> multiply by exp(-1/tau)
+            _dec_stim_zeroed[:, _S["recency"]] = (
+                _enc_stim[_S["recency"], -1] * (np.exp(-1.0 / 5.0) ** np.arange(1, F_eval + 1))
+            )
 
             _samples_abl.append((_enc_in, _dec_stim.T, _dec_tgt, _full_win, _light_win, _dec_stim_zeroed))
             _t += 2
-            break
-        break
 
-    mo.stop(True)
+    #mo.stop(True)
 
     _preds_zeroed, _preds_true = [], []
     with torch.no_grad():
         for _enc, _dec, _tgt, _, _, _dec_z in _samples_abl:
-            _enc_t = torch.tensor(_enc, dtype=torch.float32).unsqueeze(0).to(dev)
-            _dec_t = torch.tensor(_dec, dtype=torch.float32).unsqueeze(0).to(dev)
+            _enc_t = torch.tensor(_enc,   dtype=torch.float32).unsqueeze(0).to(dev)
+            _dec_t = torch.tensor(_dec,   dtype=torch.float32).unsqueeze(0).to(dev)
             _dec_zero = torch.tensor(_dec_z, dtype=torch.float32).unsqueeze(0).to(dev)
 
             _pred_true = m(_enc_t, _dec_t).cpu().numpy().squeeze(0)
@@ -588,13 +606,12 @@ def _(F_eval, H_eval, dev, m):
     abl_preds_zeroed = np.array(_preds_zeroed)
     abl_targets = np.array([s[2] for s in _samples_abl])
     abl_windows = np.array([s[3] for s in _samples_abl])
-    abl_light = np.array([s[4] for s in _samples_abl])
+    abl_light   = np.array([s[4] for s in _samples_abl])
 
     _rmse_true = np.sqrt(np.mean((abl_preds_true - abl_targets) ** 2))
     _rmse_zero = np.sqrt(np.mean((abl_preds_zeroed - abl_targets) ** 2))
     _rmse_diff = np.sqrt(np.mean((abl_preds_true - abl_preds_zeroed) ** 2))
 
-    # Per-step comparison
     _rmse_true_step = np.sqrt(np.mean((abl_preds_true - abl_targets) ** 2, axis=0))
     _rmse_zero_step = np.sqrt(np.mean((abl_preds_zeroed - abl_targets) ** 2, axis=0))
 
@@ -668,8 +685,6 @@ def _(
         _pred_true_abs = _last + np.cumsum(abl_preds_true[_idx])
         _pred_zero_abs = _last + np.cumsum(abl_preds_zeroed[_idx])
 
-        print(_win) # okay, trajectory of cnr
-
         _ax2 = _ax.twinx()
         _ax2.fill_between(_t_all, abl_light[_idx], alpha=0.15, color="orange", label="light")
         _ax2.set_ylim(0, max(abl_light[_idx].max() * 3, 1))
@@ -687,7 +702,6 @@ def _(
             _h1, _l1 = _ax.get_legend_handles_labels()
             _h2, _l2 = _ax2.get_legend_handles_labels()
             _ax.legend(_h1 + _h2, _l1 + _l2, fontsize=7, ncol=3, loc="upper right")
-        break
 
     _axes_ex[-1].set_xlabel("Time step")
     _fig_ex.suptitle("Ablation examples (click Reshuffle for new ones)", fontsize=11)
