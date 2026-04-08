@@ -3,9 +3,7 @@ import marimo
 __generated_with = "0.21.1"
 app = marimo.App(width="full")
 
-
-@app.cell(hide_code=True)
-def _():
+with app.setup:
     import sys
     from pathlib import Path
 
@@ -35,37 +33,85 @@ def _():
     hostname = get_username()
     is_cluster = running_on_cluster()
     results_base = results_write_path()
-    return (
-        DataLoader,
-        Dataset,
-        ExperimentTracker,
-        Path,
-        STIM_COLS,
-        Subset,
-        compute_training_stats,
-        device,
-        hostname,
-        is_cluster,
-        load_real,
-        load_synthetic,
-        mo,
-        n_stim,
-        nn,
-        np,
-        optim,
-        os,
-        parse_bool,
-        plt,
-        results_base,
-        tempfile,
-        time,
-        torch,
-        train_test_split,
-    )
+
+    def _init_forget_bias(lstm):
+        for name, param in lstm.named_parameters():
+            if "bias" in name:
+                n = param.size(0)
+                param.data[n // 4 : n // 2].fill_(1.0)
+
+    class LSTMEncoder(nn.Module):
+        def __init__(self, input_dim, hidden_dim, num_layers):
+            super().__init__()
+            self.lstm = nn.LSTM(
+                input_dim, hidden_dim, num_layers,
+                batch_first=True, dropout=0.1 if num_layers > 1 else 0.0,
+            )
+            _init_forget_bias(self.lstm)
+
+        def forward(self, x):
+            _, (h_n, c_n) = self.lstm(x)
+            return h_n, c_n
+
+    class LSTMDecoder(nn.Module):
+        def __init__(self, stim_dim, hidden_dim, num_layers):
+            super().__init__()
+            self.lstm = nn.LSTM(
+                stim_dim, hidden_dim, num_layers,
+                batch_first=True, dropout=0.1 if num_layers > 1 else 0.0,
+            )
+            _init_forget_bias(self.lstm)
+            self.fc_out = nn.Linear(hidden_dim, 1)
+
+        def forward(self, future_stim, h_0, c_0):
+            out, _ = self.lstm(future_stim, (h_0, c_0))
+            return self.fc_out(out).squeeze(-1)
+
+    class Seq2Seq(nn.Module):
+        """Autoregressive rollout with teacher forcing."""
+        def __init__(self, encoder_dim, stim_dim, hidden_dim, num_layers, **kwargs):
+            super().__init__()
+            self.encoder = LSTMEncoder(encoder_dim, hidden_dim, num_layers)
+            self.decoder = LSTMDecoder(stim_dim, hidden_dim, num_layers)
+
+        def forward(self, encoder_input, future_stim, targets=None, tf_ratio=0.0):
+            B, H, _ = encoder_input.shape
+            F = future_stim.shape[1]
+            current_window = encoder_input
+            predictions = []
+            for i in range(F):
+                h, c = self.encoder(current_window)
+                pred = self.decoder(future_stim[:, i:i+1, :], h, c)  # (B, 1)
+                predictions.append(pred.squeeze(1))
+                if i < F - 1:
+                    # Window stores absolute CNR; reconstruct from delta before appending
+                    last_abs = current_window[:, -1, 0:1]  # (B, 1)
+                    use_teacher = targets is not None and torch.rand(1).item() < tf_ratio
+                    next_cnr_abs = last_abs + (targets[:, i:i+1] if use_teacher else pred)
+                    next_input = torch.cat([next_cnr_abs, future_stim[:, i, :]], dim=-1).unsqueeze(1)
+                    current_window = torch.cat([current_window[:, 1:, :], next_input], dim=1)
+            return torch.stack(predictions, dim=1)  # (B, F)
+
+        def loss(self, predictions, target):
+            return nn.functional.mse_loss(predictions, target)
+
+    class Seq2SeqBaseline(nn.Module):
+        """Single-pass: encode history once, decode all future steps in parallel."""
+        def __init__(self, encoder_dim, stim_dim, hidden_dim, num_layers):
+            super().__init__()
+            self.encoder = LSTMEncoder(encoder_dim, hidden_dim, num_layers)
+            self.decoder = LSTMDecoder(stim_dim, hidden_dim, num_layers)
+
+        def forward(self, encoder_input, future_stim, **kwargs):
+            h, c = self.encoder(encoder_input)
+            return self.decoder(future_stim, h, c)
+
+        def loss(self, predictions, target):
+            return nn.functional.mse_loss(predictions, target)
 
 
 @app.cell
-def _(mo, parse_bool):
+def _():
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
@@ -81,7 +127,7 @@ def _(mo, parse_bool):
 
 
 @app.cell
-def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
+def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
     DATA_SOURCE = source_selector.value
 
     config = dict(
@@ -124,7 +170,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
 
 
 @app.cell
-def _(mo):
+def _():
     _headless = "name" in mo.cli_args()
     load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
     train_button = mo.ui.run_button(label="Start training")
@@ -133,23 +179,7 @@ def _(mo):
 
 
 @app.cell
-def _(
-    DATA_SOURCE,
-    DRY_RUN,
-    DataLoader,
-    Dataset,
-    STIM_COLS,
-    Subset,
-    config,
-    load_data_button,
-    load_real,
-    load_synthetic,
-    mo,
-    n_stim,
-    np,
-    torch,
-    train_test_split,
-):
+def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
     _headless = "name" in mo.cli_args()
     mo.stop(not _headless and not load_data_button.value, mo.md("Click **Load data & prepare datasets** to continue."))
     H = config["history_len"]
@@ -231,82 +261,7 @@ def _(
 
 
 @app.cell
-def _(config, device, mo, n_stim, nn, torch):
-    def _init_forget_bias(lstm):
-        for name, param in lstm.named_parameters():
-            if "bias" in name:
-                n = param.size(0)
-                param.data[n // 4 : n // 2].fill_(1.0)
-
-    class LSTMEncoder(nn.Module):
-        def __init__(self, input_dim, hidden_dim, num_layers):
-            super().__init__()
-            self.lstm = nn.LSTM(
-                input_dim, hidden_dim, num_layers,
-                batch_first=True, dropout=0.1 if num_layers > 1 else 0.0,
-            )
-            _init_forget_bias(self.lstm)
-
-        def forward(self, x):
-            _, (h_n, c_n) = self.lstm(x)
-            return h_n, c_n
-
-    class LSTMDecoder(nn.Module):
-        def __init__(self, stim_dim, hidden_dim, num_layers):
-            super().__init__()
-            self.lstm = nn.LSTM(
-                stim_dim, hidden_dim, num_layers,
-                batch_first=True, dropout=0.1 if num_layers > 1 else 0.0,
-            )
-            _init_forget_bias(self.lstm)
-            self.fc_out = nn.Linear(hidden_dim, 1)
-
-        def forward(self, future_stim, h_0, c_0):
-            out, _ = self.lstm(future_stim, (h_0, c_0))
-            return self.fc_out(out).squeeze(-1)
-
-    class Seq2Seq(nn.Module):
-        """Autoregressive rollout with teacher forcing."""
-        def __init__(self, encoder_dim, stim_dim, hidden_dim, num_layers):
-            super().__init__()
-            self.encoder = LSTMEncoder(encoder_dim, hidden_dim, num_layers)
-            self.decoder = LSTMDecoder(stim_dim, hidden_dim, num_layers)
-
-        def forward(self, encoder_input, future_stim, targets=None, tf_ratio=0.0):
-            B, H, _ = encoder_input.shape
-            F = future_stim.shape[1]
-            current_window = encoder_input
-            predictions = []
-            for i in range(F):
-                h, c = self.encoder(current_window)
-                pred = self.decoder(future_stim[:, i:i+1, :], h, c)  # (B, 1)
-                predictions.append(pred.squeeze(1))
-                if i < F - 1:
-                    # Window stores absolute CNR; reconstruct from delta before appending
-                    last_abs = current_window[:, -1, 0:1]  # (B, 1)
-                    use_teacher = targets is not None and torch.rand(1).item() < tf_ratio
-                    next_cnr_abs = last_abs + (targets[:, i:i+1] if use_teacher else pred)
-                    next_input = torch.cat([next_cnr_abs, future_stim[:, i, :]], dim=-1).unsqueeze(1)
-                    current_window = torch.cat([current_window[:, 1:, :], next_input], dim=1)
-            return torch.stack(predictions, dim=1)  # (B, F)
-
-        def loss(self, predictions, target):
-            return nn.functional.mse_loss(predictions, target)
-
-    class Seq2SeqBaseline(nn.Module):
-        """Single-pass: encode history once, decode all future steps in parallel."""
-        def __init__(self, encoder_dim, stim_dim, hidden_dim, num_layers):
-            super().__init__()
-            self.encoder = LSTMEncoder(encoder_dim, hidden_dim, num_layers)
-            self.decoder = LSTMDecoder(stim_dim, hidden_dim, num_layers)
-
-        def forward(self, encoder_input, future_stim, **kwargs):
-            h, c = self.encoder(encoder_input)
-            return self.decoder(future_stim, h, c)
-
-        def loss(self, predictions, target):
-            return nn.functional.mse_loss(predictions, target)
-
+def _(config):
     encoder_dim = 1 + n_stim
     stim_dim = n_stim
 
@@ -341,21 +296,9 @@ def _(config, device, mo, n_stim, nn, torch):
 def _(
     DATA_SOURCE,
     EXPERIMENT_NAME,
-    ExperimentTracker,
     config,
-    device,
-    mo,
     model,
     model_baseline,
-    n_stim,
-    nn,
-    np,
-    optim,
-    os,
-    results_base,
-    tempfile,
-    time,
-    torch,
     train_button,
     train_loader,
     val_loader,
@@ -545,7 +488,7 @@ def _(
 
 
 @app.cell
-def _(history, history_baseline, plt):
+def _(history, history_baseline):
     skip = 3
     fig_loss, _ax = plt.subplots(1, 3, figsize=(18, 4))
 
@@ -577,7 +520,7 @@ def _(history, history_baseline, plt):
 
 
 @app.cell
-def _(F_, H, device, model, model_baseline, np, plt, test_ds, torch):
+def _(F_, H, model, model_baseline, test_ds):
     _n_examples = 8
     _indices = np.linspace(0, len(test_ds) - 1, _n_examples, dtype=int)
 
@@ -632,7 +575,7 @@ def _(F_, H, device, model, model_baseline, np, plt, test_ds, torch):
 
 
 @app.cell
-def _(DataLoader, device, model, model_baseline, np, test_ds, torch):
+def _(model, model_baseline, test_ds):
     # --- collect full test-set predictions (shared across eval cells) ---
     _last_cnr, _actual_all, _pred_ar_all, _pred_bl_all = [], [], [], []
     _pred_ar_nz, _pred_bl_nz, _fut_stim_all = [], [], []
@@ -684,8 +627,6 @@ def _(DataLoader, device, model, model_baseline, np, test_ds, torch):
 @app.cell(hide_code=True)
 def _(
     F_,
-    np,
-    plt,
     test_act,
     test_act_abs,
     test_ar,
@@ -763,7 +704,7 @@ def _(
 
 
 @app.cell
-def _(DataLoader, np, plt, test_ds):
+def _(test_ds):
     _last_cnr2, _hist_mean2 = [], []
     for _enc, _stim, _tgt in DataLoader(test_ds, batch_size=512):
         _last_cnr2.append(_enc[:, -1, 0].numpy())
@@ -799,7 +740,7 @@ def _(DataLoader, np, plt, test_ds):
 
 
 @app.cell
-def _(DataLoader, np, plt, test_ds):
+def _(test_ds):
     # conditional ratio: does actual_step1 / last_cnr drop toward 0.5 for high-CNR windows?
     _last3, _step1_actual3 = [], []
     for _enc, _stim, _tgt in DataLoader(test_ds, batch_size=512):
@@ -846,7 +787,7 @@ def _(DataLoader, np, plt, test_ds):
 
 
 @app.cell
-def _(np, test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
+def _(test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
     mse_per_step_ar = np.mean((test_ar - test_act) ** 2, axis=0)
     mse_per_step_bl = np.mean((test_bl - test_act) ** 2, axis=0)
     mse_per_step_zero = np.mean(test_act ** 2, axis=0)
@@ -915,13 +856,10 @@ def _(np, test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
 @app.cell
 def _(
     F_,
-    mo,
     mse_per_step_ar,
     mse_per_step_bl,
     mse_per_step_mean,
     mse_per_step_zero,
-    np,
-    plt,
     r2_per_step_ar,
     r2_per_step_bl,
 ):
@@ -956,14 +894,7 @@ def _(
 
 
 @app.cell
-def _(
-    mo,
-    overall_mse_ar,
-    overall_mse_bl,
-    overall_mse_mean,
-    overall_mse_zero,
-    plt,
-):
+def _(overall_mse_ar, overall_mse_bl, overall_mse_mean, overall_mse_zero):
     _names = ["Persist last\n(zero delta)", "Predict\nmean delta", "Baseline", "AR"]
     _vals = [overall_mse_zero, overall_mse_mean, overall_mse_bl, overall_mse_ar]
     _colors = ["#aaa", "#ccc", "#dd8452", "#4c72b0"]
@@ -991,7 +922,7 @@ def _(
 
 
 @app.cell
-def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std, mo, np, plt):
+def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std):
     _steps = np.arange(1, F_ + 1)
 
     fig_cumulative, _ax = plt.subplots(figsize=(8, 5))
@@ -1013,7 +944,7 @@ def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std, mo, np, plt):
 
 
 @app.cell
-def _(ar_win_rate, mo, mse_window_ar, mse_window_bl, plt, test_stim):
+def _(ar_win_rate, mse_window_ar, mse_window_bl, test_stim):
     fig_head2head, _ax = plt.subplots(figsize=(7, 7))
     _sc = _ax.scatter(
         mse_window_bl, mse_window_ar,
@@ -1041,7 +972,6 @@ def _(ar_win_rate, mo, mse_window_ar, mse_window_bl, plt, test_stim):
 @app.cell
 def _(
     ar_win_rate,
-    mo,
     overall_mse_ar,
     overall_mse_bl,
     overall_mse_mean,
@@ -1062,7 +992,7 @@ def _(
 
 
 @app.cell
-def _(mo, test_ds):
+def _(test_ds):
     traj_selector = mo.ui.slider(
         0, len(test_ds) - 1, value=0, label="Test window index"
     )
@@ -1071,19 +1001,7 @@ def _(mo, test_ds):
 
 
 @app.cell
-def _(
-    F_,
-    H,
-    device,
-    mo,
-    model,
-    model_baseline,
-    np,
-    plt,
-    test_ds,
-    torch,
-    traj_selector,
-):
+def _(F_, H, model, model_baseline, test_ds, traj_selector):
     _idx = traj_selector.value
     _enc_in, _dec_stim, _dec_target = test_ds[_idx]
 
@@ -1147,8 +1065,6 @@ def _(
 
 @app.cell
 def _(
-    Path,
-    compute_training_stats,
     eval_metrics,
     fig_baselines,
     fig_cumulative,
@@ -1159,9 +1075,6 @@ def _(
     fig_step_metrics,
     history,
     history_baseline,
-    hostname,
-    is_cluster,
-    mo,
     model,
     model_baseline,
     tracker_ar,

@@ -62,39 +62,20 @@ def launch(job: Job, local: bool = False):
 # ── Experiment definitions ────────────────────────────────────────────────────
 
 JOBS = [
-    Job(
-        notebook="experiments/lstm_seq2seq.py",
-        name="lstm_seq2seq_synthetic",
-        params=dict(source="synthetic", dry_run="false"),
-        time="18:00:00",
-        mem="16G",
-    ),
-    Job(
-        notebook="experiments/lstm_seq2seq.py",
-        name="lstm_seq2seq_real",
-        params=dict(source="real", dry_run="false"),
-        time="18:00:00",
-        mem="16G",
-    ),
-    Job(
-        notebook="experiments/lstm_seq2seq.py",
-        name="sanitycheck",
-        params=dict(source="real", dry_run="true"),
-        time="18:00:00",
-        mem="16G",
-    ),
     #Job(
-    #    notebook="experiments/lstm_gridsearch_seq2seq.py",
-    #    name="lstm_gridsearch_synthetic_smaller",
-    #    params=dict(gridsearch="true", gridsearch_sources="synthetic", dry_run="false"),
-    #    time="15:00:00",
-    #    mem="32G",
-    #),
-    #Job(
-    #    notebook="experiments/lstm_gridsearch_seq2seq.py",
-    #    name="lstm_gridsearch_real_smaller",
-    #    params=dict(gridsearch="true", gridsearch_sources="real", dry_run="false"),
-    #    time="15:00:00",
+    #    notebook="experiments/gridsearch_lstm_seq2seq.py",
+    #    name="lstm_gridsearch_synthetic",
+    #    params=dict(
+    #        source="synthetic",
+    #        dry_run="false",
+    #        history_len="10,20,30",
+    #        future_len="2,5,10",
+    #        lr="1e-3,5e-4",
+    #        num_layers="1,2",
+    #        hidden_dim="16,32,64",
+    #        patience="30,50",
+    #    ),
+    #    time="24:00:00",
     #    mem="32G",
     #),
 ]
