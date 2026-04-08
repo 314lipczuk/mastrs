@@ -713,8 +713,9 @@ def _(
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    Why is the zero stim jumping higher than anything else?
-    Huh??????
+    Fixed a bug where the generation of features would incorrectly initialize cumulative features from 0 instead of relying on features from a complete trajectory that we are windowing.
+
+    Despite that, some trajectories still exhibit a behavior where zero stimulation results in an immediate peak that is higher than both true stimulation and actual trajectories in the future.
     """)
     return
 
@@ -730,19 +731,33 @@ def _():
     return
 
 
-@app.cell
-def _(F_eval, H_eval, dev, m):
+@app.cell(hide_code=True)
+def _(F_eval, H_eval):
     from experiments.seq2seq_data import load_real as _load_real_cf
     from experiments.seq2seq_data import _stim_features
 
     _total_cf = H_eval + F_eval
-    _cnr_cf, _stim_cf, _ = _load_real_cf(window_size=_total_cf, stride=13)
+    cnr_cf, stim_cf, _ = _load_real_cf(window_size=_total_cf, stride=13)
+    return cnr_cf, stim_cf
 
-    # Pick 3 cells spread across the dataset
-    _n_cells = len(_cnr_cf)
-    _cell_ids = [0, _n_cells // 2, _n_cells - 1] if _n_cells >= 3 else list(range(_n_cells))
 
-    # Build counterfactual light patterns (shared across cells)
+@app.cell(hide_code=True)
+def _():
+    cf_reshuffle = mo.ui.run_button(label="Reshuffle examples")
+    mo.hstack([
+        mo.md("### Counterfactual sensitivity"),
+        cf_reshuffle,
+    ], justify="start", gap=1, align="center")
+    return (cf_reshuffle,)
+
+
+@app.cell(hide_code=True)
+def _(F_eval, H_eval, cf_reshuffle, cnr_cf, dev, m, stim_cf):
+    _ = cf_reshuffle.value
+
+    _S = {name: i for i, name in enumerate(STIM_COLS)}
+    _total_cf = H_eval + F_eval
+
     _light_patterns = {}
     _light_patterns["Always OFF"] = np.zeros((1, F_eval))
     _light_patterns["Always ON"] = np.ones((1, F_eval))
@@ -758,15 +773,17 @@ def _(F_eval, H_eval, dev, m):
     _scenario_names = list(_light_patterns.keys()) + ["Actual"]
     _n_scenarios = len(_scenario_names)
 
+    _n_cells = len(cnr_cf)
+    _cell_ids = np.random.choice(_n_cells, size=min(3, _n_cells), replace=False)
+
     _t_all = np.arange(_total_cf)
     _t_hist = np.arange(H_eval)
     _t_fut = np.arange(H_eval, _total_cf)
     _n_show = len(_cell_ids)
 
-    # Per cell: 1 CNR row + 1 light row per scenario
     _rows_per_cell = 1 + _n_scenarios
-    _cnr_h = 3.0   # inches per CNR row
-    _light_h = 0.4  # inches per light row
+    _cnr_h = 3.0
+    _light_h = 0.4
     _ratios = []
     for _ in range(_n_show):
         _ratios.append(_cnr_h)
@@ -786,24 +803,47 @@ def _(F_eval, H_eval, dev, m):
         _base = _ci * _rows_per_cell
         _ax_cnr = _axes_cf[_base]
 
-        _enc_cnr = _cnr_cf[_cell_idx, :H_eval]
-        _enc_stim = _stim_cf[_cell_idx, :, :H_eval]
-        _enc_in = np.concatenate([_enc_cnr[:, np.newaxis], _enc_stim.T], axis=-1)
-        _enc_t = torch.tensor(_enc_in, dtype=torch.float32).unsqueeze(0).to(dev)
+        _enc_cnr  = cnr_cf[_cell_idx, :H_eval]
+        _enc_stim = stim_cf[_cell_idx, :, :H_eval]
+        _enc_in   = np.concatenate([_enc_cnr[:, np.newaxis], _enc_stim.T], axis=-1)
+        _enc_t    = torch.tensor(_enc_in, dtype=torch.float32).unsqueeze(0).to(dev)
 
-        _actual_dec = _stim_cf[_cell_idx, :, H_eval : _total_cf]
-        _full_window = _cnr_cf[_cell_idx, :_total_cf]
+        _hist_light  = stim_cf[_cell_idx, 0, :H_eval]
+        _actual_dec  = stim_cf[_cell_idx, :, H_eval : _total_cf]
+        _full_window = cnr_cf[_cell_idx, :_total_cf]
         _true_deltas = np.diff(_full_window)[H_eval - 1 : H_eval - 1 + F_eval]
-        _last_cnr = _full_window[H_eval - 1]
+        _last_cnr    = _full_window[H_eval - 1]
 
-        # Build scenarios: synthetic patterns + actual
         _scenarios = {}
         for _name, _lp_arr in _light_patterns.items():
-            _scenarios[_name] = (_stim_features(_lp_arr)[0].T, _lp_arr.squeeze())
-        _actual_light = _stim_cf[_cell_idx, 0, H_eval : _total_cf]
+            _full_light = np.concatenate([_hist_light, _lp_arr.squeeze()])[np.newaxis, :]
+            _full_feats = _stim_features(_full_light)
+            _dec_feats  = _full_feats[0, :, H_eval:].T.copy()
+
+            _dec_feats[:, _S["s_cum"]] = (
+                _enc_stim[_S["s_cum"], -1] + np.cumsum(_lp_arr.squeeze())
+            )
+            _dec_feats[:, _S["ewma_fast"]] = (
+                _enc_stim[_S["ewma_fast"], -1] * (0.5 ** np.arange(1, F_eval + 1))
+                + 0.5 * np.array([
+                    sum(0.5**j * _lp_arr[0, t - j] for j in range(t + 1))
+                    for t in range(F_eval)
+                ])
+            )
+            _dec_feats[:, _S["ewma_slow"]] = (
+                _enc_stim[_S["ewma_slow"], -1] * (0.9 ** np.arange(1, F_eval + 1))
+                + 0.1 * np.array([
+                    sum(0.9**j * _lp_arr[0, t - j] for j in range(t + 1))
+                    for t in range(F_eval)
+                ])
+            )
+            _dec_feats[:, _S["recency"]] = _full_feats[0, _S["recency"], H_eval:]
+
+            _scenarios[_name] = (_dec_feats, _lp_arr.squeeze())
+
+        _actual_light = stim_cf[_cell_idx, 0, H_eval : _total_cf]
         _scenarios["Actual"] = (_actual_dec.T, _actual_light)
 
-        # Predict under each scenario
         _cf_preds = {}
         with torch.no_grad():
             for _label, (_dec_np, _) in _scenarios.items():
@@ -813,7 +853,6 @@ def _(F_eval, H_eval, dev, m):
 
         _true_abs = _last_cnr + np.cumsum(_true_deltas)
 
-        # CNR subplot
         _ax_cnr.plot(_t_hist, _full_window[:H_eval], "k-", alpha=0.5, label="History")
         _ax_cnr.plot(_t_fut, _true_abs, "k--", lw=1.5, alpha=0.5, label="True future")
         for _label, _pred_abs in _cf_preds.items():
@@ -824,8 +863,6 @@ def _(F_eval, H_eval, dev, m):
         if _ci == 0:
             _ax_cnr.legend(fontsize=7, ncol=3, loc="upper right")
 
-        # One light row per scenario
-        _hist_light = _stim_cf[_cell_idx, 0, :H_eval]
         for _si, _sname in enumerate(_scenario_names):
             _ax_l = _axes_cf[_base + 1 + _si]
             _, _light_arr = _scenarios[_sname]
@@ -836,24 +873,18 @@ def _(F_eval, H_eval, dev, m):
             _ax_l.set_yticks([])
             _ax_l.set_ylabel(_sname, fontsize=7, rotation=0, ha="right", va="center")
 
-        # Spread for this cell
         _preds_stack = np.stack(list(_cf_preds.values()))
         _all_spreads.append(np.max(_preds_stack, axis=0) - np.min(_preds_stack, axis=0))
 
     _axes_cf[-1].set_xlabel("Time step")
-    _fig_cf.suptitle("Counterfactual sensitivity", fontsize=12)
+    _fig_cf.suptitle(f"Counterfactual sensitivity — cells {list(_cell_ids)}", fontsize=12)
     _fig_cf.tight_layout()
 
-    # Aggregate spread across all cells
     _spread = np.concatenate(_all_spreads)
-    _cnr_range = np.ptp(_cnr_cf[:, :_total_cf])
+    _cnr_range = np.ptp(cnr_cf[:, :_total_cf])
 
     mo.vstack([
         mo.md(f"""
-    ### Counterfactual sensitivity
-
-    Predicted trajectories under 4 stimulation scenarios for {_n_show} cells.
-
     | Metric | Value |
     |--------|------:|
     | Mean counterfactual spread | {np.mean(_spread):.6f} |
