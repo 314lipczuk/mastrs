@@ -917,13 +917,12 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(F_eval, H_eval, dev, m):
+def _(F_eval, H_eval, bundle, dev, m):
     from experiments.seq2seq_data import load_real as _load_real_pc
 
     _total_pc = H_eval + F_eval
     _cnr_pc, _stim_pc, _cond_pc = _load_real_pc(window_size=_total_pc, stride=13)
 
-    # Build windows, tracking condition and stimulation regime per window
     _records = []
     for _i in range(len(_cnr_pc)):
         _t = 0
@@ -935,7 +934,6 @@ def _(F_eval, H_eval, dev, m):
             _dec_tgt = np.diff(_full_win)[H_eval - 1 : H_eval - 1 + F_eval]
             _enc_in = np.concatenate([_enc_cnr[:, np.newaxis], _enc_stim.T], axis=-1)
 
-            # Classify stimulation regime by future light (u_t channel)
             _future_light = _stim_pc[_i, 0, _t + H_eval : _t + _total_pc]
             _frac_on = np.mean(_future_light > 0)
             if _frac_on < 0.1:
@@ -948,53 +946,54 @@ def _(F_eval, H_eval, dev, m):
             _records.append({
                 "enc_in": _enc_in, "dec_stim": _dec_stim.T,
                 "target": _dec_tgt, "last_cnr": _full_win[H_eval - 1],
-                "condition": _cond_pc[_i], "stim_regime": _stim_regime,
+                "stim_regime": _stim_regime,
+                "condition": _cond_pc[_i],
             })
             _t += 2
 
-    # Inference
     with torch.no_grad():
         for _r in _records:
             _enc_t = torch.tensor(_r["enc_in"], dtype=torch.float32).unsqueeze(0).to(dev)
             _dec_t = torch.tensor(_r["dec_stim"], dtype=torch.float32).unsqueeze(0).to(dev)
             _r["pred"] = m(_enc_t, _dec_t).cpu().numpy().squeeze(0)
 
-    # Compute per-group metrics
-    def _group_metrics(records, key):
-        from collections import defaultdict
-        groups = defaultdict(list)
-        for r in records:
-            groups[r[key]].append(r)
-        rows = []
-        for name, recs in sorted(groups.items()):
-            preds = np.array([r["pred"] for r in recs])
-            tgts = np.array([r["target"] for r in recs])
-            rmse_model = np.sqrt(np.mean((preds - tgts) ** 2))
-            rmse_naive = np.sqrt(np.mean(tgts ** 2))  # baseline: Δ=0
-            rows.append({
-                "Group": name, "N": len(recs),
-                "RMSE (model)": rmse_model,
-                "RMSE (naive Δ=0)": rmse_naive,
-                "Improvement": f"{(1 - rmse_model / max(rmse_naive, 1e-8)) * 100:.1f}%",
+    from collections import defaultdict
+
+    def _group_metrics(key):
+        _groups = defaultdict(list)
+        for _r in _records:
+            _groups[_r[key]].append(_r)
+        _rows = []
+        for _name, _recs in sorted(_groups.items()):
+            _preds = np.array([_r["pred"] for _r in _recs])
+            _tgts  = np.array([_r["target"] for _r in _recs])
+            _rmse_model = np.sqrt(np.mean((_preds - _tgts) ** 2))
+            _rmse_naive = np.sqrt(np.mean(_tgts ** 2))
+            _rows.append({
+                "Group": _name, "N": len(_recs),
+                "RMSE (model)": _rmse_model,
+                "RMSE (naive)": _rmse_naive,
+                "Improvement": f"{(1 - _rmse_model / max(_rmse_naive, 1e-8)) * 100:.1f}%",
             })
-        return rows
+        return _rows
 
-    _regime_rows = _group_metrics(_records, "stim_regime")
-    _cond_rows = _group_metrics(_records, "condition")
+    def _make_table(rows):
+        lines = ["| Group | N | RMSE (model) | RMSE (naive) | Improvement |",
+                 "|-------|--:|-------------:|-------------:|------------:|"]
+        for _r in rows:
+            lines.append(
+                f"| {_r['Group']} | {_r['N']} "
+                f"| {_r['RMSE (model)']:.6f} | {_r['RMSE (naive)']:.6f} "
+                f"| {_r['Improvement']} |"
+            )
+        return "\n".join(lines)
 
-    _regime_table = "| Regime | N | RMSE (model) | RMSE (naive) | Improvement |\n|--------|--:|-------------:|-------------:|------------:|\n"
-    for r in _regime_rows:
-        _regime_table += f"| {r['Group']} | {r['N']} | {r['RMSE (model)']:.6f} | {r['RMSE (naive Δ=0)']:.6f} | {r['Improvement']} |\n"
+    _regime_rows = _group_metrics("stim_regime")
 
-    _cond_table = "| Condition | N | RMSE (model) | RMSE (naive) | Improvement |\n|-----------|--:|-------------:|-------------:|------------:|\n"
-    for r in _cond_rows:
-        _cond_table += f"| {r['Group']} | {r['N']} | {r['RMSE (model)']:.6f} | {r['RMSE (naive Δ=0)']:.6f} | {r['Improvement']} |\n"
-
-    # Bar chart
     _regime_df = pl.DataFrame({
-        "regime": [r["Group"] for r in _regime_rows],
-        "model": [r["RMSE (model)"] for r in _regime_rows],
-        "naive": [r["RMSE (naive Δ=0)"] for r in _regime_rows],
+        "regime": [_r["Group"] for _r in _regime_rows],
+        "model":  [_r["RMSE (model)"] for _r in _regime_rows],
+        "naive":  [_r["RMSE (naive)"] for _r in _regime_rows],
     }).unpivot(index="regime", on=["model", "naive"], variable_name="method", value_name="RMSE")
 
     _bar = alt.Chart(_regime_df).mark_bar().encode(
@@ -1003,16 +1002,71 @@ def _(F_eval, H_eval, dev, m):
         color=alt.Color("method:N", scale=alt.Scale(domain=["model", "naive"], range=["#4c78a8", "#e45756"])),
         xOffset="method:N",
         tooltip=["regime", "method", alt.Tooltip("RMSE:Q", format=".6f")],
-    ).properties(width=400, height=250, title="RMSE by stimulation regime")
+    ).properties(width=400, height=250, title="RMSE by stimulation regime (all steps)")
 
-    mo.vstack([
-        mo.md(f"### Per-condition RMSE ({len(_records)} windows)"),
-        mo.md("#### By stimulation regime"),
-        mo.md(_regime_table),
-        _bar,
-        mo.md("#### By experimental condition"),
-        mo.md(_cond_table),
+    # Per-step RMSE: shows whether the model degrades quickly over the horizon
+    _all_preds = np.array([_r["pred"] for _r in _records])   # (N, F_eval)
+    _all_tgts  = np.array([_r["target"] for _r in _records]) # (N, F_eval)
+    _steps = np.arange(1, F_eval + 1)
+    _rmse_model_step = np.sqrt(np.mean((_all_preds - _all_tgts) ** 2, axis=0))
+    _rmse_naive_step = np.sqrt(np.mean(_all_tgts ** 2, axis=0))
+
+    _step_df = pl.concat([
+        pl.DataFrame({"step": _steps, "RMSE": _rmse_model_step, "method": ["model"] * F_eval}),
+        pl.DataFrame({"step": _steps, "RMSE": _rmse_naive_step, "method": ["naive (Δ=0)"] * F_eval}),
     ])
+    _step_chart = alt.Chart(_step_df).mark_line(point=True, strokeWidth=2).encode(
+        x=alt.X("step:O", title="Future step"),
+        y=alt.Y("RMSE:Q", title="RMSE"),
+        color=alt.Color("method:N", title="",
+                        scale=alt.Scale(domain=["model", "naive (Δ=0)"],
+                                        range=["#4c78a8", "#e45756"])),
+        tooltip=["method", "step", alt.Tooltip("RMSE:Q", format=".6f")],
+    ).properties(width=400, height=220, title="RMSE by future step (all regimes)")
+
+    _parts = [
+        mo.md(f"### Per-regime RMSE ({len(_records)} windows, averaged over all {F_eval} future steps)"),
+        mo.md(_make_table(_regime_rows)),
+        _bar,
+        mo.md("### RMSE vs prediction horizon"),
+        mo.md(
+            f"Step 1 improvement: "
+            f"{(1 - _rmse_model_step[0] / _rmse_naive_step[0]) * 100:.1f}%  |  "
+            f"Step {F_eval} improvement: "
+            f"{(1 - _rmse_model_step[-1] / _rmse_naive_step[-1]) * 100:.1f}%"
+        ),
+        _step_chart,
+    ]
+
+    if bundle.model_config.get("data_source") == "real":
+        _cond_rows = _group_metrics("condition")
+        _parts += [
+            mo.md("#### By experimental condition"),
+            mo.md(_make_table(_cond_rows)),
+        ]
+
+    mo.vstack(_parts)
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    Notes:
+
+    Full real experiment shows big improvement, esp in the first frames (26.7% at the beginning, to 4.6% at steo 10);
+    However, the synthetic data as it currently is gets way worse results.
+
+    synthetic full
+    ar still better than baseline; by far
+
+    What can explain it?
+    1. Synthetic generation is not that good - generated model kinda sucks / does not capture real dynamics, etc...
+    2. Real data is being overfitted on - only a couple of patterns of stimulation, we learn some weird representation of those rather than the real deal.
+
+    How do you discriminate between those?
+    TODO: figure it out
+    """)
     return
 
 
