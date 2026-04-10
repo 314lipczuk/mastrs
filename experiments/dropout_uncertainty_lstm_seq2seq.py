@@ -50,6 +50,7 @@ with app.setup:
             _init_forget_bias(self.lstm)
 
         def forward(self, x):
+            self.lstm.train()
             _, (h_n, c_n) = self.lstm(x)
             return h_n, c_n
 
@@ -58,12 +59,14 @@ with app.setup:
             super().__init__()
             self.lstm = nn.LSTM(
                 stim_dim, hidden_dim, num_layers,
-                batch_first=True, dropout=dropout,
+                batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
             )
             _init_forget_bias(self.lstm)
             self.fc_out = nn.Linear(hidden_dim, 1)
 
         def forward(self, future_stim, h_0, c_0):
+            # A hack that always will set the training mode before running a forward pass; This way dropout is applied both during training and eval phase; 
+            self.lstm.train()
             out, _ = self.lstm(future_stim, (h_0, c_0))
             return self.fc_out(out).squeeze(-1)
 
@@ -79,6 +82,7 @@ with app.setup:
             F = future_stim.shape[1]
             current_window = encoder_input
             predictions = []
+            self.train()
             for i in range(F):
                 h, c = self.encoder(current_window)
                 pred = self.decoder(future_stim[:, i:i+1, :], h, c)  # (B, 1)
@@ -141,6 +145,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
         patience=int(args.get("patience", "20" if DRY_RUN else "50")),
         tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
         tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
+        dropout=0.4
     )
 
     mo.md(f"""
@@ -165,6 +170,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
     | tf_ratio_start | {config['tf_ratio_start']} |
     | tf_ratio_end | {config['tf_ratio_end']} |
     | dry_run | {DRY_RUN} |
+    | dropout | {config['dropout']} |
     """)
     return DATA_SOURCE, config
 
@@ -270,7 +276,6 @@ def _(config):
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
-        dropout=config['dropout']
     ).to(device)
 
     model_baseline = Seq2SeqBaseline(
@@ -278,7 +283,6 @@ def _(config):
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
-        dropout=config['dropout']
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -294,7 +298,7 @@ def _(config):
     return model, model_baseline
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
     DATA_SOURCE,
     EXPERIMENT_NAME,
@@ -989,6 +993,88 @@ def _(
     | **Overall MSE** | {overall_mse_ar:.6f} | {overall_mse_bl:.6f} | {overall_mse_zero:.6f} | {overall_mse_mean:.6f} |
     | **Overall R²** | {overall_r2_ar:.4f} | {overall_r2_bl:.4f} | — | — |
     | **AR win rate** | {ar_win_rate * 100:.1f}% | — | — | — |
+    """)
+    return
+
+
+@app.cell
+def _(model, model_baseline, test_ds):
+    mo.md("## MC Dropout validation")
+
+    _n_forward = 30
+    _sample_indices = [0, len(test_ds) // 2, len(test_ds) - 1]
+    _results = []
+
+    for _idx in _sample_indices:
+        _enc_in, _dec_stim, _dec_target = test_ds[_idx]
+        _enc_d = _enc_in.unsqueeze(0).to(device)
+        _stim_d = _dec_stim.unsqueeze(0).to(device)
+
+        # Run N forward passes — dropout masks should differ each time
+        _preds_ar = []
+        _preds_bl = []
+        with torch.no_grad():
+            for _ in range(_n_forward):
+                _preds_ar.append(model(_enc_d, _stim_d).cpu().numpy()[0])
+                _preds_bl.append(model_baseline(_enc_d, _stim_d).cpu().numpy()[0])
+
+        _preds_ar = np.stack(_preds_ar)  # (N, F)
+        _preds_bl = np.stack(_preds_bl)
+
+        # Check variance across forward passes
+        _std_ar = _preds_ar.std(axis=0)  # (F,)
+        _std_bl = _preds_bl.std(axis=0)
+        _unique_ar = len(np.unique(_preds_ar[:, 0]))
+        _unique_bl = len(np.unique(_preds_bl[:, 0]))
+
+        _results.append({
+            "idx": _idx,
+            "ar_mean_std": float(_std_ar.mean()),
+            "bl_mean_std": float(_std_bl.mean()),
+            "ar_unique_step1": _unique_ar,
+            "bl_unique_step1": _unique_bl,
+            "preds_ar": _preds_ar,
+            "preds_bl": _preds_bl,
+        })
+
+    # Also verify encoder hidden states are deterministic (no dropout in single-layer encoder)
+    _enc_in0, _dec_stim0, _ = test_ds[0]
+    _enc_d0 = _enc_in0.unsqueeze(0).to(device)
+    with torch.no_grad():
+        _h1, _c1 = model.encoder(_enc_d0)
+        _h2, _c2 = model.encoder(_enc_d0)
+    _encoder_deterministic = torch.allclose(_h1, _h2) and torch.allclose(_c1, _c2)
+
+    # Summary table
+    _rows = []
+    for _r in _results:
+        _rows.append(
+            f"| {_r['idx']} | {_r['ar_mean_std']:.6f} | {_r['bl_mean_std']:.6f} "
+            f"| {_r['ar_unique_step1']}/{_n_forward} | {_r['bl_unique_step1']}/{_n_forward} |"
+        )
+
+    _all_pass_ar = all(r["ar_unique_step1"] > 1 for r in _results)
+    _all_pass_bl = all(r["bl_unique_step1"] > 1 for r in _results)
+    rows = _rows
+
+    mo.md(f"""
+    ### MC Dropout check ({_n_forward} forward passes per sample)
+
+    The `self.train()` hack in `LSTMDecoder.forward()` should cause different dropout masks
+    on each forward pass, producing varying predictions for the same input.
+
+    | Sample | AR mean σ | BL mean σ | AR unique step-1 | BL unique step-1 |
+    |--------|-----------|-----------|-------------------|-------------------|
+    {chr(10).join(_rows)}
+
+    **Encoder deterministic:** {"Yes" if _encoder_deterministic else "No — unexpected!"}
+    (Encoder uses multi-layer LSTM dropout between layers; with `model.eval()` this would be off,
+    but the decoder's `self.train()` only affects the decoder — encoder behavior depends on its own mode.)
+
+    **Verdict:**
+    - AR model predictions vary across passes: **{"PASS" if _all_pass_ar else "FAIL"}**
+    - Baseline model predictions vary across passes: **{"PASS" if _all_pass_bl else "FAIL"}**
+    {"" if (_all_pass_ar and _all_pass_bl) else "⚠ If FAIL: dropout may not be active — check that `num_layers > 1` or add explicit `nn.Dropout` layers."}
     """)
     return
 

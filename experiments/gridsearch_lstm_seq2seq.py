@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.21.1"
+__generated_with = "0.22.5"
 app = marimo.App(width="full")
 
 with app.setup:
@@ -24,7 +24,7 @@ with app.setup:
 
     from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
-    from experiments.lstm_seq2seq import Seq2Seq, Seq2SeqBaseline
+    from experiments.dropout_uncertainty_lstm_seq2seq import Seq2Seq, Seq2SeqBaseline
     import altair as alt
 
     device = get_device()
@@ -62,12 +62,13 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, itertools, source_selector):
         return [cast(x) for x in str(raw).split(",")]
 
     grid = dict(
-        history_len=_parse_grid(args.get("history_len", "10,20,30" if not DRY_RUN else "10,15"), int),
+        history_len=_parse_grid(args.get("history_len", "10,20,30" if not DRY_RUN else "10"), int),
         future_len=_parse_grid(args.get("future_len", "2,5,10" if not DRY_RUN else "2,5"), int),
         lr=_parse_grid(args.get("lr", "1e-3,5e-4" if not DRY_RUN else "1e-3"), float),
         num_layers=_parse_grid(args.get("num_layers", "1,2" if not DRY_RUN else "1"), int),
         hidden_dim=_parse_grid(args.get("hidden_dim", "16,32,64" if not DRY_RUN else "16,32"), int),
         patience=_parse_grid(args.get("patience", "30,50" if not DRY_RUN else "15"), int),
+        dropout=_parse_grid(args.get("dropout", "0.1,0.25,0.5" if not DRY_RUN else "0.1,0.5"), float),
     )
 
     grid_keys = list(grid.keys())
@@ -112,6 +113,20 @@ def _(
     _batch_size = int(args.get("batch_size", "64"))
 
     _exp_dir = mo.cli_args().get("results-dir", f"{results_base}/{EXPERIMENT_NAME}")
+    import json
+    os.makedirs(_exp_dir, exist_ok=True)
+    _out_path = Path(_exp_dir) / "gridsearch_results.json"
+
+    # Resume: reload already-completed rows so a crashed run can continue
+    _done_keys = set()
+    if _out_path.exists():
+        with open(_out_path) as _f:
+            _existing = json.load(_f)
+        gs_results = list(_existing)
+        for _r in _existing:
+            _done_keys.add(tuple(_r[k] for k in grid_keys))
+    else:
+        gs_results = []
 
     class Seq2SeqDataset(Dataset):
         def __init__(self, cnr, stim, history_len, future_len, stride=5):
@@ -285,10 +300,12 @@ def _(
     _encoder_dim = 1 + n_stim
     _stim_dim = n_stim
 
-    gs_results = []
     _total_combos = len(grid_combos)
     for _ci, _combo in enumerate(grid_combos):
         _params = dict(zip(grid_keys, _combo))
+        if tuple(_combo) in _done_keys:
+            print(f"[{_ci+1}/{_total_combos}] Skipping (already done): {_params}")
+            continue
         _h, _f = _params["history_len"], _params["future_len"]
         _train_ds, _val_ds, _test_ds = _data_cache[(_h, _f)]
 
@@ -307,10 +324,12 @@ def _(
         _mdl_ar = Seq2Seq(
             encoder_dim=_encoder_dim, stim_dim=_stim_dim,
             hidden_dim=_params["hidden_dim"], num_layers=_params["num_layers"],
+            dropout=_params['dropout']
         ).to(device)
         _mdl_bl = Seq2SeqBaseline(
             encoder_dim=_encoder_dim, stim_dim=_stim_dim,
             hidden_dim=_params["hidden_dim"], num_layers=_params["num_layers"],
+            dropout=_params['dropout']
         ).to(device)
 
         _t0 = time.time()
@@ -339,6 +358,8 @@ def _(
             "train_time_s": _elapsed,
         }
         gs_results.append(_row)
+        with open(_out_path, "w") as _f:
+            json.dump(gs_results, _f, indent=2)
 
         print(f"[{_ci+1}/{_total_combos}] H={_h} F={_f} hid={_params['hidden_dim']} "
               f"layers={_params['num_layers']} lr={_params['lr']} pat={_params['patience']} "
@@ -444,15 +465,8 @@ def _(gs_df):
 
 
 @app.cell
-def _(EXPERIMENT_NAME, gs_df, gs_results):
+def _(EXPERIMENT_NAME, gs_df):
     _exp_dir = mo.cli_args().get("results-dir", f"{results_base}/{EXPERIMENT_NAME}")
-    os.makedirs(_exp_dir, exist_ok=True)
-
-    _out_path = Path(_exp_dir) / "gridsearch_results.json"
-    import json
-    with open(_out_path, "w") as f:
-        json.dump(gs_results, f, indent=2)
-
     gs_df.write_parquet(str(Path(_exp_dir) / "gridsearch_results.parquet"))
 
     _env_label = f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
