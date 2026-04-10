@@ -846,6 +846,10 @@ def is_experiment_dir(directory: Path) -> bool:
     - Grouped experiments (``experiment.json`` with variant subdirs)
     - Legacy format (any ``.pt`` file at the top level)
     """
+    if (directory / "slurm.log").exists():
+        return True
+    if (directory / "notebook.html").exists():
+        return True
     if not directory.is_dir():
         return False
     if (directory / "bundle.pt").exists():
