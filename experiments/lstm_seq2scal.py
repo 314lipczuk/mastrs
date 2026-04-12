@@ -112,23 +112,6 @@ def _():
             return nn.functional.mse_loss(predictions, target)
 
 
-    class MLPDecoder(nn.Module):
-        def __init__(self, stim_dim, hidden_dim, mlp_hidden, num_layers, dropout=0.1):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(hidden_dim + stim_dim, mlp_hidden),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(mlp_hidden, mlp_hidden),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(mlp_hidden, 1)
-            )
-
-        def forward(self, stim_i, h_top, **kwargs):
-            # stim_i: (B, stim_dim), h_top: (B, hidden_dim)
-            return self.net(torch.cat([h_top, stim_i], dim=-1)).squeeze(-1)
-
     class Seq2Scalar(nn.Module):
         """Autoregressive one-step predictor: sliding-window LSTM encoder + MLP readout.
 
@@ -221,13 +204,6 @@ def _():
 
 
 @app.cell
-def _(torch):
-    t = torch.tensor([1,2,3])
-    torch.Tensor.squeeze
-    return
-
-
-@app.cell
 def _(mo, parse_bool):
     args = mo.cli_args()
 
@@ -248,18 +224,21 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     DATA_SOURCE = source_selector.value
 
     config = dict(
-        hidden_dim=int(args.get("hidden_dim", "16" if DRY_RUN else "32")),
+        hidden_dim=int(args.get("hidden_dim", "16" if DRY_RUN else "64")),
         num_layers=int(args.get("num_layers", "2")),
-        history_len=int(args.get("history_len", "15")),
-        future_len=int(args.get("future_len", "10")),
+        history_len=int(args.get("history_len", "30")),
+        future_len=int(args.get("future_len", "5")),
         lr=float(args.get("lr", "1e-3")),
         epochs=int(args.get("epochs", "50" if DRY_RUN else "400")),
-        batch_size=int(args.get("batch_size", "128")),
-        patience=int(args.get("patience", "20" if DRY_RUN else "50")),
+        batch_size=int(args.get("batch_size", "64")),
+        patience=int(args.get("patience", "20" if DRY_RUN else "100")),
         tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
         tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
-        dropout=float(args.get("dropout", "0.0")),
+        dropout=float(args.get("dropout", "0.1")),
+        mlp_hidden=int(args["mlp_hidden"]) if args.get("mlp_hidden") else None,
+        n_mlp_layers=int(args.get("n_mlp_layers", "5")),
     )
+    print(config)
 
     mo.md(f"""
     # LSTM encoder + LSTM vs MLP decoder: `{EXPERIMENT_NAME}`
@@ -285,6 +264,9 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     | patience | {config['patience']} |
     | tf_ratio_start | {config['tf_ratio_start']} |
     | tf_ratio_end | {config['tf_ratio_end']} |
+    | dropout | {config['dropout']} |
+    | mlp_hidden | {config['mlp_hidden'] if config['mlp_hidden'] is not None else f"auto (= hidden_dim = {config['hidden_dim']})"} |
+    | n_mlp_layers | {config['n_mlp_layers']} |
     | dry_run | {DRY_RUN} |
     """)
     return DATA_SOURCE, config
@@ -415,16 +397,19 @@ def _(Seq2Scalar, Seq2Seq, config, device, mo, n_stim):
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
+        mlp_hidden=config["mlp_hidden"],
+        n_mlp_layers=config["n_mlp_layers"],
         dropout=config['dropout']
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     n_params_m = sum(p.numel() for p in model_mlp.parameters())
+    _mlp_h = config["mlp_hidden"] if config["mlp_hidden"] is not None else config["hidden_dim"]
     mo.md(f"""
     | model | type | params |
     |-------|------|--------|
     | LSTM decoder (AR + TF) | `Seq2Seq` | {n_params:,} |
-    | MLP decoder (AR + TF)  | `Seq2Scalar` | {n_params_m:,} |
+    | MLP decoder (AR + TF)  | `Seq2Scalar` (mlp_hidden={_mlp_h}, n_mlp_layers={config['n_mlp_layers']}) | {n_params_m:,} |
 
     encoder_in={encoder_dim} | decoder_in={stim_dim} | hidden={config['hidden_dim']} | layers={config['num_layers']} | `{device}`
     """)
@@ -577,7 +562,13 @@ def _(
         "lstm", model_config=dict(**_model_config_shared, variant="seq2seq_lstm_ar_tf"),
     )
     tracker_mlp = tracker.make_subexperiment(
-        "mlp", model_config=dict(**_model_config_shared, variant="seq2scalar_mlp_ar_tf"),
+        "mlp",
+        model_config=dict(
+            **_model_config_shared,
+            variant="seq2scalar_mlp_ar_tf",
+            mlp_hidden=config["mlp_hidden"] if config["mlp_hidden"] is not None else config["hidden_dim"],
+            n_mlp_layers=config["n_mlp_layers"],
+        ),
     )
     tracker_lstm.register_start()
     tracker_mlp.register_start()
@@ -604,6 +595,8 @@ def _(
     |-------|-------|
     | hidden_dim | {config['hidden_dim']} |
     | num_layers | {config['num_layers']} |
+    | mlp_hidden | {config['mlp_hidden'] if config['mlp_hidden'] is not None else f"= hidden_dim ({config['hidden_dim']})"} |
+    | n_mlp_layers | {config['n_mlp_layers']} |
     | history / future | {config['history_len']} / {config['future_len']} |
     | lr | {config['lr']} |
     | batch_size | {config['batch_size']} |
