@@ -3,7 +3,9 @@ import marimo
 __generated_with = "0.22.5"
 app = marimo.App(width="full")
 
-with app.setup:
+
+app._unparsable_cell(
+    """
     import sys
     from pathlib import Path
 
@@ -36,7 +38,7 @@ with app.setup:
 
     def _init_forget_bias(lstm):
         for name, param in lstm.named_parameters():
-            if "bias" in name:
+            if \"bias\" in name:
                 n = param.size(0)
                 param.data[n // 4 : n // 2].fill_(1.0)
 
@@ -68,7 +70,7 @@ with app.setup:
             return self.fc_out(out).squeeze(-1)
 
     class Seq2Seq(nn.Module):
-        """Autoregressive rollout with teacher forcing."""
+        \"\"\"Autoregressive rollout with teacher forcing.\"\"\"
         def __init__(self, encoder_dim, stim_dim, hidden_dim, num_layers, dropout=0.1, **kwargs):
             super().__init__()
             self.encoder = LSTMEncoder(encoder_dim, hidden_dim, num_layers, dropout)
@@ -96,7 +98,7 @@ with app.setup:
             return nn.functional.mse_loss(predictions, target)
 
     class Seq2SeqBaseline(nn.Module):
-        """Single-pass: encode history once, decode all future steps in parallel."""
+        \"\"\"Single-pass: encode history once, decode all future steps in parallel.\"\"\"
         def __init__(self, encoder_dim, stim_dim, hidden_dim, num_layers, dropout=0.1):
             super().__init__()
             self.encoder = LSTMEncoder(encoder_dim, hidden_dim, num_layers, dropout)
@@ -128,13 +130,16 @@ with app.setup:
             return self.net(torch.cat([h_top, stim_i], dim=-1)).squeeze(-1)
 
     class Seq2Scalar(nn.Module):
-        """Autoregressive one-step predictor: sliding-window LSTM encoder + MLP readout.
+        def __init__(nn.Module):
+            super().__init__()
+            self.encoder = LSTMEncoder(self, encoder_dim, stim_dim, hidden_dim, mlp_hidden, num_layers, dropout=0.1)class Seq2Scalar(nn.Module):
+        \"\"\"Autoregressive one-step predictor: sliding-window LSTM encoder + MLP readout.
 
         At each future step i:
           - Encode the current window -> (h, c)
           - Predict delta from top hidden state + stim_i via MLP
           - Reconstruct absolute CNR, slide window, repeat
-        """
+        \"\"\"
         def __init__(
             self,
             encoder_dim,
@@ -186,11 +191,20 @@ with app.setup:
 
         def loss(self, predictions, target):
             return nn.functional.mse_loss(predictions, target)
-
+    """,
+    name="setup"
+)
 
 
 @app.cell
-def _():
+def _(torch):
+    t = torch.tensor([1,2,3])
+    torch.Tensor.squeeze
+    return
+
+
+@app.cell
+def _(mo, parse_bool):
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
@@ -206,7 +220,7 @@ def _():
 
 
 @app.cell
-def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
+def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     DATA_SOURCE = source_selector.value
 
     config = dict(
@@ -220,8 +234,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
         patience=int(args.get("patience", "20" if DRY_RUN else "50")),
         tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
         tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
-        dropout=float(args.get("dropout", "0.1")),
-        mlp_hidden=int(args.get("mlp_hidden", "64"))
+        dropout=float(args.get("dropout", "0.0")),
     )
 
     mo.md(f"""
@@ -246,13 +259,12 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
     | tf_ratio_start | {config['tf_ratio_start']} |
     | tf_ratio_end | {config['tf_ratio_end']} |
     | dry_run | {DRY_RUN} |
-    | dropout | {config['dropout']} |
     """)
     return DATA_SOURCE, config
 
 
 @app.cell
-def _():
+def _(mo):
     _headless = "name" in mo.cli_args()
     load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
     train_button = mo.ui.run_button(label="Start training")
@@ -261,7 +273,23 @@ def _():
 
 
 @app.cell
-def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
+def _(
+    DATA_SOURCE,
+    DRY_RUN,
+    DataLoader,
+    Dataset,
+    STIM_COLS,
+    Subset,
+    config,
+    load_data_button,
+    load_real,
+    load_synthetic,
+    mo,
+    n_stim,
+    np,
+    torch,
+    train_test_split,
+):
     _headless = "name" in mo.cli_args()
     mo.stop(not _headless and not load_data_button.value, mo.md("Click **Load data & prepare datasets** to continue."))
     H = config["history_len"]
@@ -343,11 +371,11 @@ def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
 
 
 @app.cell
-def _(config):
+def _(Seq2Seq, Seq2SeqBaseline, config, device, mo, n_stim):
     encoder_dim = 1 + n_stim
     stim_dim = n_stim
 
-    model_seq2seq = Seq2Seq(
+    model = Seq2Seq(
         encoder_dim=encoder_dim,
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
@@ -355,42 +383,46 @@ def _(config):
         dropout=config['dropout']
     ).to(device)
 
-    # model_baseline = Seq2SeqBaseline(
-    #     encoder_dim=encoder_dim,
-    #     stim_dim=stim_dim,
-    #     hidden_dim=config["hidden_dim"],
-    #     num_layers=config["num_layers"],
-    #     dropout=config['dropout']
-    # ).to(device)
-
-    model_seq2scal = Seq2Scalar(
+    model_baseline = Seq2SeqBaseline(
         encoder_dim=encoder_dim,
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
         dropout=config['dropout']
-    )
+    ).to(device)
 
-    n_params = sum(p.numel() for p in model_seq2seq.parameters())
-    n_params_b = sum(p.numel() for p in model_seq2scal.parameters())
+    n_params = sum(p.numel() for p in model.parameters())
+    n_params_b = sum(p.numel() for p in model_baseline.parameters())
     mo.md(f"""
     | model | type | params |
     |-------|------|--------|
-    | AR | `Seq2Seq` | {n_params:,} |
-    | seq2scal | `Seq2scal` | {n_params_b:,} |
+    | AR + teacher forcing | `Seq2Seq` | {n_params:,} |
+    | Single-pass baseline | `Seq2SeqBaseline` | {n_params_b:,} |
 
     encoder_in={encoder_dim} | decoder_in={stim_dim} | hidden={config['hidden_dim']} | layers={config['num_layers']} | `{device}`
     """)
-    return
+    return model, model_baseline
 
 
 @app.cell
 def _(
     DATA_SOURCE,
     EXPERIMENT_NAME,
+    ExperimentTracker,
     config,
+    device,
+    mo,
     model,
     model_baseline,
+    n_stim,
+    nn,
+    np,
+    optim,
+    os,
+    results_base,
+    tempfile,
+    time,
+    torch,
     train_button,
     train_loader,
     val_loader,
@@ -580,7 +612,7 @@ def _(
 
 
 @app.cell
-def _(history, history_baseline):
+def _(history, history_baseline, plt):
     skip = 3
     fig_loss, _ax = plt.subplots(1, 3, figsize=(18, 4))
 
@@ -612,7 +644,7 @@ def _(history, history_baseline):
 
 
 @app.cell
-def _(F_, H, model, model_baseline, test_ds):
+def _(F_, H, device, model, model_baseline, np, plt, test_ds, torch):
     _n_examples = 8
     _indices = np.linspace(0, len(test_ds) - 1, _n_examples, dtype=int)
 
@@ -667,7 +699,7 @@ def _(F_, H, model, model_baseline, test_ds):
 
 
 @app.cell
-def _(model, model_baseline, test_ds):
+def _(DataLoader, device, model, model_baseline, np, test_ds, torch):
     # --- collect full test-set predictions (shared across eval cells) ---
     _last_cnr, _actual_all, _pred_ar_all, _pred_bl_all = [], [], [], []
     _pred_ar_nz, _pred_bl_nz, _fut_stim_all = [], [], []
@@ -719,6 +751,8 @@ def _(model, model_baseline, test_ds):
 @app.cell(hide_code=True)
 def _(
     F_,
+    np,
+    plt,
     test_act,
     test_act_abs,
     test_ar,
@@ -796,7 +830,7 @@ def _(
 
 
 @app.cell
-def _(test_ds):
+def _(DataLoader, np, plt, test_ds):
     _last_cnr2, _hist_mean2 = [], []
     for _enc, _stim, _tgt in DataLoader(test_ds, batch_size=512):
         _last_cnr2.append(_enc[:, -1, 0].numpy())
@@ -832,7 +866,7 @@ def _(test_ds):
 
 
 @app.cell
-def _(test_ds):
+def _(DataLoader, np, plt, test_ds):
     # conditional ratio: does actual_step1 / last_cnr drop toward 0.5 for high-CNR windows?
     _last3, _step1_actual3 = [], []
     for _enc, _stim, _tgt in DataLoader(test_ds, batch_size=512):
@@ -879,7 +913,7 @@ def _(test_ds):
 
 
 @app.cell
-def _(test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
+def _(np, test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
     mse_per_step_ar = np.mean((test_ar - test_act) ** 2, axis=0)
     mse_per_step_bl = np.mean((test_bl - test_act) ** 2, axis=0)
     mse_per_step_zero = np.mean(test_act ** 2, axis=0)
@@ -948,10 +982,13 @@ def _(test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
 @app.cell
 def _(
     F_,
+    mo,
     mse_per_step_ar,
     mse_per_step_bl,
     mse_per_step_mean,
     mse_per_step_zero,
+    np,
+    plt,
     r2_per_step_ar,
     r2_per_step_bl,
 ):
@@ -986,7 +1023,14 @@ def _(
 
 
 @app.cell
-def _(overall_mse_ar, overall_mse_bl, overall_mse_mean, overall_mse_zero):
+def _(
+    mo,
+    overall_mse_ar,
+    overall_mse_bl,
+    overall_mse_mean,
+    overall_mse_zero,
+    plt,
+):
     _names = ["Persist last\n(zero delta)", "Predict\nmean delta", "Baseline", "AR"]
     _vals = [overall_mse_zero, overall_mse_mean, overall_mse_bl, overall_mse_ar]
     _colors = ["#aaa", "#ccc", "#dd8452", "#4c72b0"]
@@ -1014,7 +1058,7 @@ def _(overall_mse_ar, overall_mse_bl, overall_mse_mean, overall_mse_zero):
 
 
 @app.cell
-def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std):
+def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std, mo, np, plt):
     _steps = np.arange(1, F_ + 1)
 
     fig_cumulative, _ax = plt.subplots(figsize=(8, 5))
@@ -1036,7 +1080,7 @@ def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std):
 
 
 @app.cell
-def _(ar_win_rate, mse_window_ar, mse_window_bl, test_stim):
+def _(ar_win_rate, mo, mse_window_ar, mse_window_bl, plt, test_stim):
     fig_head2head, _ax = plt.subplots(figsize=(7, 7))
     _sc = _ax.scatter(
         mse_window_bl, mse_window_ar,
@@ -1064,6 +1108,7 @@ def _(ar_win_rate, mse_window_ar, mse_window_bl, test_stim):
 @app.cell
 def _(
     ar_win_rate,
+    mo,
     overall_mse_ar,
     overall_mse_bl,
     overall_mse_mean,
@@ -1084,7 +1129,7 @@ def _(
 
 
 @app.cell
-def _(test_ds):
+def _(mo, test_ds):
     traj_selector = mo.ui.slider(
         0, len(test_ds) - 1, value=0, label="Test window index"
     )
@@ -1093,7 +1138,19 @@ def _(test_ds):
 
 
 @app.cell
-def _(F_, H, model, model_baseline, test_ds, traj_selector):
+def _(
+    F_,
+    H,
+    device,
+    mo,
+    model,
+    model_baseline,
+    np,
+    plt,
+    test_ds,
+    torch,
+    traj_selector,
+):
     _idx = traj_selector.value
     _enc_in, _dec_stim, _dec_target = test_ds[_idx]
 
@@ -1157,6 +1214,8 @@ def _(F_, H, model, model_baseline, test_ds, traj_selector):
 
 @app.cell
 def _(
+    Path,
+    compute_training_stats,
     eval_metrics,
     fig_baselines,
     fig_cumulative,
@@ -1167,6 +1226,9 @@ def _(
     fig_step_metrics,
     history,
     history_baseline,
+    hostname,
+    is_cluster,
+    mo,
     model,
     model_baseline,
     tracker_ar,

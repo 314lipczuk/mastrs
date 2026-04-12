@@ -59,7 +59,7 @@ with app.setup:
             super().__init__()
             self.lstm = nn.LSTM(
                 stim_dim, hidden_dim, num_layers,
-                batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True, dropout=dropout,
             )
             _init_forget_bias(self.lstm)
             self.fc_out = nn.Linear(hidden_dim, 1)
@@ -107,6 +107,9 @@ with app.setup:
             self.decoder = LSTMDecoder(stim_dim, hidden_dim, num_layers, dropout)
 
         def forward(self, encoder_input, future_stim, **kwargs):
+            self.train()
+            self.encoder.train()
+            self.decoder.train()
             h, c = self.encoder(encoder_input)
             return self.decoder(future_stim, h, c)
 

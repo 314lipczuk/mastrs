@@ -24,7 +24,7 @@ with app.setup:
 
     from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
     from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
-    from experiments.dropout_uncertainty_lstm_seq2seq import Seq2Seq, Seq2SeqBaseline
+    from experiments.lstm_seq2seq import Seq2Seq, Seq2SeqBaseline
     import altair as alt
 
     device = get_device()

@@ -3,7 +3,9 @@ import marimo
 __generated_with = "0.22.5"
 app = marimo.App(width="full")
 
-with app.setup:
+
+@app.cell
+def _():
     import sys
     from pathlib import Path
 
@@ -187,10 +189,46 @@ with app.setup:
         def loss(self, predictions, target):
             return nn.functional.mse_loss(predictions, target)
 
+    return (
+        DataLoader,
+        Dataset,
+        ExperimentTracker,
+        Path,
+        STIM_COLS,
+        Seq2Scalar,
+        Seq2Seq,
+        Subset,
+        compute_training_stats,
+        device,
+        hostname,
+        is_cluster,
+        load_real,
+        load_synthetic,
+        mo,
+        n_stim,
+        nn,
+        np,
+        optim,
+        os,
+        parse_bool,
+        plt,
+        results_base,
+        tempfile,
+        time,
+        torch,
+        train_test_split,
+    )
 
 
 @app.cell
-def _():
+def _(torch):
+    t = torch.tensor([1,2,3])
+    torch.Tensor.squeeze
+    return
+
+
+@app.cell
+def _(mo, parse_bool):
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
@@ -206,7 +244,7 @@ def _():
 
 
 @app.cell
-def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
+def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     DATA_SOURCE = source_selector.value
 
     config = dict(
@@ -220,17 +258,19 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
         patience=int(args.get("patience", "20" if DRY_RUN else "50")),
         tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
         tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
-        dropout=float(args.get("dropout", "0.1")),
-        mlp_hidden=int(args.get("mlp_hidden", "64"))
+        dropout=float(args.get("dropout", "0.0")),
     )
 
     mo.md(f"""
-    # LSTM Encoder-Decoder: `{EXPERIMENT_NAME}`
+    # LSTM encoder + LSTM vs MLP decoder: `{EXPERIMENT_NAME}`
 
-    Sequence-to-sequence model for CNR prediction.
+    Compare two autoregressive CNR predictors sharing the same LSTM encoder:
+    - **`Seq2Seq`** — LSTM decoder, sliding-window AR rollout with teacher forcing.
+    - **`Seq2Scalar`** — MLP head on top hidden state, same sliding-window AR rollout.
+
     Encoder compresses CNR + stim features history → hidden state.
-    Decoder takes hidden state + future stim features → predicted CNR.
-    Autoregressive rollout with teacher forcing (annealed).
+    Decoder (LSTM or MLP) takes hidden state + future stim features → next-step delta CNR.
+    Both use annealed teacher forcing.
 
     | param | value |
     |-------|-------|
@@ -246,13 +286,12 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, source_selector):
     | tf_ratio_start | {config['tf_ratio_start']} |
     | tf_ratio_end | {config['tf_ratio_end']} |
     | dry_run | {DRY_RUN} |
-    | dropout | {config['dropout']} |
     """)
     return DATA_SOURCE, config
 
 
 @app.cell
-def _():
+def _(mo):
     _headless = "name" in mo.cli_args()
     load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
     train_button = mo.ui.run_button(label="Start training")
@@ -261,7 +300,23 @@ def _():
 
 
 @app.cell
-def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
+def _(
+    DATA_SOURCE,
+    DRY_RUN,
+    DataLoader,
+    Dataset,
+    STIM_COLS,
+    Subset,
+    config,
+    load_data_button,
+    load_real,
+    load_synthetic,
+    mo,
+    n_stim,
+    np,
+    torch,
+    train_test_split,
+):
     _headless = "name" in mo.cli_args()
     mo.stop(not _headless and not load_data_button.value, mo.md("Click **Load data & prepare datasets** to continue."))
     H = config["history_len"]
@@ -343,11 +398,11 @@ def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
 
 
 @app.cell
-def _(config):
+def _(Seq2Scalar, Seq2Seq, config, device, mo, n_stim):
     encoder_dim = 1 + n_stim
     stim_dim = n_stim
 
-    model_seq2seq = Seq2Seq(
+    model = Seq2Seq(
         encoder_dim=encoder_dim,
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
@@ -355,42 +410,46 @@ def _(config):
         dropout=config['dropout']
     ).to(device)
 
-    # model_baseline = Seq2SeqBaseline(
-    #     encoder_dim=encoder_dim,
-    #     stim_dim=stim_dim,
-    #     hidden_dim=config["hidden_dim"],
-    #     num_layers=config["num_layers"],
-    #     dropout=config['dropout']
-    # ).to(device)
-
-    model_seq2scal = Seq2Scalar(
+    model_mlp = Seq2Scalar(
         encoder_dim=encoder_dim,
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
         dropout=config['dropout']
-    )
+    ).to(device)
 
-    n_params = sum(p.numel() for p in model_seq2seq.parameters())
-    n_params_b = sum(p.numel() for p in model_seq2scal.parameters())
+    n_params = sum(p.numel() for p in model.parameters())
+    n_params_m = sum(p.numel() for p in model_mlp.parameters())
     mo.md(f"""
     | model | type | params |
     |-------|------|--------|
-    | AR | `Seq2Seq` | {n_params:,} |
-    | seq2scal | `Seq2scal` | {n_params_b:,} |
+    | LSTM decoder (AR + TF) | `Seq2Seq` | {n_params:,} |
+    | MLP decoder (AR + TF)  | `Seq2Scalar` | {n_params_m:,} |
 
     encoder_in={encoder_dim} | decoder_in={stim_dim} | hidden={config['hidden_dim']} | layers={config['num_layers']} | `{device}`
     """)
-    return
+    return model, model_mlp
 
 
 @app.cell
 def _(
     DATA_SOURCE,
     EXPERIMENT_NAME,
+    ExperimentTracker,
     config,
+    device,
+    mo,
     model,
-    model_baseline,
+    model_mlp,
+    n_stim,
+    nn,
+    np,
+    optim,
+    os,
+    results_base,
+    tempfile,
+    time,
+    torch,
     train_button,
     train_loader,
     val_loader,
@@ -429,23 +488,6 @@ def _(
                 losses.append(loss.item())
         return np.mean(losses), tf_ratio
 
-    def _run_epoch_baseline(model, loader, device, optimizer, is_train):
-        model.train() if is_train else model.eval()
-        losses = []
-        ctx = torch.enable_grad() if is_train else torch.no_grad()
-        with ctx:
-            for enc_in, dec_stim, dec_target in loader:
-                enc_in, dec_stim, dec_target = enc_in.to(device), dec_stim.to(device), dec_target.to(device)
-                preds = model(enc_in, dec_stim)
-                loss = model.loss(preds, dec_target)
-                if is_train:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                losses.append(loss.item())
-        return np.mean(losses)
-
     def _checkpoint_with_best_weights(tracker, mdl, best_ckpt_path, hist):
         """Swap in best weights, checkpoint, swap back."""
         _cur = {k: v.clone() for k, v in mdl.state_dict().items()}
@@ -453,72 +495,72 @@ def _(
         tracker.checkpoint(mdl, training_results={"history": hist})
         mdl.load_state_dict(_cur)
 
-    def train_both(model_ar, model_bl, train_loader, val_loader, cfg, device,
-                   tracker_ar, tracker_bl):
-        opt_ar = optim.Adam(model_ar.parameters(), lr=cfg["lr"], weight_decay=1e-4)
-        opt_bl = optim.Adam(model_bl.parameters(), lr=cfg["lr"], weight_decay=1e-4)
-        sched_ar = optim.lr_scheduler.ReduceLROnPlateau(opt_ar, patience=10, factor=0.5)
-        sched_bl = optim.lr_scheduler.ReduceLROnPlateau(opt_bl, patience=10, factor=0.5)
+    def train_both(model_lstm, model_mlp, train_loader, val_loader, cfg, device,
+                   tracker_lstm, tracker_mlp):
+        opt_lstm = optim.Adam(model_lstm.parameters(), lr=cfg["lr"], weight_decay=1e-4)
+        opt_mlp = optim.Adam(model_mlp.parameters(), lr=cfg["lr"], weight_decay=1e-4)
+        sched_lstm = optim.lr_scheduler.ReduceLROnPlateau(opt_lstm, patience=10, factor=0.5)
+        sched_mlp = optim.lr_scheduler.ReduceLROnPlateau(opt_mlp, patience=10, factor=0.5)
 
         epochs, patience = cfg["epochs"], cfg["patience"]
-        hist_ar = {"train_loss": [], "val_loss": []}
-        hist_bl = {"train_loss": [], "val_loss": []}
+        hist_lstm = {"train_loss": [], "val_loss": []}
+        hist_mlp = {"train_loss": [], "val_loss": []}
 
-        ckpt_fd_ar, ckpt_ar = tempfile.mkstemp(suffix=".pt")
-        ckpt_fd_bl, ckpt_bl = tempfile.mkstemp(suffix=".pt")
-        os.close(ckpt_fd_ar)
-        os.close(ckpt_fd_bl)
+        ckpt_fd_lstm, ckpt_lstm = tempfile.mkstemp(suffix=".pt")
+        ckpt_fd_mlp, ckpt_mlp = tempfile.mkstemp(suffix=".pt")
+        os.close(ckpt_fd_lstm)
+        os.close(ckpt_fd_mlp)
 
-        best_ar, best_bl, wait_ar, wait_bl = float("inf"), float("inf"), 0, 0
-        done_ar, done_bl = False, False
+        best_lstm, best_mlp, wait_lstm, wait_mlp = float("inf"), float("inf"), 0, 0
+        done_lstm, done_mlp = False, False
 
         for epoch in range(epochs):
-            if not done_ar:
-                t_ar, tf = _run_epoch_ar(model_ar, train_loader, device, opt_ar, cfg, epoch, True)
-                v_ar, _ = _run_epoch_ar(model_ar, val_loader, device, opt_ar, cfg, epoch, False)
-                hist_ar["train_loss"].append(t_ar)
-                hist_ar["val_loss"].append(v_ar)
-                sched_ar.step(v_ar)
-                if v_ar < best_ar:
-                    best_ar, wait_ar = v_ar, 0
-                    torch.save(model_ar.state_dict(), ckpt_ar)
+            if not done_lstm:
+                t_lstm, tf = _run_epoch_ar(model_lstm, train_loader, device, opt_lstm, cfg, epoch, True)
+                v_lstm, _ = _run_epoch_ar(model_lstm, val_loader, device, opt_lstm, cfg, epoch, False)
+                hist_lstm["train_loss"].append(t_lstm)
+                hist_lstm["val_loss"].append(v_lstm)
+                sched_lstm.step(v_lstm)
+                if v_lstm < best_lstm:
+                    best_lstm, wait_lstm = v_lstm, 0
+                    torch.save(model_lstm.state_dict(), ckpt_lstm)
                 else:
-                    wait_ar += 1
-                    if wait_ar >= patience:
-                        print(f"[AR]       Early stopping at epoch {epoch}")
-                        done_ar = True
+                    wait_lstm += 1
+                    if wait_lstm >= patience:
+                        print(f"[LSTM] Early stopping at epoch {epoch}")
+                        done_lstm = True
 
-            if not done_bl:
-                t_bl = _run_epoch_baseline(model_bl, train_loader, device, opt_bl, True)
-                v_bl = _run_epoch_baseline(model_bl, val_loader, device, opt_bl, False)
-                hist_bl["train_loss"].append(t_bl)
-                hist_bl["val_loss"].append(v_bl)
-                sched_bl.step(v_bl)
-                if v_bl < best_bl:
-                    best_bl, wait_bl = v_bl, 0
-                    torch.save(model_bl.state_dict(), ckpt_bl)
+            if not done_mlp:
+                t_mlp, _ = _run_epoch_ar(model_mlp, train_loader, device, opt_mlp, cfg, epoch, True)
+                v_mlp, _ = _run_epoch_ar(model_mlp, val_loader, device, opt_mlp, cfg, epoch, False)
+                hist_mlp["train_loss"].append(t_mlp)
+                hist_mlp["val_loss"].append(v_mlp)
+                sched_mlp.step(v_mlp)
+                if v_mlp < best_mlp:
+                    best_mlp, wait_mlp = v_mlp, 0
+                    torch.save(model_mlp.state_dict(), ckpt_mlp)
                 else:
-                    wait_bl += 1
-                    if wait_bl >= patience:
-                        print(f"[Baseline] Early stopping at epoch {epoch}")
-                        done_bl = True
+                    wait_mlp += 1
+                    if wait_mlp >= patience:
+                        print(f"[MLP]  Early stopping at epoch {epoch}")
+                        done_mlp = True
 
-            if done_ar and done_bl:
+            if done_lstm and done_mlp:
                 break
 
             if epoch % 20 == 0:
-                ar_str = f"AR tf={tf:.2f} T:{t_ar:.5f} V:{v_ar:.5f}" if not done_ar else "AR done"
-                bl_str = f"BL T:{t_bl:.5f} V:{v_bl:.5f}" if not done_bl else "BL done"
-                print(f"Epoch {epoch:3d} | {ar_str} | {bl_str}")
+                lstm_str = f"LSTM tf={tf:.2f} T:{t_lstm:.5f} V:{v_lstm:.5f}" if not done_lstm else "LSTM done"
+                mlp_str  = f"MLP  tf={tf:.2f} T:{t_mlp:.5f} V:{v_mlp:.5f}"   if not done_mlp  else "MLP done"
+                print(f"Epoch {epoch:3d} | {lstm_str} | {mlp_str}")
 
-            _checkpoint_with_best_weights(tracker_ar, model_ar, ckpt_ar, hist_ar)
-            _checkpoint_with_best_weights(tracker_bl, model_bl, ckpt_bl, hist_bl)
+            _checkpoint_with_best_weights(tracker_lstm, model_lstm, ckpt_lstm, hist_lstm)
+            _checkpoint_with_best_weights(tracker_mlp, model_mlp, ckpt_mlp, hist_mlp)
 
-        model_ar.load_state_dict(torch.load(ckpt_ar, weights_only=True))
-        model_bl.load_state_dict(torch.load(ckpt_bl, weights_only=True))
-        os.remove(ckpt_ar)
-        os.remove(ckpt_bl)
-        return hist_ar, hist_bl
+        model_lstm.load_state_dict(torch.load(ckpt_lstm, weights_only=True))
+        model_mlp.load_state_dict(torch.load(ckpt_mlp, weights_only=True))
+        os.remove(ckpt_lstm)
+        os.remove(ckpt_mlp)
+        return hist_lstm, hist_mlp
 
     _headless = "name" in mo.cli_args()
     mo.stop(not _headless and not train_button.value, mo.md("Click **Start training** when ready."))
@@ -531,19 +573,19 @@ def _(
         training_config=config,
     )
     tracker.register_start()
-    tracker_ar = tracker.make_subexperiment(
-        "ar", model_config=dict(**_model_config_shared, variant="autoregressive_tf"),
+    tracker_lstm = tracker.make_subexperiment(
+        "lstm", model_config=dict(**_model_config_shared, variant="seq2seq_lstm_ar_tf"),
     )
-    tracker_bl = tracker.make_subexperiment(
-        "baseline", model_config=dict(**_model_config_shared, variant="single_pass"),
+    tracker_mlp = tracker.make_subexperiment(
+        "mlp", model_config=dict(**_model_config_shared, variant="seq2scalar_mlp_ar_tf"),
     )
-    tracker_ar.register_start()
-    tracker_bl.register_start()
+    tracker_lstm.register_start()
+    tracker_mlp.register_start()
 
     _t0 = time.time()
-    history, history_baseline = train_both(
-        model, model_baseline, train_loader, val_loader, config, device,
-        tracker_ar, tracker_bl,
+    history, history_mlp = train_both(
+        model, model_mlp, train_loader, val_loader, config, device,
+        tracker_lstm, tracker_mlp,
     )
     train_elapsed = time.time() - _t0
 
@@ -552,8 +594,8 @@ def _(
 
     | model | epochs |
     |-------|--------|
-    | AR + teacher forcing | {len(history['train_loss'])} |
-    | Single-pass baseline | {len(history_baseline['train_loss'])} |
+    | LSTM decoder (Seq2Seq) | {len(history['train_loss'])} |
+    | MLP decoder (Seq2Scalar) | {len(history_mlp['train_loss'])} |
     """)
     _config_md = mo.md(f"""
     **Config**
@@ -572,35 +614,35 @@ def _(
 
     | model | final train | final val |
     |-------|-------------|-----------|
-    | AR | {history['train_loss'][-1]:.4f} | {history['val_loss'][-1]:.4f} |
-    | Baseline | {history_baseline['train_loss'][-1]:.4f} | {history_baseline['val_loss'][-1]:.4f} |
+    | LSTM | {history['train_loss'][-1]:.4f} | {history['val_loss'][-1]:.4f} |
+    | MLP  | {history_mlp['train_loss'][-1]:.4f} | {history_mlp['val_loss'][-1]:.4f} |
     """)
     mo.output.replace(mo.hstack([_models_md, _config_md, _metrics_md], gap=2))
-    return history, history_baseline, tracker_ar, tracker_bl, train_elapsed
+    return history, history_mlp, tracker_lstm, tracker_mlp, train_elapsed
 
 
 @app.cell
-def _(history, history_baseline):
+def _(history, history_mlp, plt):
     skip = 3
     fig_loss, _ax = plt.subplots(1, 3, figsize=(18, 4))
 
     _ax[0].plot(history["train_loss"], label="train", color="tab:red")
     _ax[0].plot(history["val_loss"], label="val", color="tab:red", linestyle="--")
-    _ax[0].set_title("AR (autoregressive)")
+    _ax[0].set_title("LSTM decoder (Seq2Seq AR)")
     _ax[0].set_xlabel("epoch")
     _ax[0].set_ylabel("MSE")
     _ax[0].set_yscale("log")
     _ax[0].legend()
 
-    _ax[1].plot(history_baseline["train_loss"], label="train", color="tab:blue")
-    _ax[1].plot(history_baseline["val_loss"], label="val", color="tab:blue", linestyle="--")
-    _ax[1].set_title("Baseline (single-pass)")
+    _ax[1].plot(history_mlp["train_loss"], label="train", color="tab:blue")
+    _ax[1].plot(history_mlp["val_loss"], label="val", color="tab:blue", linestyle="--")
+    _ax[1].set_title("MLP decoder (Seq2Scalar AR)")
     _ax[1].set_xlabel("epoch")
     _ax[1].set_yscale("log")
     _ax[1].legend()
 
-    _ax[2].plot(history["val_loss"][skip:], label="AR val", color="tab:red")
-    _ax[2].plot(history_baseline["val_loss"][skip:], label="Baseline val", color="tab:blue")
+    _ax[2].plot(history["val_loss"][skip:], label="LSTM val", color="tab:red")
+    _ax[2].plot(history_mlp["val_loss"][skip:], label="MLP val", color="tab:blue")
     _ax[2].set_title(f"Val loss comparison (epoch {skip}+)")
     _ax[2].set_xlabel("epoch")
     _ax[2].set_yscale("log")
@@ -612,7 +654,7 @@ def _(history, history_baseline):
 
 
 @app.cell
-def _(F_, H, model, model_baseline, test_ds):
+def _(F_, H, device, model, model_mlp, np, plt, test_ds, torch):
     _n_examples = 8
     _indices = np.linspace(0, len(test_ds) - 1, _n_examples, dtype=int)
 
@@ -620,30 +662,30 @@ def _(F_, H, model, model_baseline, test_ds):
     _axes = _axes.flatten()
 
     model.eval()
-    model_baseline.eval()
+    model_mlp.eval()
     with torch.no_grad():
         for _ax_i, _idx in enumerate(_indices):
             _enc_in, _dec_stim, _dec_target = test_ds[_idx]
             _enc_in_d = _enc_in.unsqueeze(0).to(device)
             _dec_stim_d = _dec_stim.unsqueeze(0).to(device)
 
-            _pred_ar_d = model(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
-            _pred_bl_d = model_baseline(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
+            _pred_lstm_d = model(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
+            _pred_mlp_d  = model_mlp(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
             _hist_cnr = _enc_in[:, 0].numpy()
             _hist_u_t = _enc_in[:, 1].numpy()
             _fut_u_t = _dec_stim[:, 0].numpy()
             _last_val = _hist_cnr[-1]
             # reconstruct absolute CNR from deltas
-            _actual = _last_val + np.cumsum(_dec_target.numpy())
-            _pred_ar = _last_val + np.cumsum(_pred_ar_d)
-            _pred_bl = _last_val + np.cumsum(_pred_bl_d)
+            _actual   = _last_val + np.cumsum(_dec_target.numpy())
+            _pred_lstm = _last_val + np.cumsum(_pred_lstm_d)
+            _pred_mlp  = _last_val + np.cumsum(_pred_mlp_d)
 
             _ax = _axes[_ax_i]
             _t_hist = np.arange(H)
             _t_fut = np.arange(H, H + F_)
 
             _u_max = max(_hist_u_t.max(), _fut_u_t.max(), 1e-8)
-            _cnr_max = max(_hist_cnr.max(), _actual.max(), _pred_ar.max(), _pred_bl.max(), 1e-8)
+            _cnr_max = max(_hist_cnr.max(), _actual.max(), _pred_lstm.max(), _pred_mlp.max(), 1e-8)
             _ls_h = _hist_u_t / _u_max * _cnr_max * 0.5
             _ls_f = _fut_u_t / _u_max * _cnr_max * 0.5
 
@@ -651,29 +693,29 @@ def _(F_, H, model, model_baseline, test_ds):
             _ax.fill_between(_t_fut, 0, _ls_f, alpha=0.15, color="gold", step="mid")
             _ax.plot(_t_hist, _hist_cnr, color="navy", lw=1.5, label="history")
             _ax.plot(_t_fut, _actual, color="navy", lw=1.5, alpha=0.5, label="actual")
-            _ax.plot(_t_fut, _pred_ar, color="tab:red", lw=1.5, linestyle="--", label="AR")
-            _ax.plot(_t_fut, _pred_bl, color="tab:blue", lw=1.5, linestyle=":", label="baseline")
+            _ax.plot(_t_fut, _pred_lstm, color="tab:red", lw=1.5, linestyle="--", label="LSTM")
+            _ax.plot(_t_fut, _pred_mlp,  color="tab:blue", lw=1.5, linestyle=":", label="MLP")
             _ax.axvline(H, color="gray", linestyle=":", alpha=0.5)
-            _mse_ar = np.mean((_actual - _pred_ar) ** 2)
-            _mse_bl = np.mean((_actual - _pred_bl) ** 2)
-            _ax.set_title(f"#{_idx} AR:{_mse_ar:.4f} BL:{_mse_bl:.4f}", fontsize=8)
+            _mse_lstm = np.mean((_actual - _pred_lstm) ** 2)
+            _mse_mlp  = np.mean((_actual - _pred_mlp) ** 2)
+            _ax.set_title(f"#{_idx} LSTM:{_mse_lstm:.4f} MLP:{_mse_mlp:.4f}", fontsize=8)
             if _ax_i == 0:
                 _ax.legend(fontsize=7)
 
-    fig_recon.suptitle("AR (red dashed) vs Baseline (blue dotted)", fontsize=12)
+    fig_recon.suptitle("LSTM decoder (red dashed) vs MLP decoder (blue dotted)", fontsize=12)
     fig_recon.tight_layout()
     fig_recon
     return (fig_recon,)
 
 
 @app.cell
-def _(model, model_baseline, test_ds):
+def _(DataLoader, device, model, model_mlp, np, test_ds, torch):
     # --- collect full test-set predictions (shared across eval cells) ---
-    _last_cnr, _actual_all, _pred_ar_all, _pred_bl_all = [], [], [], []
-    _pred_ar_nz, _pred_bl_nz, _fut_stim_all = [], [], []
+    _last_cnr, _actual_all, _pred_lstm_all, _pred_mlp_all = [], [], [], []
+    _pred_lstm_nz, _pred_mlp_nz, _fut_stim_all = [], [], []
 
     model.eval()
-    model_baseline.eval()
+    model_mlp.eval()
     with torch.no_grad():
         for _enc, _stim, _tgt in DataLoader(test_ds, batch_size=512):
             _enc_d, _stim_d = _enc.to(device), _stim.to(device)
@@ -681,36 +723,36 @@ def _(model, model_baseline, test_ds):
 
             _last_cnr.append(_enc_d[:, -1, 0].cpu().numpy())
             _actual_all.append(_tgt.numpy())
-            _pred_ar_all.append(model(_enc_d, _stim_d).cpu().numpy())
-            _pred_bl_all.append(model_baseline(_enc_d, _stim_d).cpu().numpy())
-            _pred_ar_nz.append(model(_enc_d, _zero_d).cpu().numpy())
-            _pred_bl_nz.append(model_baseline(_enc_d, _zero_d).cpu().numpy())
+            _pred_lstm_all.append(model(_enc_d, _stim_d).cpu().numpy())
+            _pred_mlp_all.append(model_mlp(_enc_d, _stim_d).cpu().numpy())
+            _pred_lstm_nz.append(model(_enc_d, _zero_d).cpu().numpy())
+            _pred_mlp_nz.append(model_mlp(_enc_d, _zero_d).cpu().numpy())
             _fut_stim_all.append(_stim_d[:, :, 0].mean(dim=1).cpu().numpy())
 
     test_last = np.concatenate(_last_cnr)
-    test_act  = np.concatenate(_actual_all)   # (N, F) — deltas
-    test_ar   = np.concatenate(_pred_ar_all)  # (N, F) — predicted deltas
-    test_bl   = np.concatenate(_pred_bl_all)
-    test_ar0  = np.concatenate(_pred_ar_nz)
-    test_bl0  = np.concatenate(_pred_bl_nz)
-    test_stim = np.concatenate(_fut_stim_all)
+    test_act   = np.concatenate(_actual_all)      # (N, F) — deltas
+    test_lstm  = np.concatenate(_pred_lstm_all)   # (N, F) — predicted deltas
+    test_mlp   = np.concatenate(_pred_mlp_all)
+    test_lstm0 = np.concatenate(_pred_lstm_nz)
+    test_mlp0  = np.concatenate(_pred_mlp_nz)
+    test_stim  = np.concatenate(_fut_stim_all)
 
     # reconstruct absolute CNR for plots that need it
-    test_act_abs = test_last[:, None] + np.cumsum(test_act, axis=1)
-    test_ar_abs  = test_last[:, None] + np.cumsum(test_ar,  axis=1)
-    test_bl_abs  = test_last[:, None] + np.cumsum(test_bl,  axis=1)
+    test_act_abs  = test_last[:, None] + np.cumsum(test_act,  axis=1)
+    test_lstm_abs = test_last[:, None] + np.cumsum(test_lstm, axis=1)
+    test_mlp_abs  = test_last[:, None] + np.cumsum(test_mlp,  axis=1)
 
     test_stim_on = test_stim > test_stim.mean()
     return (
         test_act,
         test_act_abs,
-        test_ar,
-        test_ar0,
-        test_ar_abs,
-        test_bl,
-        test_bl0,
-        test_bl_abs,
         test_last,
+        test_lstm,
+        test_lstm0,
+        test_lstm_abs,
+        test_mlp,
+        test_mlp0,
+        test_mlp_abs,
         test_stim,
         test_stim_on,
     )
@@ -719,15 +761,17 @@ def _(model, model_baseline, test_ds):
 @app.cell(hide_code=True)
 def _(
     F_,
+    np,
+    plt,
     test_act,
     test_act_abs,
-    test_ar,
-    test_ar0,
-    test_ar_abs,
-    test_bl,
-    test_bl0,
-    test_bl_abs,
     test_last,
+    test_lstm,
+    test_lstm0,
+    test_lstm_abs,
+    test_mlp,
+    test_mlp0,
+    test_mlp_abs,
     test_stim_on,
 ):
     fig_diag, _ax = plt.subplots(2, 3, figsize=(18, 10))
@@ -739,7 +783,7 @@ def _(
     _ax[0, 0].set_title("Actual delta distribution (target)")
     _ax[0, 0].legend(fontsize=8)
 
-    for _pred, _color, _lbl in [(test_ar[:, 0], "tab:red", "AR"), (test_bl[:, 0], "tab:blue", "BL")]:
+    for _pred, _color, _lbl in [(test_lstm[:, 0], "tab:red", "LSTM"), (test_mlp[:, 0], "tab:blue", "MLP")]:
         _ax[0, 1].scatter(test_act[:, 0], _pred, s=3, alpha=0.15, color=_color, label=_lbl)
     _lim2 = [test_act[:, 0].min(), test_act[:, 0].max()]
     _ax[0, 1].plot(_lim2, _lim2, "k--", lw=1)
@@ -751,38 +795,38 @@ def _(
     _ax[0, 1].legend(fontsize=8, markerscale=4)
 
     for _i in range(min(F_, 3)):
-        _ax[0, 2].hist(test_act[:, _i] - test_ar[:, _i], bins=60, alpha=0.4, color="tab:red", label=f"AR step{_i+1}")
-        _ax[0, 2].hist(test_act[:, _i] - test_bl[:, _i], bins=60, alpha=0.4, color="tab:blue", label=f"BL step{_i+1}")
+        _ax[0, 2].hist(test_act[:, _i] - test_lstm[:, _i], bins=60, alpha=0.4, color="tab:red",  label=f"LSTM step{_i+1}")
+        _ax[0, 2].hist(test_act[:, _i] - test_mlp[:, _i],  bins=60, alpha=0.4, color="tab:blue", label=f"MLP step{_i+1}")
     _ax[0, 2].axvline(0, color="black", lw=1)
     _ax[0, 2].set_xlabel("actual delta − predicted delta")
     _ax[0, 2].set_title("Residual distribution (deltas)")
     _ax[0, 2].legend(fontsize=7)
 
-    _sens_ar = np.abs(test_ar - test_ar0).mean(axis=1)
-    _sens_bl = np.abs(test_bl - test_bl0).mean(axis=1)
-    _ax[1, 0].hist(_sens_ar, bins=60, alpha=0.6, color="tab:red", label=f"AR (mean={_sens_ar.mean():.4f})")
-    _ax[1, 0].hist(_sens_bl, bins=60, alpha=0.6, color="tab:blue", label=f"BL (mean={_sens_bl.mean():.4f})")
+    _sens_lstm = np.abs(test_lstm - test_lstm0).mean(axis=1)
+    _sens_mlp  = np.abs(test_mlp  - test_mlp0).mean(axis=1)
+    _ax[1, 0].hist(_sens_lstm, bins=60, alpha=0.6, color="tab:red",  label=f"LSTM (mean={_sens_lstm.mean():.4f})")
+    _ax[1, 0].hist(_sens_mlp,  bins=60, alpha=0.6, color="tab:blue", label=f"MLP (mean={_sens_mlp.mean():.4f})")
     _ax[1, 0].set_xlabel("|pred(stim) − pred(zero stim)|")
     _ax[1, 0].set_title("Stimulus sensitivity (ablation)")
     _ax[1, 0].legend(fontsize=8)
 
     _steps = np.arange(1, F_ + 1)
     for _mask, _ls, _lbl in [(test_stim_on, "-", "stim ON"), (~test_stim_on, "--", "stim OFF")]:
-        _ax[1, 1].plot(_steps, test_act_abs[_mask].mean(axis=0), color="navy", ls=_ls, label=f"actual {_lbl}")
-        _ax[1, 1].plot(_steps, test_ar_abs[_mask].mean(axis=0),  color="tab:red",  ls=_ls, label=f"AR {_lbl}")
-        _ax[1, 1].plot(_steps, test_bl_abs[_mask].mean(axis=0),  color="tab:blue", ls=_ls, label=f"BL {_lbl}")
+        _ax[1, 1].plot(_steps, test_act_abs[_mask].mean(axis=0),  color="navy",     ls=_ls, label=f"actual {_lbl}")
+        _ax[1, 1].plot(_steps, test_lstm_abs[_mask].mean(axis=0), color="tab:red",  ls=_ls, label=f"LSTM {_lbl}")
+        _ax[1, 1].plot(_steps, test_mlp_abs[_mask].mean(axis=0),  color="tab:blue", ls=_ls, label=f"MLP {_lbl}")
     _ax[1, 1].set_xlabel("future step")
     _ax[1, 1].set_ylabel("mean CNR (absolute)")
     _ax[1, 1].set_title("Mean prediction: stim ON vs OFF")
     _ax[1, 1].legend(fontsize=7)
 
-    _ratio_ar  = test_ar_abs[:, 0]  / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
-    _ratio_bl  = test_bl_abs[:, 0]  / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
-    _ratio_act = test_act_abs[:, 0] / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
+    _ratio_lstm = test_lstm_abs[:, 0] / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
+    _ratio_mlp  = test_mlp_abs[:, 0]  / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
+    _ratio_act  = test_act_abs[:, 0]  / np.where(np.abs(test_last) > 1e-8, test_last, 1e-8)
     _bins = np.linspace(0, 2, 60)
-    _ax[1, 2].hist(_ratio_act, bins=_bins, alpha=0.4, color="navy",     label=f"actual (μ={_ratio_act.mean():.2f})")
-    _ax[1, 2].hist(_ratio_ar,  bins=_bins, alpha=0.5, color="tab:red",  label=f"AR pred (μ={_ratio_ar.mean():.2f})")
-    _ax[1, 2].hist(_ratio_bl,  bins=_bins, alpha=0.5, color="tab:blue", label=f"BL pred (μ={_ratio_bl.mean():.2f})")
+    _ax[1, 2].hist(_ratio_act,  bins=_bins, alpha=0.4, color="navy",     label=f"actual (μ={_ratio_act.mean():.2f})")
+    _ax[1, 2].hist(_ratio_lstm, bins=_bins, alpha=0.5, color="tab:red",  label=f"LSTM pred (μ={_ratio_lstm.mean():.2f})")
+    _ax[1, 2].hist(_ratio_mlp,  bins=_bins, alpha=0.5, color="tab:blue", label=f"MLP pred (μ={_ratio_mlp.mean():.2f})")
     _ax[1, 2].axvline(1.0, color="black", lw=1, linestyle="--", label="1×")
     _ax[1, 2].axvline(0.5, color="red",   lw=1, linestyle="--", label="0.5×")
     _ax[1, 2].set_xlabel("reconstructed abs pred / last_history_cnr")
@@ -796,7 +840,7 @@ def _(
 
 
 @app.cell
-def _(test_ds):
+def _(DataLoader, np, plt, test_ds):
     _last_cnr2, _hist_mean2 = [], []
     for _enc, _stim, _tgt in DataLoader(test_ds, batch_size=512):
         _last_cnr2.append(_enc[:, -1, 0].numpy())
@@ -832,7 +876,7 @@ def _(test_ds):
 
 
 @app.cell
-def _(test_ds):
+def _(DataLoader, np, plt, test_ds):
     # conditional ratio: does actual_step1 / last_cnr drop toward 0.5 for high-CNR windows?
     _last3, _step1_actual3 = [], []
     for _enc, _stim, _tgt in DataLoader(test_ds, batch_size=512):
@@ -879,81 +923,92 @@ def _(test_ds):
 
 
 @app.cell
-def _(test_act, test_act_abs, test_ar, test_ar_abs, test_bl, test_bl_abs):
-    mse_per_step_ar = np.mean((test_ar - test_act) ** 2, axis=0)
-    mse_per_step_bl = np.mean((test_bl - test_act) ** 2, axis=0)
+def _(
+    np,
+    test_act,
+    test_act_abs,
+    test_lstm,
+    test_lstm_abs,
+    test_mlp,
+    test_mlp_abs,
+):
+    mse_per_step_lstm = np.mean((test_lstm - test_act) ** 2, axis=0)
+    mse_per_step_mlp  = np.mean((test_mlp  - test_act) ** 2, axis=0)
     mse_per_step_zero = np.mean(test_act ** 2, axis=0)
     _act_mean = test_act.mean(axis=0)
     mse_per_step_mean = np.mean((test_act - _act_mean) ** 2, axis=0)
 
     _ss_tot = np.sum((test_act - _act_mean) ** 2, axis=0)
     _ss_tot = np.where(_ss_tot > 0, _ss_tot, 1e-8)
-    r2_per_step_ar = 1 - np.sum((test_ar - test_act) ** 2, axis=0) / _ss_tot
-    r2_per_step_bl = 1 - np.sum((test_bl - test_act) ** 2, axis=0) / _ss_tot
+    r2_per_step_lstm = 1 - np.sum((test_lstm - test_act) ** 2, axis=0) / _ss_tot
+    r2_per_step_mlp  = 1 - np.sum((test_mlp  - test_act) ** 2, axis=0) / _ss_tot
 
-    mae_cum_ar = np.mean(np.abs(test_ar_abs - test_act_abs), axis=0)
-    mae_cum_bl = np.mean(np.abs(test_bl_abs - test_act_abs), axis=0)
-    mae_cum_ar_std = np.std(np.abs(test_ar_abs - test_act_abs), axis=0)
-    mae_cum_bl_std = np.std(np.abs(test_bl_abs - test_act_abs), axis=0)
+    mae_cum_lstm = np.mean(np.abs(test_lstm_abs - test_act_abs), axis=0)
+    mae_cum_mlp  = np.mean(np.abs(test_mlp_abs  - test_act_abs), axis=0)
+    mae_cum_lstm_std = np.std(np.abs(test_lstm_abs - test_act_abs), axis=0)
+    mae_cum_mlp_std  = np.std(np.abs(test_mlp_abs  - test_act_abs), axis=0)
 
-    mse_window_ar = np.mean((test_ar - test_act) ** 2, axis=1)
-    mse_window_bl = np.mean((test_bl - test_act) ** 2, axis=1)
+    mse_window_lstm = np.mean((test_lstm - test_act) ** 2, axis=1)
+    mse_window_mlp  = np.mean((test_mlp  - test_act) ** 2, axis=1)
 
-    overall_mse_ar = float(np.mean(mse_window_ar))
-    overall_mse_bl = float(np.mean(mse_window_bl))
+    overall_mse_lstm = float(np.mean(mse_window_lstm))
+    overall_mse_mlp  = float(np.mean(mse_window_mlp))
     overall_mse_zero = float(np.mean(test_act ** 2))
     overall_mse_mean = float(mse_per_step_mean.mean())
     _ss_tot_all = np.sum((test_act - test_act.mean()) ** 2)
-    overall_r2_ar = float(1 - np.sum((test_ar - test_act) ** 2) / max(_ss_tot_all, 1e-8))
-    overall_r2_bl = float(1 - np.sum((test_bl - test_act) ** 2) / max(_ss_tot_all, 1e-8))
-    ar_win_rate = float(np.mean(mse_window_ar < mse_window_bl))
+    overall_r2_lstm = float(1 - np.sum((test_lstm - test_act) ** 2) / max(_ss_tot_all, 1e-8))
+    overall_r2_mlp  = float(1 - np.sum((test_mlp  - test_act) ** 2) / max(_ss_tot_all, 1e-8))
+    lstm_win_rate = float(np.mean(mse_window_lstm < mse_window_mlp))
 
     eval_metrics = {
-        "test_mse_ar": overall_mse_ar,
-        "test_mse_bl": overall_mse_bl,
+        "test_mse_lstm": overall_mse_lstm,
+        "test_mse_mlp": overall_mse_mlp,
         "test_mse_persist_last": overall_mse_zero,
         "test_mse_predict_mean": overall_mse_mean,
-        "test_r2_ar": overall_r2_ar,
-        "test_r2_bl": overall_r2_bl,
-        "ar_win_rate": ar_win_rate,
-        "mse_per_step_ar": mse_per_step_ar.tolist(),
-        "mse_per_step_bl": mse_per_step_bl.tolist(),
-        "r2_per_step_ar": r2_per_step_ar.tolist(),
-        "r2_per_step_bl": r2_per_step_bl.tolist(),
+        "test_r2_lstm": overall_r2_lstm,
+        "test_r2_mlp": overall_r2_mlp,
+        "lstm_win_rate": lstm_win_rate,
+        "mse_per_step_lstm": mse_per_step_lstm.tolist(),
+        "mse_per_step_mlp": mse_per_step_mlp.tolist(),
+        "r2_per_step_lstm": r2_per_step_lstm.tolist(),
+        "r2_per_step_mlp": r2_per_step_mlp.tolist(),
     }
     return (
-        ar_win_rate,
         eval_metrics,
-        mae_cum_ar,
-        mae_cum_ar_std,
-        mae_cum_bl,
-        mae_cum_bl_std,
-        mse_per_step_ar,
-        mse_per_step_bl,
+        lstm_win_rate,
+        mae_cum_lstm,
+        mae_cum_lstm_std,
+        mae_cum_mlp,
+        mae_cum_mlp_std,
+        mse_per_step_lstm,
         mse_per_step_mean,
+        mse_per_step_mlp,
         mse_per_step_zero,
-        mse_window_ar,
-        mse_window_bl,
-        overall_mse_ar,
-        overall_mse_bl,
+        mse_window_lstm,
+        mse_window_mlp,
+        overall_mse_lstm,
         overall_mse_mean,
+        overall_mse_mlp,
         overall_mse_zero,
-        overall_r2_ar,
-        overall_r2_bl,
-        r2_per_step_ar,
-        r2_per_step_bl,
+        overall_r2_lstm,
+        overall_r2_mlp,
+        r2_per_step_lstm,
+        r2_per_step_mlp,
     )
 
 
 @app.cell
 def _(
     F_,
-    mse_per_step_ar,
-    mse_per_step_bl,
+    mo,
+    mse_per_step_lstm,
     mse_per_step_mean,
+    mse_per_step_mlp,
     mse_per_step_zero,
-    r2_per_step_ar,
-    r2_per_step_bl,
+    np,
+    plt,
+    r2_per_step_lstm,
+    r2_per_step_mlp,
 ):
     _steps = np.arange(1, F_ + 1)
     _w = 0.2
@@ -962,16 +1017,16 @@ def _(
 
     _ax_mse.bar(_steps - 1.5 * _w, mse_per_step_zero, _w, label="Persist last", color="#aaa")
     _ax_mse.bar(_steps - 0.5 * _w, mse_per_step_mean, _w, label="Predict mean", color="#ccc")
-    _ax_mse.bar(_steps + 0.5 * _w, mse_per_step_bl,   _w, label="Baseline", color="#dd8452")
-    _ax_mse.bar(_steps + 1.5 * _w, mse_per_step_ar,   _w, label="AR", color="#4c72b0")
+    _ax_mse.bar(_steps + 0.5 * _w, mse_per_step_mlp,  _w, label="MLP",  color="#dd8452")
+    _ax_mse.bar(_steps + 1.5 * _w, mse_per_step_lstm, _w, label="LSTM", color="#4c72b0")
     _ax_mse.set_xlabel("Forecast step")
     _ax_mse.set_ylabel("MSE")
     _ax_mse.set_title("Per-step MSE vs naive baselines")
     _ax_mse.set_xticks(_steps)
     _ax_mse.legend(fontsize=8)
 
-    _ax_r2.plot(_steps, r2_per_step_ar, "o-", color="#4c72b0", label="AR")
-    _ax_r2.plot(_steps, r2_per_step_bl, "s-", color="#dd8452", label="Baseline")
+    _ax_r2.plot(_steps, r2_per_step_lstm, "o-", color="#4c72b0", label="LSTM")
+    _ax_r2.plot(_steps, r2_per_step_mlp,  "s-", color="#dd8452", label="MLP")
     _ax_r2.axhline(0, color="black", lw=1, linestyle="--", label="R²=0 (naive)")
     _ax_r2.set_xlabel("Forecast step")
     _ax_r2.set_ylabel("R²")
@@ -986,9 +1041,16 @@ def _(
 
 
 @app.cell
-def _(overall_mse_ar, overall_mse_bl, overall_mse_mean, overall_mse_zero):
-    _names = ["Persist last\n(zero delta)", "Predict\nmean delta", "Baseline", "AR"]
-    _vals = [overall_mse_zero, overall_mse_mean, overall_mse_bl, overall_mse_ar]
+def _(
+    mo,
+    overall_mse_lstm,
+    overall_mse_mean,
+    overall_mse_mlp,
+    overall_mse_zero,
+    plt,
+):
+    _names = ["Persist last\n(zero delta)", "Predict\nmean delta", "MLP", "LSTM"]
+    _vals = [overall_mse_zero, overall_mse_mean, overall_mse_mlp, overall_mse_lstm]
     _colors = ["#aaa", "#ccc", "#dd8452", "#4c72b0"]
 
     fig_baselines, _ax = plt.subplots(figsize=(8, 5))
@@ -997,32 +1059,41 @@ def _(overall_mse_ar, overall_mse_bl, overall_mse_mean, overall_mse_zero):
         _ax.text(_bar.get_x() + _bar.get_width() / 2, _v, f"{_v:.6f}",
                  ha="center", va="bottom", fontsize=9)
     _ax.set_ylabel("Overall MSE")
-    _ax.set_title("Model vs naive baselines")
+    _ax.set_title("Models vs naive baselines")
     fig_baselines.tight_layout()
 
-    _pct_ar = (1 - overall_mse_ar / overall_mse_zero) * 100
-    _pct_bl = (1 - overall_mse_bl / overall_mse_zero) * 100
+    _pct_lstm = (1 - overall_mse_lstm / overall_mse_zero) * 100
+    _pct_mlp  = (1 - overall_mse_mlp  / overall_mse_zero) * 100
 
     mo.vstack([
         fig_baselines,
         mo.md(f"""
-    **AR** achieves **{_pct_ar:.1f}%** lower MSE than persist-last baseline.
-    **Baseline** achieves **{_pct_bl:.1f}%** lower MSE than persist-last baseline.
+    **LSTM decoder** achieves **{_pct_lstm:.1f}%** lower MSE than persist-last baseline.
+    **MLP decoder**  achieves **{_pct_mlp:.1f}%** lower MSE than persist-last baseline.
     """),
     ])
     return (fig_baselines,)
 
 
 @app.cell
-def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std):
+def _(
+    F_,
+    mae_cum_lstm,
+    mae_cum_lstm_std,
+    mae_cum_mlp,
+    mae_cum_mlp_std,
+    mo,
+    np,
+    plt,
+):
     _steps = np.arange(1, F_ + 1)
 
     fig_cumulative, _ax = plt.subplots(figsize=(8, 5))
-    _ax.plot(_steps, mae_cum_ar, "o-", color="#4c72b0", label="AR")
-    _ax.fill_between(_steps, mae_cum_ar - mae_cum_ar_std, mae_cum_ar + mae_cum_ar_std,
+    _ax.plot(_steps, mae_cum_lstm, "o-", color="#4c72b0", label="LSTM")
+    _ax.fill_between(_steps, mae_cum_lstm - mae_cum_lstm_std, mae_cum_lstm + mae_cum_lstm_std,
                      alpha=0.15, color="#4c72b0")
-    _ax.plot(_steps, mae_cum_bl, "s-", color="#dd8452", label="Baseline")
-    _ax.fill_between(_steps, mae_cum_bl - mae_cum_bl_std, mae_cum_bl + mae_cum_bl_std,
+    _ax.plot(_steps, mae_cum_mlp, "s-", color="#dd8452", label="MLP")
+    _ax.fill_between(_steps, mae_cum_mlp - mae_cum_mlp_std, mae_cum_mlp + mae_cum_mlp_std,
                      alpha=0.15, color="#dd8452")
     _ax.set_xlabel("Forecast step")
     _ax.set_ylabel("MAE (absolute CNR)")
@@ -1036,55 +1107,56 @@ def _(F_, mae_cum_ar, mae_cum_ar_std, mae_cum_bl, mae_cum_bl_std):
 
 
 @app.cell
-def _(ar_win_rate, mse_window_ar, mse_window_bl, test_stim):
+def _(lstm_win_rate, mo, mse_window_lstm, mse_window_mlp, plt, test_stim):
     fig_head2head, _ax = plt.subplots(figsize=(7, 7))
     _sc = _ax.scatter(
-        mse_window_bl, mse_window_ar,
+        mse_window_mlp, mse_window_lstm,
         s=8, alpha=0.3, c=test_stim, cmap="viridis", edgecolors="none",
     )
-    _lim = [0, max(mse_window_ar.max(), mse_window_bl.max()) * 1.05]
+    _lim = [0, max(mse_window_lstm.max(), mse_window_mlp.max()) * 1.05]
     _ax.plot(_lim, _lim, "k--", lw=1, label="y = x")
     _ax.set_xlim(_lim)
     _ax.set_ylim(_lim)
-    _ax.set_xlabel("Baseline per-window MSE")
-    _ax.set_ylabel("AR per-window MSE")
-    _ax.set_title("AR vs Baseline head-to-head")
-    _ax.text(0.05, 0.95, f"AR wins {ar_win_rate * 100:.1f}% of windows",
+    _ax.set_xlabel("MLP per-window MSE")
+    _ax.set_ylabel("LSTM per-window MSE")
+    _ax.set_title("LSTM vs MLP head-to-head")
+    _ax.text(0.05, 0.95, f"LSTM wins {lstm_win_rate * 100:.1f}% of windows",
              transform=_ax.transAxes, fontsize=11, va="top",
              bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
     _ax.legend(loc="lower right")
     fig_head2head.colorbar(_sc, ax=_ax, label="Mean stimulus intensity")
     fig_head2head.tight_layout()
 
-    mo.md("## AR vs Baseline head-to-head")
+    mo.md("## LSTM vs MLP head-to-head")
     _ax
     return (fig_head2head,)
 
 
 @app.cell
 def _(
-    ar_win_rate,
-    overall_mse_ar,
-    overall_mse_bl,
+    lstm_win_rate,
+    mo,
+    overall_mse_lstm,
     overall_mse_mean,
+    overall_mse_mlp,
     overall_mse_zero,
-    overall_r2_ar,
-    overall_r2_bl,
+    overall_r2_lstm,
+    overall_r2_mlp,
 ):
     mo.md(f"""
     ## Evaluation summary
 
-    | Metric | AR | Baseline | Persist-last | Predict-mean |
-    |--------|---:|--------:|-----------:|-----------:|
-    | **Overall MSE** | {overall_mse_ar:.6f} | {overall_mse_bl:.6f} | {overall_mse_zero:.6f} | {overall_mse_mean:.6f} |
-    | **Overall R²** | {overall_r2_ar:.4f} | {overall_r2_bl:.4f} | — | — |
-    | **AR win rate** | {ar_win_rate * 100:.1f}% | — | — | — |
+    | Metric | LSTM | MLP | Persist-last | Predict-mean |
+    |--------|-----:|----:|-------------:|-------------:|
+    | **Overall MSE** | {overall_mse_lstm:.6f} | {overall_mse_mlp:.6f} | {overall_mse_zero:.6f} | {overall_mse_mean:.6f} |
+    | **Overall R²** | {overall_r2_lstm:.4f} | {overall_r2_mlp:.4f} | — | — |
+    | **LSTM win rate** | {lstm_win_rate * 100:.1f}% | — | — | — |
     """)
     return
 
 
 @app.cell
-def _(test_ds):
+def _(mo, test_ds):
     traj_selector = mo.ui.slider(
         0, len(test_ds) - 1, value=0, label="Test window index"
     )
@@ -1093,38 +1165,50 @@ def _(test_ds):
 
 
 @app.cell
-def _(F_, H, model, model_baseline, test_ds, traj_selector):
+def _(
+    F_,
+    H,
+    device,
+    mo,
+    model,
+    model_mlp,
+    np,
+    plt,
+    test_ds,
+    torch,
+    traj_selector,
+):
     _idx = traj_selector.value
     _enc_in, _dec_stim, _dec_target = test_ds[_idx]
 
     model.eval()
-    model_baseline.eval()
+    model_mlp.eval()
     with torch.no_grad():
         _enc_in_d = _enc_in.unsqueeze(0).to(device)
         _dec_stim_d = _dec_stim.unsqueeze(0).to(device)
-        _pred_ar_d = model(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
-        _pred_bl_d = model_baseline(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
+        _pred_lstm_d = model(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
+        _pred_mlp_d  = model_mlp(_enc_in_d, _dec_stim_d).cpu().numpy()[0]
 
     _hist_cnr = _enc_in[:, 0].numpy()
     _hist_u_t = _enc_in[:, 1].numpy()
     _fut_u_t = _dec_stim[:, 0].numpy()
     _last_val = _hist_cnr[-1]
     # reconstruct absolute CNR from deltas
-    _actual = _last_val + np.cumsum(_dec_target.numpy())
-    _pred_ar = _last_val + np.cumsum(_pred_ar_d)
-    _pred_bl = _last_val + np.cumsum(_pred_bl_d)
+    _actual    = _last_val + np.cumsum(_dec_target.numpy())
+    _pred_lstm = _last_val + np.cumsum(_pred_lstm_d)
+    _pred_mlp  = _last_val + np.cumsum(_pred_mlp_d)
     _t_hist = np.arange(H)
     _t_fut = np.arange(H, H + F_)
     _umax = max(_hist_u_t.max(), _fut_u_t.max(), 1e-8)
-    _cmax = max(_hist_cnr.max(), _actual.max(), _pred_ar.max(), _pred_bl.max(), 1e-8)
+    _cmax = max(_hist_cnr.max(), _actual.max(), _pred_lstm.max(), _pred_mlp.max(), 1e-8)
     _ls_h = _hist_u_t / _umax * _cmax * 0.5
     _ls_f = _fut_u_t / _umax * _cmax * 0.5
 
     _fig, _axes2 = plt.subplots(2, 2, figsize=(16, 8), height_ratios=[3, 1], sharex=True)
 
     for _col, (_pred, _color, _label) in enumerate([
-        (_pred_ar, "tab:red", "AR"),
-        (_pred_bl, "tab:blue", "Baseline"),
+        (_pred_lstm, "tab:red",  "LSTM"),
+        (_pred_mlp,  "tab:blue", "MLP"),
     ]):
         _ax_main = _axes2[0, _col]
         _ax_err = _axes2[1, _col]
@@ -1145,18 +1229,20 @@ def _(F_, H, model, model_baseline, test_ds, traj_selector):
         _ax_err.set_ylabel("error")
         _ax_err.set_xlabel("timestep")
 
-    _mse_ar = np.mean((_actual - _pred_ar) ** 2)
-    _mse_bl = np.mean((_actual - _pred_bl) ** 2)
+    _mse_lstm = np.mean((_actual - _pred_lstm) ** 2)
+    _mse_mlp  = np.mean((_actual - _pred_mlp) ** 2)
     _fig.tight_layout()
     mo.vstack([
         _fig,
-        mo.md(f"**Window {_idx}** | AR MSE: {_mse_ar:.6f} | Baseline MSE: {_mse_bl:.6f}")
+        mo.md(f"**Window {_idx}** | LSTM MSE: {_mse_lstm:.6f} | MLP MSE: {_mse_mlp:.6f}")
     ])
     return
 
 
 @app.cell
 def _(
+    Path,
+    compute_training_stats,
     eval_metrics,
     fig_baselines,
     fig_cumulative,
@@ -1166,29 +1252,32 @@ def _(
     fig_recon,
     fig_step_metrics,
     history,
-    history_baseline,
+    history_mlp,
+    hostname,
+    is_cluster,
+    mo,
     model,
-    model_baseline,
-    tracker_ar,
-    tracker_bl,
+    model_mlp,
+    tracker_lstm,
+    tracker_mlp,
     train_elapsed,
     train_loader,
     val_loader,
 ):
 
-    _stats_ar = compute_training_stats(
+    _stats_lstm = compute_training_stats(
         train_elapsed_s=train_elapsed,
         history=history,
         n_train_samples=len(train_loader.dataset),
         n_val_samples=len(val_loader.dataset),
         model=model,
     )
-    _stats_bl = compute_training_stats(
+    _stats_mlp = compute_training_stats(
         train_elapsed_s=train_elapsed,
-        history=history_baseline,
+        history=history_mlp,
         n_train_samples=len(train_loader.dataset),
         n_val_samples=len(val_loader.dataset),
-        model=model_baseline,
+        model=model_mlp,
     )
 
     _figures = {
@@ -1201,22 +1290,22 @@ def _(
         "head_to_head": fig_head2head,
     }
 
-    _bundle_ar = tracker_ar.save_final(
+    _bundle_lstm = tracker_lstm.save_final(
         model=model,
-        training_results={"history": history, "train_elapsed_s": train_elapsed, "stats": _stats_ar},
+        training_results={"history": history, "train_elapsed_s": train_elapsed, "stats": _stats_lstm},
         metrics=eval_metrics,
         figures=_figures,
     )
 
-    _bundle_bl = tracker_bl.save_final(
-        model=model_baseline,
-        training_results={"history": history_baseline, "train_elapsed_s": train_elapsed, "stats": _stats_bl},
+    _bundle_mlp = tracker_mlp.save_final(
+        model=model_mlp,
+        training_results={"history": history_mlp, "train_elapsed_s": train_elapsed, "stats": _stats_mlp},
         metrics=eval_metrics,
         figures=_figures,
     )
 
     _env_label = f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
-    _parent_dir = str(Path(_bundle_ar.save_dir).parent)
+    _parent_dir = str(Path(_bundle_lstm.save_dir).parent)
     mo.md(f"**Saved** on {_env_label}\n\n`{_parent_dir}`")
     return
 
