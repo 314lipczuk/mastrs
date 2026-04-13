@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.21.1"
+__generated_with = "0.22.5"
 app = marimo.App(width="columns")
 
 
@@ -601,6 +601,323 @@ def _(np):
     return DEFAULT_PARAMS, simulate_population
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Real vs Simulated Comparison
+
+    Compares real ERK measurements (`cnr_median_norm` from `dataset.parquet`) against
+    the simulator output `sim_erk_noisy` resimulated on-the-fly from the sliders above.
+
+    Sim is baseline-normalised (divided by per-cell mean over the first 10 timepoints)
+    so both sit on the "CNR ratio" scale centred on 1 during baseline.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(df, np, pd, sim_cnr):
+    # Task 1 — distribution compare (real vs sim CNR)
+    from scipy import stats as _stats
+
+    _real = df[["uid", "frame", "cnr_median_norm"]].dropna()
+    real_peak = _real.groupby("uid")["cnr_median_norm"].max().to_numpy()
+    real_pool = _real["cnr_median_norm"].to_numpy()
+
+    sim_peak = sim_cnr.max(axis=1)
+    sim_pool = sim_cnr.flatten()
+
+    def _moments(x, name):
+        x = x[np.isfinite(x)]
+        return {"name": name, "n": len(x),
+                "mean": float(x.mean()), "std": float(x.std()),
+                "skew": float(_stats.skew(x)), "kurt": float(_stats.kurtosis(x))}
+
+    _ks_peak = _stats.ks_2samp(real_peak, sim_peak)
+    _ks_pool = _stats.ks_2samp(real_pool[::20], sim_pool[::20])
+
+    moments_table = pd.DataFrame([
+        _moments(real_peak, "real peak"),
+        _moments(sim_peak,  "sim  peak"),
+        _moments(real_pool, "real pool"),
+        _moments(sim_pool,  "sim  pool"),
+    ])
+    moments_table["KS D"] = [_ks_peak.statistic, _ks_peak.statistic, _ks_pool.statistic, _ks_pool.statistic]
+    moments_table["KS p"] = [_ks_peak.pvalue, _ks_peak.pvalue, _ks_pool.pvalue, _ks_pool.pvalue]
+    moments_table
+
+    return real_peak, real_pool, sim_peak, sim_pool
+
+
+@app.cell(hide_code=True)
+def _(np, plt, real_peak, real_pool, sim_peak, sim_pool):
+    # Task 1 — overlay hist
+    _fig, _axes = plt.subplots(1, 2, figsize=(13, 4))
+
+    _bins_peak = np.linspace(
+        min(real_peak.min(), sim_peak.min()),
+        max(real_peak.max(), sim_peak.max()), 50,
+    )
+    _axes[0].hist(real_peak, bins=_bins_peak, alpha=0.55, color="crimson",
+                  edgecolor="white", lw=0.4, label=f"real (n={len(real_peak)})", density=True)
+    _axes[0].hist(sim_peak, bins=_bins_peak, alpha=0.55, color="steelblue",
+                  edgecolor="white", lw=0.4, label=f"sim  (n={len(sim_peak)})", density=True)
+    _axes[0].set_xlabel("peak CNR (per cell)")
+    _axes[0].set_ylabel("density")
+    _axes[0].set_title("Peak CNR distribution")
+    _axes[0].legend(fontsize=8)
+
+    _lo, _hi = np.nanpercentile(real_pool, [0.5, 99.5])
+    _bins_pool = np.linspace(_lo, _hi, 60)
+    _axes[1].hist(real_pool, bins=_bins_pool, alpha=0.55, color="crimson",
+                  edgecolor="white", lw=0.4, label="real", density=True)
+    _axes[1].hist(sim_pool, bins=_bins_pool, alpha=0.55, color="steelblue",
+                  edgecolor="white", lw=0.4, label="sim", density=True)
+    _axes[1].set_xlabel("CNR (pooled over cells × time)")
+    _axes[1].set_ylabel("density")
+    _axes[1].set_title("Pooled CNR distribution")
+    _axes[1].legend(fontsize=8)
+
+    _fig.suptitle("Real vs Sim CNR distributions", y=1.02)
+    _fig.tight_layout()
+    _fig
+
+    return
+
+
+@app.cell(hide_code=True)
+def _(
+    dataset_noise,
+    noise_baseline_scale,
+    noise_jitter_scale,
+    noise_jitter_timescale,
+    np,
+    sim_K_values,
+    sim_trajectories,
+    trajectory_noise,
+):
+    # Synthesise per-cell CNR from sim trajectories (same formula as CLI block)
+    # cnr = cyt / nuc; nuc = b*(1 - ERK/K·s);  cyt = b*(1 + ERK/K·s)
+    from scipy.ndimage import gaussian_filter1d as _gf1d_cmp
+    _rng_cmp = np.random.default_rng(0)
+
+    _erk_clean = sim_trajectories[:, 4, :]           # (n_cells, n_t)
+    _K_erk     = sim_K_values[:, 4][:, None]         # (n_cells, 1)
+    _erk_norm  = _erk_clean / np.maximum(_K_erk, 1e-6)
+
+    _n_cells_s, _n_t_s = _erk_clean.shape
+    _b_nuc  = _rng_cmp.lognormal(np.log(0.5), 0.2, size=(_n_cells_s, 1))
+    _scale  = _rng_cmp.lognormal(0.0, 0.6, size=(_n_cells_s, 1))
+
+    _jitter_std   = dataset_noise * noise_jitter_scale.value
+    _baseline_std = trajectory_noise.median() * noise_baseline_scale.value
+    _raw_n  = _rng_cmp.normal(0, 1.0, size=(_n_cells_s, _n_t_s))
+    _smooth = _gf1d_cmp(_raw_n, sigma=noise_jitter_timescale.value, axis=1)
+    _smooth = _smooth / (_smooth.std(axis=1, keepdims=True) + 1e-9) * _jitter_std
+    _bshift = _rng_cmp.normal(0, _baseline_std, size=(_n_cells_s, 1))
+
+    _prod = np.clip(_erk_norm * _scale, 0.0, 0.9)
+    _nuc = _b_nuc * (1.0 - _prod) + _smooth * 0.5
+    _cyt = _b_nuc * (1.0 + _prod) + _smooth
+    _nuc_floored = np.maximum(_nuc, 0.3 * _b_nuc)
+    sim_cnr = _cyt / _nuc_floored + _bshift  # already ~1 at baseline by construction
+    sim_cnr.shape
+
+    return (sim_cnr,)
+
+
+@app.cell(hide_code=True)
+def _(
+    DEFAULT_PARAMS,
+    dataset_noise,
+    df,
+    k12_std_ui,
+    noise_baseline_scale,
+    noise_jitter_scale,
+    noise_jitter_timescale,
+    np,
+    pd,
+    sim_K_mean,
+    sim_K_std,
+    simulate_population_het,
+    trajectory_noise,
+):
+    # Task 2 — trajectory envelope: real vs sim per real light pattern
+    # Reconstruct real stim profile → feed to simulate_population → synthesise CNR → compare envelopes.
+    from scipy.ndimage import gaussian_filter1d as _gf1d_env
+
+    _patterns = ['Single', 'Sustained', 'ramp1', '3-2-1minIntervals']
+    _N_CELLS_SIM = 200
+
+    envelope = {}
+
+    for _pname in _patterns:
+        _sub = df[df['ramp_pattern_name'] == _pname]
+        _nf = int(_sub['frame'].max()) + 1
+
+        _pivot = (_sub.pivot_table(index='uid', columns='frame',
+                                    values='cnr_median_norm', aggfunc='mean')
+                       .reindex(columns=range(_nf)))
+        _real_mean = _pivot.mean(axis=0).to_numpy()
+        _real_std  = _pivot.std(axis=0).to_numpy()
+
+        _light_frame = _sub.groupby('frame')['stim_exposure'].mean().reindex(range(_nf)).fillna(0).to_numpy()
+        _max_l = _light_frame.max() if _light_frame.max() > 0 else 1.0
+        _light_norm = _light_frame / _max_l
+        def _lfn(t, _p=_light_norm, _n=_nf):
+            _i = int(t)
+            if _i < 0 or _i >= _n:
+                return 0.0
+            return float(_p[_i])
+
+        _times_s, _trajs, _Kvals, _k12vals = simulate_population_het(
+            n_cells=_N_CELLS_SIM, params=DEFAULT_PARAMS,
+            K_mean=sim_K_mean.value, K_std=sim_K_std.value, k12_std=k12_std_ui.value,
+            light_fn=_lfn, t_max=float(_nf), dt=1.0, seed=17,
+        )
+
+        _rng_e = np.random.default_rng(17)
+        _erk   = _trajs[:, 4, :]
+        _K_erk = _Kvals[:, 4][:, None]
+        _enorm = np.clip(_erk / np.maximum(_K_erk, 1e-6), 0.0, 1.0)
+        _b_nuc = _rng_e.lognormal(np.log(0.5), 0.2, size=(_N_CELLS_SIM, 1))
+        _scale = _rng_e.lognormal(0.0, 0.6, size=(_N_CELLS_SIM, 1))  # wider biosensor gain
+
+        _jstd = dataset_noise * noise_jitter_scale.value
+        _bstd = trajectory_noise.median() * noise_baseline_scale.value
+        _rawn = _rng_e.normal(0, 1.0, size=_erk.shape)
+        _smth = _gf1d_env(_rawn, sigma=noise_jitter_timescale.value, axis=1)
+        # Global std normalisation — per-cell division blows up for short sequences
+        _smth = _smth / (_smth.std() + 1e-9) * _jstd
+        _bsh  = _rng_e.normal(0, _bstd, size=(_N_CELLS_SIM, 1))
+
+        _prod = np.clip(_enorm * _scale, 0.0, 0.9)   # keep nuc positive
+        _nuc  = _b_nuc * (1.0 - _prod) + _smth * 0.5
+        _cyt  = _b_nuc * (1.0 + _prod) + _smth
+        _nuc  = np.maximum(_nuc, 0.3 * _b_nuc)        # physical floor: nuc stays > 30% of baseline
+        _cnr_raw = _cyt / _nuc + _bsh                 # cnr is already ~1 at baseline by construction
+        _cnr = _cnr_raw
+
+        envelope[_pname] = dict(
+            frames=np.arange(_nf),
+            real_mean=_real_mean, real_std=_real_std,
+            sim_mean=_cnr.mean(axis=0), sim_std=_cnr.std(axis=0),
+            light=_light_norm,
+            n_real=_pivot.shape[0], n_sim=_N_CELLS_SIM,
+        )
+
+    envelope_summary = pd.DataFrame([
+        {'pattern': p, 'n_frames': len(v['frames']), 'n_real': v['n_real'], 'n_sim': v['n_sim'],
+         'sim_peak': float(v['sim_mean'].max()), 'real_peak': float(v['real_mean'].max())}
+        for p, v in envelope.items()
+    ])
+    envelope_summary
+
+    return (envelope,)
+
+
+@app.cell(hide_code=True)
+def _(envelope, plt):
+    # Plot 4 subplots: real envelope vs sim envelope per pattern
+    _fig, _axes = plt.subplots(2, 2, figsize=(15, 8))
+    _axes = _axes.flatten()
+
+    for _ax, _pname in zip(_axes, ['Single', 'Sustained', 'ramp1', '3-2-1minIntervals']):
+        _e = envelope[_pname]
+        _f = _e['frames']
+
+        _ax_l = _ax.twinx()
+        _ax_l.fill_between(_f, _e['light'], alpha=0.12, color='gold')
+        _ax_l.set_ylim(-0.05, 4.0)
+        _ax_l.set_yticks([])
+
+        _n_real = _e['n_real']
+        _n_sim  = _e['n_sim']
+        _ax.plot(_f, _e['real_mean'], color='crimson', lw=1.8, label='real (n=' + str(_n_real) + ')')
+        _ax.fill_between(_f, _e['real_mean'] - _e['real_std'], _e['real_mean'] + _e['real_std'],
+                         color='crimson', alpha=0.18)
+        _ax.plot(_f, _e['sim_mean'],  color='steelblue', lw=1.8, label='sim  (n=' + str(_n_sim) + ')')
+        _ax.fill_between(_f, _e['sim_mean'] - _e['sim_std'], _e['sim_mean'] + _e['sim_std'],
+                         color='steelblue', alpha=0.18)
+
+        _ax.axvline(10, color='gray', ls=':', lw=1, alpha=0.6)
+        _ax.set_title(_pname)
+        _ax.set_xlabel('frame')
+        _ax.set_ylabel('CNR (baseline-norm.)')
+        _ax.legend(fontsize=8, loc='upper right')
+
+    _fig.suptitle('Real vs Sim trajectory envelopes per light pattern  (mean ± 1σ)', y=1.01)
+    _fig.tight_layout()
+    _fig
+
+    return
+
+
+@app.cell(hide_code=True)
+def _(np):
+    # Per-cell heterogeneous simulator: varies k12 (RAS input sensitivity) across cells
+    # on top of the existing lognormal K. Reduces to homogeneous when k12_std=0.
+    from scipy.integrate import solve_ivp as _solve_ivp_het
+
+    def simulate_population_het(n_cells, params, K_mean, K_std, k12_std,
+                                 light_fn, t_max=100.0, dt=1.0, seed=42):
+        rng = np.random.default_rng(seed)
+
+        # K per cell per state var — same lognormal as base simulate_population
+        _sig_K = np.log(1 + (K_std / K_mean) ** 2)
+        _mu_K  = np.log(K_mean) - _sig_K / 2
+        K_values = rng.lognormal(mean=_mu_K, sigma=np.sqrt(_sig_K), size=(n_cells, 5))
+
+        # k12 per cell, lognormal around params[1]
+        k12_base = float(params[1])
+        if k12_std > 0:
+            _sig12 = np.log(1 + k12_std ** 2)
+            _mu12  = np.log(k12_base) - _sig12 / 2
+            k12_values = rng.lognormal(mean=_mu12, sigma=np.sqrt(_sig12), size=n_cells)
+        else:
+            k12_values = np.full(n_cells, k12_base)
+
+        times = np.arange(0, t_max, dt)
+        y0 = [0.05] * 5
+        trajectories = np.zeros((n_cells, 5, len(times)))
+
+        for i in range(n_cells):
+            p_i = params.copy()
+            p_i[1] = k12_values[i]
+            K_i = K_values[i]
+
+            def _sys(t, y, _p=p_i, _K=K_i, _lf=light_fn):
+                RAS, RAF, MEK, NFB, ERK = y
+                K_RAS, K_RAF, K_MEK, K_NFB, K_ERK = _K
+                Km, k12, k21, k34, knfb, k43, k56, k65, k78, k87, f12, f21 = _p
+                light = _lf(t)
+                return [
+                    light * k12 * (K_RAS - RAS) - k21 * (RAS / (Km + RAS)),
+                    k34 * RAS * (K_RAF - RAF) - (knfb * NFB + k43) * (RAF / (Km + RAF)),
+                    k56 * RAF * (K_MEK - MEK) - k65 * (MEK / (Km + MEK)),
+                    f12 * ERK * (K_NFB - NFB) - f21 * (NFB / (Km + NFB)),
+                    k78 * MEK * (K_ERK - ERK) - k87 * (ERK / (Km + ERK)),
+                ]
+
+            sol = _solve_ivp_het(_sys, [0, t_max], y0, t_eval=times,
+                                 method='LSODA', rtol=1e-8)
+            trajectories[i] = sol.y if sol.success else np.nan
+
+        return times, trajectories, K_values, k12_values
+
+
+    return (simulate_population_het,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    k12_std_ui = mo.ui.slider(0.0, 2.0, value=0.8, step=0.05,
+                              label='k12 heterogeneity σ (lognormal CV)')
+    k12_std_ui
+
+    return (k12_std_ui,)
+
+
 @app.cell(column=1)
 def _(
     np,
@@ -688,12 +1005,13 @@ def _(dataset_noise, mo, trajectory_noise):
 @app.cell(hide_code=True)
 def _(
     DEFAULT_PARAMS,
+    k12_std_ui,
     np,
     sim_K_mean,
     sim_K_std,
     sim_light_pattern,
     sim_n_cells,
-    simulate_population,
+    simulate_population_het,
 ):
     def _make_light_fn(pattern):
         if pattern == "constant":
@@ -706,11 +1024,12 @@ def _(
 
     _light_fn = _make_light_fn(sim_light_pattern.value)
 
-    sim_times, sim_trajectories, sim_K_values = simulate_population(
+    sim_times, sim_trajectories, sim_K_values, sim_k12_values = simulate_population_het(
         n_cells=sim_n_cells.value,
         params=DEFAULT_PARAMS,
         K_mean=sim_K_mean.value,
         K_std=sim_K_std.value,
+        k12_std=k12_std_ui.value,
         light_fn=_light_fn,
         t_max=100.0,
         dt=0.1,
@@ -720,7 +1039,14 @@ def _(
     sim_erk = sim_trajectories[:, 4, :]
     sim_erk_mean = np.nanmean(sim_erk, axis=0)
     sim_erk_std = np.nanstd(sim_erk, axis=0)
-    return sim_erk, sim_erk_mean, sim_erk_std, sim_times
+    return (
+        sim_K_values,
+        sim_erk,
+        sim_erk_mean,
+        sim_erk_std,
+        sim_times,
+        sim_trajectories,
+    )
 
 
 @app.cell(hide_code=True)
