@@ -1,9 +1,6 @@
 import getpass
 import types
 from pathlib import Path
-
-import torch
-
 # --- Path constants ---
 
 CLUSTER_RESULTS_PATH = "/mnt/imaging.data/ppilip/results/models"
@@ -46,6 +43,7 @@ def parse_bool(value, default: bool = True) -> bool:
 # --- Device ---
 
 def get_device():
+    import torch
     dev = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     print('Device:', dev)
     return dev

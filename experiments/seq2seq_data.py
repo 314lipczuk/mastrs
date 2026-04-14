@@ -160,3 +160,29 @@ def load_real(
     conditions = meta["ramp_pattern_name"].values
 
     return cnr, stim_all, conditions
+
+
+AVAILABLE_DATASETS = ("synthetic", "synthetic_v2", "real")
+
+
+def load(
+    ds_name: str,
+    **kwargs,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dispatch to the loader for a named dataset.
+
+    Single source of truth for "which datasets exist". Adding a new dataset
+    means touching this function (and `AVAILABLE_DATASETS`) — notebooks don't
+    need to know the catalog.
+
+    Returns (cnr, stim, conditions) — same contract as the underlying loaders.
+    """
+    if ds_name == "synthetic":
+        return load_synthetic(**kwargs)
+    if ds_name == "synthetic_v2":
+        return load_synthetic_v2(**kwargs)
+    if ds_name == "real":
+        return load_real(**kwargs)
+    raise ValueError(
+        f"Unknown dataset {ds_name!r}. Available: {list(AVAILABLE_DATASETS)}"
+    )
