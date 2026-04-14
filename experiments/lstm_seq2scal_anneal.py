@@ -207,7 +207,7 @@ def _():
 def _(mo, parse_bool):
     args = mo.cli_args()
 
-    EXPERIMENT_NAME = args.get("name", "lstm_seq2seq")
+    EXPERIMENT_NAME = args.get("name", "lstm_seq2scal_anneal")
     DRY_RUN = parse_bool(args.get("dry_run", True))
     _cli_source = args.get("source", None)
 
@@ -234,6 +234,8 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
         patience=int(args.get("patience", "20" if DRY_RUN else "100")),
         tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
         tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
+        tf_schedule_kind=args.get("tf_schedule_kind", "linear"),
+        tf_anneal_frac=float(args.get("tf_anneal_frac", "0.5")),
         dropout=float(args.get("dropout", "0.1")),
         mlp_hidden=int(args["mlp_hidden"]) if args.get("mlp_hidden") else None,
         n_mlp_layers=int(args.get("n_mlp_layers", "5")),
@@ -264,6 +266,8 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     | patience | {config['patience']} |
     | tf_ratio_start | {config['tf_ratio_start']} |
     | tf_ratio_end | {config['tf_ratio_end']} |
+    | tf_schedule_kind | {config['tf_schedule_kind']} |
+    | tf_anneal_frac | {config['tf_anneal_frac']} |
     | dropout | {config['dropout']} |
     | mlp_hidden | {config['mlp_hidden'] if config['mlp_hidden'] is not None else f"auto (= hidden_dim = {config['hidden_dim']})"} |
     | n_mlp_layers | {config['n_mlp_layers']} |
@@ -290,8 +294,8 @@ def _(
     STIM_COLS,
     Subset,
     config,
-    load,
     load_data_button,
+    load,
     mo,
     n_stim,
     np,
@@ -448,11 +452,45 @@ def _(
         data_source=DATA_SOURCE,
     )
 
-    def _run_epoch_ar(model, loader, device, optimizer, cfg, epoch, is_train):
+    def _tf_schedule(cfg):
+        kind = cfg["tf_schedule_kind"]
+        start, end, frac = cfg["tf_ratio_start"], cfg["tf_ratio_end"], cfg["tf_anneal_frac"]
+
+        def _progress(epoch, total):
+            anneal_epochs = max(int(total * frac) - 1, 1)
+            return min(epoch / anneal_epochs, 1.0)
+
+        if kind == "linear":
+            def schedule(epoch, total):
+                p = _progress(epoch, total)
+                return start + (end - start) * p
+        elif kind == "exp":
+            # exponential decay; clamps end away from 0 to keep the ratio well-defined
+            safe_end = max(end, 1e-4)
+            def schedule(epoch, total):
+                p = _progress(epoch, total)
+                return start * (safe_end / start) ** p
+        elif kind == "inv_sigmoid":
+            # Bengio et al. 2015 inverse sigmoid decay. k controls steepness.
+            import math
+            k = 5.0
+            def schedule(epoch, total):
+                p = _progress(epoch, total)
+                s = k / (k + math.exp(p * k))
+                return end + (start - end) * s
+        elif kind == "cosine":
+            import math
+            def schedule(epoch, total):
+                p = _progress(epoch, total)
+                return end + 0.5 * (start - end) * (1 + math.cos(math.pi * p))
+        else:
+            raise ValueError(f"unknown tf_schedule_kind: {kind}")
+        return schedule
+
+    def _run_epoch_ar(model, loader, device, optimizer, cfg, epoch, is_train, tf_fn=None):
         if is_train:
             model.train()
-            tf_start, tf_end, epochs = cfg["tf_ratio_start"], cfg["tf_ratio_end"], cfg["epochs"]
-            tf_ratio = tf_start - (tf_start - tf_end) * epoch / max(epochs - 1, 1)
+            tf_ratio = tf_fn(epoch, cfg["epochs"]) if tf_fn is not None else 0.0
         else:
             model.eval()
             tf_ratio = 0.0
@@ -487,6 +525,7 @@ def _(
         sched_mlp = optim.lr_scheduler.ReduceLROnPlateau(opt_mlp, patience=10, factor=0.5)
 
         epochs, patience = cfg["epochs"], cfg["patience"]
+        tf_fn = _tf_schedule(cfg)
         hist_lstm = {"train_loss": [], "val_loss": []}
         hist_mlp = {"train_loss": [], "val_loss": []}
 
@@ -500,7 +539,7 @@ def _(
 
         for epoch in range(epochs):
             if not done_lstm:
-                t_lstm, tf = _run_epoch_ar(model_lstm, train_loader, device, opt_lstm, cfg, epoch, True)
+                t_lstm, tf = _run_epoch_ar(model_lstm, train_loader, device, opt_lstm, cfg, epoch, True, tf_fn=tf_fn)
                 v_lstm, _ = _run_epoch_ar(model_lstm, val_loader, device, opt_lstm, cfg, epoch, False)
                 hist_lstm["train_loss"].append(t_lstm)
                 hist_lstm["val_loss"].append(v_lstm)
@@ -515,7 +554,7 @@ def _(
                         done_lstm = True
 
             if not done_mlp:
-                t_mlp, _ = _run_epoch_ar(model_mlp, train_loader, device, opt_mlp, cfg, epoch, True)
+                t_mlp, _ = _run_epoch_ar(model_mlp, train_loader, device, opt_mlp, cfg, epoch, True, tf_fn=tf_fn)
                 v_mlp, _ = _run_epoch_ar(model_mlp, val_loader, device, opt_mlp, cfg, epoch, False)
                 hist_mlp["train_loss"].append(t_mlp)
                 hist_mlp["val_loss"].append(v_mlp)

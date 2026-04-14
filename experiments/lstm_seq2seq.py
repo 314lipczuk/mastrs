@@ -24,7 +24,7 @@ with app.setup:
 
     from experiment import ExperimentTracker, compute_training_stats
     from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
-    from experiments.seq2seq_data import load_synthetic, load_synthetic_v2, load_real, STIM_COLS
+    from experiments.seq2seq_data import load, AVAILABLE_DATASETS, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
     device = get_device()
@@ -197,7 +197,7 @@ def _():
     _cli_source = args.get("source", None)
 
     source_selector = mo.ui.dropdown(
-        options=["synthetic", "synthetic_v2", "real"], value=_cli_source or "synthetic", label="Data source"
+        options=list(AVAILABLE_DATASETS), value=_cli_source or "synthetic", label="Data source"
     )
 
     mo.hstack([source_selector], gap=2)
@@ -267,14 +267,12 @@ def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
     F_ = config["future_len"]
     total_window = H + F_
 
-    if DATA_SOURCE == "synthetic":
-        cnr_all, stim_all, conditions_all = load_synthetic()
-    elif DATA_SOURCE == "synthetic_v2":
-        cnr_all, stim_all, conditions_all = load_synthetic_v2()
-    else:
-        cnr_all, stim_all, conditions_all = load_real(
-            window_size=total_window, stride=max(1, total_window // 4),
+    if DATA_SOURCE == "real":
+        cnr_all, stim_all, conditions_all = load(
+            "real", window_size=total_window, stride=max(1, total_window // 4),
         )
+    else:
+        cnr_all, stim_all, conditions_all = load(DATA_SOURCE)
 
     n_traj = len(cnr_all)
     traj_len = cnr_all.shape[1]

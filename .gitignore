@@ -17,3 +17,4 @@ DS_Store
 docs
 *.md
 launcher.py
+**/__marimo__/**
