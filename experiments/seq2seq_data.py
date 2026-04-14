@@ -119,6 +119,19 @@ def load_synthetic(
     return cnr, stim, conditions
 
 
+def load_synthetic_v2(
+    path: str = "stochastic_sim_v2_output.parquet",
+    baseline_frames: int = 10,
+    cnr_max: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load v2 stochastic simulator output (k12 heterogeneity + wider biosensor gain).
+
+    Same schema as v1 plus a `k12` column. Returns the same (cnr, stim, conditions)
+    triple as `load_synthetic`.
+    """
+    return load_synthetic(path=path, baseline_frames=baseline_frames, cnr_max=cnr_max)
+
+
 def load_real(
     path: str = "dataset.parquet",
     window_size: int = 20,

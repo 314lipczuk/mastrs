@@ -24,7 +24,7 @@ with app.setup:
 
     from experiment import ExperimentTracker, compute_training_stats
     from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
-    from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
+    from experiments.seq2seq_data import load_synthetic, load_synthetic_v2, load_real, STIM_COLS
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
 
     device = get_device()
@@ -188,7 +188,6 @@ with app.setup:
             return nn.functional.mse_loss(predictions, target)
 
 
-
 @app.cell
 def _():
     args = mo.cli_args()
@@ -198,7 +197,7 @@ def _():
     _cli_source = args.get("source", None)
 
     source_selector = mo.ui.dropdown(
-        options=["synthetic", "real"], value=_cli_source or "synthetic", label="Data source"
+        options=["synthetic", "synthetic_v2", "real"], value=_cli_source or "synthetic", label="Data source"
     )
 
     mo.hstack([source_selector], gap=2)
@@ -270,6 +269,8 @@ def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
 
     if DATA_SOURCE == "synthetic":
         cnr_all, stim_all, conditions_all = load_synthetic()
+    elif DATA_SOURCE == "synthetic_v2":
+        cnr_all, stim_all, conditions_all = load_synthetic_v2()
     else:
         cnr_all, stim_all, conditions_all = load_real(
             window_size=total_window, stride=max(1, total_window // 4),
@@ -347,7 +348,7 @@ def _(config):
     encoder_dim = 1 + n_stim
     stim_dim = n_stim
 
-    model_seq2seq = Seq2Seq(
+    model = Seq2Seq(
         encoder_dim=encoder_dim,
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
@@ -355,33 +356,25 @@ def _(config):
         dropout=config['dropout']
     ).to(device)
 
-    # model_baseline = Seq2SeqBaseline(
-    #     encoder_dim=encoder_dim,
-    #     stim_dim=stim_dim,
-    #     hidden_dim=config["hidden_dim"],
-    #     num_layers=config["num_layers"],
-    #     dropout=config['dropout']
-    # ).to(device)
-
-    model_seq2scal = Seq2Scalar(
+    model_baseline = Seq2SeqBaseline(
         encoder_dim=encoder_dim,
         stim_dim=stim_dim,
         hidden_dim=config["hidden_dim"],
         num_layers=config["num_layers"],
         dropout=config['dropout']
-    )
+    ).to(device)
 
-    n_params = sum(p.numel() for p in model_seq2seq.parameters())
-    n_params_b = sum(p.numel() for p in model_seq2scal.parameters())
+    n_params = sum(p.numel() for p in model.parameters())
+    n_params_b = sum(p.numel() for p in model_baseline.parameters())
     mo.md(f"""
     | model | type | params |
     |-------|------|--------|
     | AR | `Seq2Seq` | {n_params:,} |
-    | seq2scal | `Seq2scal` | {n_params_b:,} |
+    | Baseline | `Seq2SeqBaseline` | {n_params_b:,} |
 
     encoder_in={encoder_dim} | decoder_in={stim_dim} | hidden={config['hidden_dim']} | layers={config['num_layers']} | `{device}`
     """)
-    return
+    return model, model_baseline
 
 
 @app.cell

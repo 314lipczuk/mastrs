@@ -855,20 +855,18 @@ def _(envelope, plt):
 
 @app.cell(hide_code=True)
 def _(np):
-    # Per-cell heterogeneous simulator: varies k12 (RAS input sensitivity) across cells
-    # on top of the existing lognormal K. Reduces to homogeneous when k12_std=0.
+    # Per-cell heterogeneous simulator: varies k12 (RAS input sensitivity)
+    # across cells on top of lognormal K. Reduces to homogeneous when k12_std=0.
     from scipy.integrate import solve_ivp as _solve_ivp_het
 
     def simulate_population_het(n_cells, params, K_mean, K_std, k12_std,
                                  light_fn, t_max=100.0, dt=1.0, seed=42):
         rng = np.random.default_rng(seed)
 
-        # K per cell per state var — same lognormal as base simulate_population
         _sig_K = np.log(1 + (K_std / K_mean) ** 2)
         _mu_K  = np.log(K_mean) - _sig_K / 2
         K_values = rng.lognormal(mean=_mu_K, sigma=np.sqrt(_sig_K), size=(n_cells, 5))
 
-        # k12 per cell, lognormal around params[1]
         k12_base = float(params[1])
         if k12_std > 0:
             _sig12 = np.log(1 + k12_std ** 2)
@@ -911,7 +909,7 @@ def _(np):
 
 @app.cell(hide_code=True)
 def _(mo):
-    k12_std_ui = mo.ui.slider(0.0, 2.0, value=0.8, step=0.05,
+    k12_std_ui = mo.ui.slider(0.0, 2.0, value=1.0, step=0.05,
                               label='k12 heterogeneity σ (lognormal CV)')
     k12_std_ui
 
@@ -1191,6 +1189,7 @@ def _(
 @app.cell
 def _(
     dataset_noise,
+    k12_std_ui,
     mo,
     noise_baseline_scale,
     noise_jitter_scale,
@@ -1203,7 +1202,7 @@ def _(
     # In notebook mode, just show a note and stop. In CLI mode (app.run() from __main__),
     # mo.running_in_notebook() is False so the stop is skipped and generation runs.
     mo.stop(mo.running_in_notebook(), mo.md(
-        "*Run `python stochastic_simulator.py` to generate a 30 K-trajectory parquet.*"
+        "*Run `python stochastic_simulator.py` to generate a 30 K-trajectory parquet (v2).*"
     ))
 
     import json as _json
@@ -1220,7 +1219,7 @@ def _(
     _N_TOTAL = 30_000
     _N_TP    = 100
     _T_MAX   = 100.0
-    _OUTPUT  = "stochastic_sim_output.parquet"
+    _OUTPUT  = "stochastic_sim_v2_output.parquet"
 
     def _egfr_cli(t, y, params, K, light_fn):
         RAS, RAF, MEK, NFB, ERK = y
@@ -1239,6 +1238,12 @@ def _(
     _sigma_sq = np.log(1 + (_K_STD / _K_MEAN) ** 2)
     _mu_K = np.log(_K_MEAN) - _sigma_sq / 2
 
+    # k12 heterogeneity — RAS input sensitivity varies per cell
+    _K12_STD = float(k12_std_ui.value)
+    if _K12_STD > 0:
+        _sig12 = np.log(1 + _K12_STD ** 2)
+        _mu12  = np.log(_PARAMS[1]) - _sig12 / 2
+
     _rng = np.random.default_rng(42)
     _patterns = []
     for _gname, _gfn in [
@@ -1254,13 +1259,18 @@ def _(
     _times_cli = np.linspace(0, _T_MAX, _N_TP)
     _rows, _n_fail = [], 0
 
-    for _i, _pat in enumerate(_tqdm(_patterns, desc="Simulating")):
-        _K_i = _rng.lognormal(mean=_mu_K, sigma=np.sqrt(_sigma_sq), size=5)
+    for _i, _pat in enumerate(_tqdm(_patterns, desc="Simulating v2")):
+        _K_i   = _rng.lognormal(mean=_mu_K, sigma=np.sqrt(_sigma_sq), size=5)
+        _k12_i = (_rng.lognormal(mean=_mu12, sigma=np.sqrt(_sig12))
+                  if _K12_STD > 0 else _PARAMS[1])
+        _params_i = _PARAMS.copy()
+        _params_i[1] = _k12_i
+
         _plist = _pat["pulses"]
         _lfn = lambda t, _p=_plist: sum(p["amplitude"] for p in _p if p["t_on"] <= t <= p["t_off"])
 
         _sol = _solve_ivp_cli(
-            lambda t, y, _K=_K_i: _egfr_cli(t, y, _PARAMS, _K, _lfn),
+            lambda t, y, _K=_K_i, _P=_params_i: _egfr_cli(t, y, _P, _K, _lfn),
             [_times_cli[0], _times_cli[-1]], [0.05] * 5,
             t_eval=_times_cli, method='LSODA', rtol=1e-8,
         )
@@ -1269,25 +1279,30 @@ def _(
             continue
 
         _erk = _sol.y[4]
-        _erk_norm = _erk / _K_i[4]
+        _erk_norm = np.clip(_erk / max(_K_i[4], 1e-6), 0.0, 1.0)
+
+        # CNR synthesis — wider biosensor gain + product clip to keep nuc positive
         _b_nuc = _rng.lognormal(np.log(0.5), 0.2)
-        _scale = _rng.lognormal(0.0, 0.2)
-        # Noise model: same parameterisation as the interactive sliders in column 1.
-        # In CLI mode the sliders use their default values (scale=1.0, timescale=10).
+        _scale = _rng.lognormal(0.0, 0.6)
+        _prod  = np.clip(_erk_norm * _scale, 0.0, 0.9)
+
         _jitter_std = dataset_noise * noise_jitter_scale.value
         _baseline_shift = _rng.normal(0, trajectory_noise.median() * noise_baseline_scale.value)
         _raw_j = _rng.normal(0, 1.0, _N_TP)
         _smooth_j = _gf1d_cli(_raw_j, sigma=noise_jitter_timescale.value)
         _smooth_j = _smooth_j / (_smooth_j.std() + 1e-9) * _jitter_std
-        _nuc = _b_nuc * (1.0 - _erk_norm * _scale) + _smooth_j * 0.5
-        _cyt = _b_nuc * (1.0 + _erk_norm * _scale) + _smooth_j
-        _cnr = (_cyt / np.maximum(_nuc, 1e-6)) + _baseline_shift
+
+        _nuc = _b_nuc * (1.0 - _prod) + _smooth_j * 0.5
+        _cyt = _b_nuc * (1.0 + _prod) + _smooth_j
+        _nuc = np.maximum(_nuc, 0.3 * _b_nuc)
+        _cnr = _cyt / _nuc + _baseline_shift
 
         _rows.append({
             "trajectory_id":  _i,
             "generator":      _pat["generator"],
             "pulses_json":    _json.dumps(_pat["pulses"]),
             "K_values":       _K_i.tolist(),
+            "k12":            float(_k12_i),
             "times":          _times_cli.tolist(),
             "light":          [_lfn(t) for t in _times_cli],
             "RAS_s": _sol.y[0].tolist(), "RAF_s": _sol.y[1].tolist(),
@@ -1303,9 +1318,10 @@ def _(
 
     _df_out = pd.DataFrame(_rows)
     _df_out.to_parquet(_OUTPUT, index=False)
-    print(f"Saved {len(_df_out)} trajectories to {_OUTPUT}")
+    print(f"Saved {len(_df_out)} trajectories to {_OUTPUT}  (k12_std={_K12_STD})")
     if _n_fail:
         print(f"WARNING: {_n_fail} simulations failed and were skipped")
+
     return
 
 
