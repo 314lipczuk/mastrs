@@ -162,7 +162,35 @@ def load_real(
     return cnr, stim_all, conditions
 
 
-AVAILABLE_DATASETS = ("synthetic", "synthetic_v2", "real")
+def load_real_uncertain(
+    path: str = "dataset_real_uncertain.parquet",
+    window_size: int = 20,
+    stride: int = 5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load combined real dataset (dataset.parquet + BO_v1 + BO_v2).
+
+    BO_v1/v2 stim_power metadata is unconfirmed — treat results as exploratory.
+    Rows are already preprocessed (load_and_clean output schema); skip re-cleaning
+    and window directly.
+    """
+    from notebooks.experiment.preprocessing import make_windows, DEFAULT_STIM_COLS
+
+    df = pd.read_parquet(path)
+
+    cnr, stim_all, meta = make_windows(
+        df,
+        window_size=window_size,
+        stride=stride,
+        value_col="cnr_median_norm",
+        stim_cols=DEFAULT_STIM_COLS,
+    )
+
+    conditions = meta["ramp_pattern_name"].values
+
+    return cnr, stim_all, conditions
+
+
+AVAILABLE_DATASETS = ("synthetic", "synthetic_v2", "real", "real_uncertain")
 
 
 def load(
@@ -183,6 +211,8 @@ def load(
         return load_synthetic_v2(**kwargs)
     if ds_name == "real":
         return load_real(**kwargs)
+    if ds_name == "real_uncertain":
+        return load_real_uncertain(**kwargs)
     raise ValueError(
         f"Unknown dataset {ds_name!r}. Available: {list(AVAILABLE_DATASETS)}"
     )

@@ -184,14 +184,22 @@ def _(
     total_window = H + F_
 
     DATA_SOURCE = config["data_source"]
-    cnr_all, stim_all, conditions_all = load(DATA_SOURCE)
+    if DATA_SOURCE == "real":
+        # load_real returns pre-windowed tracks of length window_size; we then run
+        # Seq2SeqDataset on those with an H+F sliding window (yields 1 sample per track).
+        cnr_all, stim_all, conditions_all = load(
+            "real", window_size=total_window, stride=max(1, total_window // 4),
+        )
+    else:
+        cnr_all, stim_all, conditions_all = load(DATA_SOURCE)
 
     n_traj = len(cnr_all)
     traj_len = cnr_all.shape[1]
 
     class Seq2SeqDataset(Dataset):
-        def __init__(self, cnr, stim, history_len, future_len, stride=5):
+        def __init__(self, cnr, stim, conditions, history_len, future_len, stride=5):
             self.samples = []
+            self.sample_conditions = []  # per-sample condition label (for stratification)
             total = history_len + future_len
             for i in range(len(cnr)):
                 t = 0
@@ -203,6 +211,7 @@ def _(
                     dec_target = np.diff(full_window)[history_len - 1 : history_len - 1 + future_len]
                     enc_in = np.concatenate([enc_cnr[:, np.newaxis], enc_stim.T], axis=-1)
                     self.samples.append((enc_in, dec_stim.T, dec_target))
+                    self.sample_conditions.append(str(conditions[i]))
                     t += stride
 
         def __len__(self):
@@ -220,16 +229,23 @@ def _(
     tr_ids, te_ids = train_test_split(traj_ids, test_size=0.2, random_state=42)
     tr_ids, va_ids = train_test_split(tr_ids, test_size=0.125, random_state=42)
 
-    stride = 15
-    train_ds = Seq2SeqDataset(cnr_all[tr_ids], stim_all[tr_ids], H, F_, stride=stride)
-    val_ds = Seq2SeqDataset(cnr_all[va_ids], stim_all[va_ids], H, F_, stride=stride)
-    test_ds = Seq2SeqDataset(cnr_all[te_ids], stim_all[te_ids], H, F_, stride=stride)
+    stride = 15 if DATA_SOURCE != "real" else max(1, total_window // 4)
+    train_ds = Seq2SeqDataset(cnr_all[tr_ids], stim_all[tr_ids], conditions_all[tr_ids], H, F_, stride=stride)
+    val_ds = Seq2SeqDataset(cnr_all[va_ids], stim_all[va_ids], conditions_all[va_ids], H, F_, stride=stride)
+    test_ds_full = Seq2SeqDataset(cnr_all[te_ids], stim_all[te_ids], conditions_all[te_ids], H, F_, stride=stride)
+
+    # Preserve per-sample condition labels aligned with test_loader iteration order
+    # (no shuffle in test_loader), for stratification by condition after inference.
+    test_conditions = np.array(test_ds_full.sample_conditions)
 
     if DRY_RUN:
         n_dry = 2000
         train_ds = Subset(train_ds, range(min(n_dry, len(train_ds))))
         val_ds = Subset(val_ds, range(min(n_dry, len(val_ds)) // 4))
-        test_ds = Subset(test_ds, range(min(n_dry, len(test_ds))))
+        test_ds = Subset(test_ds_full, range(min(n_dry, len(test_ds_full))))
+        test_conditions = test_conditions[:len(test_ds)]
+    else:
+        test_ds = test_ds_full
 
     BS = config["batch_size"]
     train_loader = DataLoader(train_ds, batch_size=BS, shuffle=True)
@@ -237,10 +253,11 @@ def _(
     test_loader = DataLoader(test_ds, batch_size=512, shuffle=False)
 
     mo.md(f"""
-    **synthetic v2:** {n_traj} trajectories × {traj_len} timepoints — stim feats: {', '.join(STIM_COLS)}
+    **{DATA_SOURCE}:** {n_traj} tracks × {traj_len} timepoints — stim feats: {', '.join(STIM_COLS)}
     Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)} windows
+    Unique test conditions: {sorted(set(test_conditions.tolist()))}
     """)
-    return F_, H, test_loader, train_loader, val_loader
+    return F_, H, test_conditions, test_loader, train_loader, val_loader
 
 
 @app.cell
@@ -395,18 +412,19 @@ def _(
 
 @app.cell
 def _(device, np, test_loader, torch, trained):
-    # Collect per-member predictions on test set
-    per_member_preds = []  # (M, N, F) deltas
+    per_member_preds = []
     all_targets = None
     all_last = None
-    all_fut_stim = None
+    all_enc_last_stim = None    # (N, n_stim) — stim features at last history timestep
+    all_fut_stim_sum = None     # (N, n_stim) — sum over future window
     for _member in trained:
         _model = _member["model"]
         _model.eval()
         preds_chunks = []
         tgt_chunks = []
         last_chunks = []
-        stim_chunks = []
+        enc_last_chunks = []
+        fut_sum_chunks = []
         with torch.no_grad():
             for enc_in, dec_stim, dec_target in test_loader:
                 enc_d = enc_in.to(device)
@@ -415,25 +433,34 @@ def _(device, np, test_loader, torch, trained):
                 preds_chunks.append(preds)
                 tgt_chunks.append(dec_target.numpy())
                 last_chunks.append(enc_in[:, -1, 0].numpy())
-                stim_chunks.append(dec_stim[:, :, 0].mean(dim=1).numpy())
+                enc_last_chunks.append(enc_in[:, -1, 1:].numpy())    # last history stim
+                fut_sum_chunks.append(dec_stim.sum(dim=1).numpy())   # (B, n_stim) sum over F
         per_member_preds.append(np.concatenate(preds_chunks, axis=0))
         if all_targets is None:
             all_targets = np.concatenate(tgt_chunks, axis=0)
             all_last = np.concatenate(last_chunks, axis=0)
-            all_fut_stim = np.concatenate(stim_chunks, axis=0)
+            all_enc_last_stim = np.concatenate(enc_last_chunks, axis=0)
+            all_fut_stim_sum = np.concatenate(fut_sum_chunks, axis=0)
 
-    ens_preds = np.stack(per_member_preds, axis=0)  # (M, N, F) deltas
-    mean_pred = ens_preds.mean(axis=0)               # (N, F)
-    std_pred = ens_preds.std(axis=0, ddof=1)         # (N, F) — epistemic
+    ens_preds = np.stack(per_member_preds, axis=0)
+    mean_pred = ens_preds.mean(axis=0)
+    std_pred = ens_preds.std(axis=0, ddof=1)
 
-    # Reconstruct absolute CNR (cumulative sum over delta predictions)
     actual_abs = all_last[:, None] + np.cumsum(all_targets, axis=1)
     mean_abs = all_last[:, None] + np.cumsum(mean_pred, axis=1)
-    per_member_abs = all_last[None, :, None] + np.cumsum(ens_preds, axis=2)  # (M, N, F)
+    per_member_abs = all_last[None, :, None] + np.cumsum(ens_preds, axis=2)
     std_abs = per_member_abs.std(axis=0, ddof=1)
 
     print(f"ensemble tensor shape (M,N,F): {ens_preds.shape}")
-    return actual_abs, all_last, mean_abs, per_member_abs, std_abs
+    return (
+        actual_abs,
+        all_enc_last_stim,
+        all_fut_stim_sum,
+        all_last,
+        mean_abs,
+        per_member_abs,
+        std_abs,
+    )
 
 
 @app.cell
@@ -557,6 +584,148 @@ def _(coverage, levels, np, plt):
 
 
 @app.cell
+def _(STIM_COLS, all_enc_last_stim, all_fut_stim_sum, np, test_conditions):
+    # Per-sample stratification features — all derived from stim channels present
+    # in the test-set tensors collected above. No dataset modification required.
+    _idx = {c: i for i, c in enumerate(STIM_COLS)}
+
+    fut_fluence = all_fut_stim_sum[:, _idx["u_t"]]          # total light in future window
+    fut_n_pulses = all_fut_stim_sum[:, _idx["m_t"]]          # # of pulses in future window
+    hist_recency = all_enc_last_stim[:, _idx["recency"]]     # exp(-dt/tau) at boundary
+    hist_n_5 = all_enc_last_stim[:, _idx["n_5"]]             # local pulse rate at boundary
+    hist_s_cum = all_enc_last_stim[:, _idx["s_cum"]]         # cumulative fluence so far
+    hist_burst = all_enc_last_stim[:, _idx["burst_pos"]] > 0 # inside a burst at boundary
+
+    def _quartile_labels(x, name):
+        q = np.quantile(x, [0.25, 0.5, 0.75])
+        labels = np.where(
+            x <= q[0], f"{name}:Q1",
+            np.where(x <= q[1], f"{name}:Q2",
+            np.where(x <= q[2], f"{name}:Q3", f"{name}:Q4")),
+        )
+        return labels
+
+    strata = {
+        "condition / protocol": np.asarray(test_conditions),
+        "future fluence (Σ u_t)": _quartile_labels(fut_fluence, "fluence"),
+        "future pulse count": np.where(fut_n_pulses == 0, "n=0",
+                              np.where(fut_n_pulses <= 2, "n=1-2", "n≥3")),
+        "recency at boundary": np.where(hist_recency < 0.05, "cold",
+                               np.where(hist_recency < 0.5, "warm", "hot")),
+        "local rate n_5 (boundary)": _quartile_labels(hist_n_5, "n5"),
+        "cumulative fluence so far": _quartile_labels(hist_s_cum, "s_cum"),
+        "inside burst at boundary": np.where(hist_burst, "in-burst", "off"),
+    }
+    return (strata,)
+
+
+@app.cell
+def _(actual_abs, levels, mean_abs, np, plt, scipy_norm, sig, strata):
+    # Per-stratum calibration: expected vs observed coverage, per group, per feature.
+    def _coverage_curve(mu, truth, sigma, levels):
+        out = []
+        for p in levels:
+            z = scipy_norm.ppf(0.5 + p / 2)
+            inside = ((truth >= mu - z * sigma) & (truth <= mu + z * sigma)).mean()
+            out.append(float(inside))
+        return np.array(out)
+
+    n_features = len(strata)
+    n_cols = 3
+    n_rows = int(np.ceil(n_features / n_cols))
+    fig_strat_cal, _axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows),
+                                        squeeze=False)
+    _axes = _axes.flatten()
+    _nominal = np.array(levels)
+
+    for _i, (_feat_name, _labels) in enumerate(strata.items()):
+        _a = _axes[_i]
+        _groups = sorted(set(_labels.tolist()))
+        _a.plot([0, 1], [0, 1], "k--", alpha=0.5, lw=1)
+        for _g in _groups:
+            _mask = _labels == _g
+            if _mask.sum() < 20:
+                continue
+            _mu = mean_abs[_mask].flatten()
+            _truth = actual_abs[_mask].flatten()
+            _sigma = sig[_mask].flatten()
+            obs = _coverage_curve(_mu, _truth, _sigma, levels)
+            _a.plot(_nominal, obs, "o-", lw=1.5, ms=5,
+                    label=f"{_g} (n={int(_mask.sum())})")
+        _a.set_title(_feat_name, fontsize=10)
+        _a.set_xlabel("nominal"); _a.set_ylabel("observed")
+        _a.grid(alpha=0.3)
+        _a.legend(fontsize=7)
+    for _i in range(n_features, len(_axes)):
+        _axes[_i].set_visible(False)
+
+    fig_strat_cal.suptitle(
+        "Stratified calibration — curves ABOVE ideal = overconfident model on that stratum",
+        fontsize=11,
+    )
+    fig_strat_cal.tight_layout()
+    fig_strat_cal
+    return (fig_strat_cal,)
+
+
+@app.cell
+def _(actual_abs, mean_abs, np, plt, scipy_norm, sig, strata):
+    # Per-stratum summary: NLL, mean σ, mean |error|, 95% miscalibration.
+    def _per_stratum_stats(labels):
+        z95 = scipy_norm.ppf(0.975)
+        rows = []
+        for g in sorted(set(labels.tolist())):
+            m = labels == g
+            if m.sum() < 20:
+                continue
+            mu = mean_abs[m]; tr = actual_abs[m]; sg = sig[m]
+            nll = float((0.5 * np.log(2 * np.pi * sg ** 2) + ((tr - mu) ** 2) / (2 * sg ** 2)).mean())
+            cov95 = float(((tr >= mu - z95 * sg) & (tr <= mu + z95 * sg)).mean())
+            rows.append(dict(
+                group=g, n=int(m.sum()),
+                mean_sigma=float(sg.mean()),
+                mean_abs_err=float(np.abs(tr - mu).mean()),
+                nll=nll,
+                cov95=cov95,
+                miscal95=cov95 - 0.95,   # >0 = conservative, <0 = overconfident
+            ))
+        return rows
+
+    fig_strat_bar, _axes = plt.subplots(len(strata), 1, figsize=(10, 2.2 * len(strata)))
+    if len(strata) == 1:
+        _axes = [_axes]
+    for _i, (_feat_name, _labels) in enumerate(strata.items()):
+        rows = _per_stratum_stats(_labels)
+        names = [r["group"] for r in rows]
+        miscal = np.array([r["miscal95"] for r in rows])
+        sigmas = np.array([r["mean_sigma"] for r in rows])
+        errs = np.array([r["mean_abs_err"] for r in rows])
+        counts = [r["n"] for r in rows]
+        x = np.arange(len(names))
+
+        _a = _axes[_i]
+        _a.bar(x - 0.2, miscal, width=0.4, color=np.where(miscal < 0, "tab:red", "tab:green"),
+               alpha=0.7, label="observed_95% − 0.95")
+        _a.set_xticks(x); _a.set_xticklabels([f"{n}\n(n={c})" for n, c in zip(names, counts)], fontsize=8)
+        _a.axhline(0, color="k", lw=0.5)
+        _a.set_ylabel("miscalibration @ 95%", fontsize=8)
+        _a.set_title(_feat_name, fontsize=9)
+
+        _b = _a.twinx()
+        _b.plot(x, sigmas, "o-", color="tab:blue", ms=5, label="mean σ")
+        _b.plot(x, errs, "s--", color="tab:orange", ms=5, label="mean |err|")
+        _b.set_ylabel("σ / |err|", fontsize=8)
+        _b.legend(fontsize=7, loc="upper right")
+
+    fig_strat_bar.suptitle(
+        "Per-stratum miscalibration (red = overconfident) with σ and error overlay", fontsize=11,
+    )
+    fig_strat_bar.tight_layout()
+    fig_strat_bar
+    return (fig_strat_bar,)
+
+
+@app.cell
 def _(actual_abs, mean_abs, np, plt, sig):
     _err = np.abs(actual_abs - mean_abs).flatten()
     _spread = sig.flatten()
@@ -632,6 +801,8 @@ def _(
     fig_curves,
     fig_horizon,
     fig_ss,
+    fig_strat_bar,
+    fig_strat_cal,
     fig_traj,
     levels,
     mean_nll,
@@ -654,6 +825,8 @@ def _(
     figures = {
         "trajectories_with_uncertainty": fig_traj,
         "calibration": fig_cal,
+        "calibration_stratified": fig_strat_cal,
+        "calibration_miscal_by_stratum": fig_strat_bar,
         "spread_skill_and_sigma_hist": fig_ss,
         "uncertainty_vs_horizon": fig_horizon,
         "training_curves_per_seed": fig_curves,

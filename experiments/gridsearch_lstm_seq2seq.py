@@ -23,7 +23,7 @@ with app.setup:
     from torch.utils.data import DataLoader, Dataset, Subset
 
     from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
-    from experiments.seq2seq_data import load_synthetic, load_real, STIM_COLS
+    from experiments.seq2seq_data import load, AVAILABLE_DATASETS, STIM_COLS
     from experiments.lstm_seq2seq import Seq2Seq, Seq2SeqBaseline
     import altair as alt
 
@@ -47,7 +47,7 @@ def _():
     _cli_source = args.get("source", None)
 
     source_selector = mo.ui.dropdown(
-        options=["synthetic", "real"], value=_cli_source or "synthetic", label="Data source"
+        options=list(AVAILABLE_DATASETS), value=_cli_source or "synthetic", label="Data source"
     )
 
     mo.hstack([source_selector], gap=2)
@@ -275,12 +275,12 @@ def _(
     _data_cache = {}
     for _h, _f in _unique_windows:
         _total = _h + _f
-        if DATA_SOURCE == "synthetic":
-            _cnr, _stim, _cond = load_synthetic()
-        else:
-            _cnr, _stim, _cond = load_real(
-                window_size=_total, stride=max(1, _total // 4),
+        if DATA_SOURCE == "real":
+            _cnr, _stim, _cond = load(
+                "real", window_size=_total, stride=max(1, _total // 4),
             )
+        else:
+            _cnr, _stim, _cond = load(DATA_SOURCE)
         _n_traj = len(_cnr)
         _traj_ids = np.arange(_n_traj)
         _tr, _te = train_test_split(_traj_ids, test_size=0.2, random_state=42)

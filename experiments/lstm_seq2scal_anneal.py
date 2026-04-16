@@ -3,38 +3,14 @@ import marimo
 __generated_with = "0.22.5"
 app = marimo.App(width="full")
 
-
-@app.cell
-def _():
+with app.setup:
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-    import marimo as mo
     import torch
     import torch.nn as nn
-    import torch.optim as optim
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import os
-    import time
-    import tempfile
-    from datetime import datetime
-    from sklearn.model_selection import train_test_split
-    from torch.utils.data import DataLoader, Dataset, Subset
-
-    from experiment import ExperimentTracker, compute_training_stats
-    from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
-    from experiments.seq2seq_data import load, AVAILABLE_DATASETS, STIM_COLS
-    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
-
-    device = get_device()
-    n_stim = len(STIM_COLS)
-
-    hostname = get_username()
-    is_cluster = running_on_cluster()
-    results_base = results_write_path()
 
     def _init_forget_bias(lstm):
         for name, param in lstm.named_parameters():
@@ -86,7 +62,6 @@ def _():
                 pred = self.decoder(future_stim[:, i:i+1, :], h, c)  # (B, 1)
                 predictions.append(pred.squeeze(1))
                 if i < F - 1:
-                    # Window stores absolute CNR; reconstruct from delta before appending
                     last_abs = current_window[:, -1, 0:1]  # (B, 1)
                     use_teacher = targets is not None and torch.rand(1).item() < tf_ratio
                     next_cnr_abs = last_abs + (targets[:, i:i+1] if use_teacher else pred)
@@ -110,7 +85,6 @@ def _():
 
         def loss(self, predictions, target):
             return nn.functional.mse_loss(predictions, target)
-
 
     class Seq2Scalar(nn.Module):
         """Autoregressive one-step predictor: sliding-window LSTM encoder + MLP readout.
@@ -144,7 +118,6 @@ def _():
             self.head = nn.Sequential(*layers)
 
         def _predict_step(self, h_top, stim_i):
-            # h_top: (B, hidden_dim), stim_i: (B, stim_dim) -> (B,)
             return self.head(torch.cat([h_top, stim_i], dim=-1)).squeeze(-1)
 
         def forward(self, encoder_input, future_stim, targets=None, tf_ratio=0.0):
@@ -172,24 +145,45 @@ def _():
         def loss(self, predictions, target):
             return nn.functional.mse_loss(predictions, target)
 
+
+@app.cell
+def _():
+    import marimo as mo
+    import torch.optim as optim
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import os
+    import time
+    import tempfile
+    from datetime import datetime
+    from sklearn.model_selection import train_test_split
+    from torch.utils.data import DataLoader, Dataset, Subset
+
+    from experiment import ExperimentTracker, compute_training_stats
+    from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
+    from experiments.seq2seq_data import load, AVAILABLE_DATASETS, STIM_COLS
+    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS
+
+    device = get_device()
+    n_stim = len(STIM_COLS)
+
+    hostname = get_username()
+    is_cluster = running_on_cluster()
+    results_base = results_write_path()
     return (
+        AVAILABLE_DATASETS,
         DataLoader,
         Dataset,
         ExperimentTracker,
-        Path,
         STIM_COLS,
-        Seq2Scalar,
-        Seq2Seq,
         Subset,
         compute_training_stats,
         device,
         hostname,
         is_cluster,
-        AVAILABLE_DATASETS,
         load,
         mo,
         n_stim,
-        nn,
         np,
         optim,
         os,
@@ -198,13 +192,12 @@ def _():
         results_base,
         tempfile,
         time,
-        torch,
         train_test_split,
     )
 
 
 @app.cell
-def _(mo, parse_bool):
+def _(AVAILABLE_DATASETS, mo, parse_bool):
     args = mo.cli_args()
 
     EXPERIMENT_NAME = args.get("name", "lstm_seq2scal_anneal")
@@ -236,6 +229,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
         tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
         tf_schedule_kind=args.get("tf_schedule_kind", "linear"),
         tf_anneal_frac=float(args.get("tf_anneal_frac", "0.5")),
+        tf_hold_frac=float(args.get("tf_hold_frac", "0.3")),
         dropout=float(args.get("dropout", "0.1")),
         mlp_hidden=int(args["mlp_hidden"]) if args.get("mlp_hidden") else None,
         n_mlp_layers=int(args.get("n_mlp_layers", "5")),
@@ -268,6 +262,7 @@ def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
     | tf_ratio_end | {config['tf_ratio_end']} |
     | tf_schedule_kind | {config['tf_schedule_kind']} |
     | tf_anneal_frac | {config['tf_anneal_frac']} |
+    | tf_hold_frac | {config['tf_hold_frac']} |
     | dropout | {config['dropout']} |
     | mlp_hidden | {config['mlp_hidden'] if config['mlp_hidden'] is not None else f"auto (= hidden_dim = {config['hidden_dim']})"} |
     | n_mlp_layers | {config['n_mlp_layers']} |
@@ -294,12 +289,11 @@ def _(
     STIM_COLS,
     Subset,
     config,
-    load_data_button,
     load,
+    load_data_button,
     mo,
     n_stim,
     np,
-    torch,
     train_test_split,
 ):
     _headless = "name" in mo.cli_args()
@@ -383,7 +377,7 @@ def _(
 
 
 @app.cell
-def _(Seq2Scalar, Seq2Seq, config, device, mo, n_stim):
+def _(config, device, mo, n_stim):
     encoder_dim = 1 + n_stim
     stim_dim = n_stim
 
@@ -430,14 +424,12 @@ def _(
     model,
     model_mlp,
     n_stim,
-    nn,
     np,
     optim,
     os,
     results_base,
     tempfile,
     time,
-    torch,
     train_button,
     train_loader,
     val_loader,
@@ -455,10 +447,14 @@ def _(
     def _tf_schedule(cfg):
         kind = cfg["tf_schedule_kind"]
         start, end, frac = cfg["tf_ratio_start"], cfg["tf_ratio_end"], cfg["tf_anneal_frac"]
+        hold = cfg.get("tf_hold_frac", 0.0)
 
         def _progress(epoch, total):
+            hold_epochs = int(total * hold)
             anneal_epochs = max(int(total * frac) - 1, 1)
-            return min(epoch / anneal_epochs, 1.0)
+            if epoch < hold_epochs:
+                return 0.0
+            return min((epoch - hold_epochs) / anneal_epochs, 1.0)
 
         if kind == "linear":
             def schedule(epoch, total):
@@ -685,7 +681,7 @@ def _(history, history_mlp, plt):
 
 
 @app.cell
-def _(F_, H, device, model, model_mlp, np, plt, test_ds, torch):
+def _(F_, H, device, model, model_mlp, np, plt, test_ds):
     _n_examples = 8
     _indices = np.linspace(0, len(test_ds) - 1, _n_examples, dtype=int)
 
@@ -740,7 +736,7 @@ def _(F_, H, device, model, model_mlp, np, plt, test_ds, torch):
 
 
 @app.cell
-def _(DataLoader, device, model, model_mlp, np, test_ds, torch):
+def _(DataLoader, device, model, model_mlp, np, test_ds):
     # --- collect full test-set predictions (shared across eval cells) ---
     _last_cnr, _actual_all, _pred_lstm_all, _pred_mlp_all = [], [], [], []
     _pred_lstm_nz, _pred_mlp_nz, _fut_stim_all = [], [], []
@@ -1196,19 +1192,7 @@ def _(mo, test_ds):
 
 
 @app.cell
-def _(
-    F_,
-    H,
-    device,
-    mo,
-    model,
-    model_mlp,
-    np,
-    plt,
-    test_ds,
-    torch,
-    traj_selector,
-):
+def _(F_, H, device, mo, model, model_mlp, np, plt, test_ds, traj_selector):
     _idx = traj_selector.value
     _enc_in, _dec_stim, _dec_target = test_ds[_idx]
 
@@ -1272,7 +1256,6 @@ def _(
 
 @app.cell
 def _(
-    Path,
     compute_training_stats,
     eval_metrics,
     fig_baselines,
