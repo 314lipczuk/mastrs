@@ -4,48 +4,68 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-cell optogenetics research studying ERK signaling dynamics under light stimulation. Combines mechanistic ODE models (EGFR cascade), deep learning autoencoders (AE, CVAE, CAE), and reinforcement learning to analyze and control mammalian cell signaling.
+Single-cell optogenetics research on ERK signaling dynamics under light stimulation. Current focus is **LSTM seq2seq / seq2scalar models** that predict CNR trajectories from stimulation features. Earlier work on mechanistic ODE models (EGFR cascade), autoencoders (AE/VAE/CVAE), and RL-based light control is retained in the repo but not actively developed.
 
 ## Commands
 
 - **Install dependencies:** `uv sync`
 - **Run a script:** `uv run python <script.py>`
-- **Run module smoke tests:** `python -m model.dl.ae`, `python -m model.dl.cvae`, `python -m model.mechanistic.egfr_simplified`
-- **Run notebook:** `papermill <notebook.ipynb> <output.ipynb>`
-- **Generate synthetic data:** `uv run python generate_synthetic_data.py`
+- **Run a marimo notebook locally:** `uv run marimo edit <notebook.py>` (interactive) or `uv run marimo export html <notebook.py> -o out.html -- --name NAME --results-dir DIR` (headless)
+- **Launch SLURM jobs:** define `Job`s in `launcher.py`, then `uv run python launcher.py` (or `--local` to run locally). `submit.sh` is the SLURM wrapper.
+- **Sync to cluster:** `./sync.sh izb` (or `ibucluster`). `./collect.sh` pulls results back. `./watch_jobs.sh` monitors SLURM queue.
+- **Generate synthetic data:** `uv run python generate_synthetic_data.py` (standalone; writes parquet)
+- **Stochastic simulator:** `stochastic_simulator.py` (Gillespie-style simulator used by seq2seq experiments)
 
 ## Architecture
 
+### Experiments (`experiments/`)
+Marimo notebooks for training runs. Each is a self-contained experiment that uses `experiment.py` for serialization and `utils.py` for paths/device. Current files:
+- `lstm_seq2seq.py`, `lstm_seq2scal.py`, `lstm_seq2scal_anneal.py` — main LSTM variants
+- `gridsearch_lstm_seq2seq.py` — hyperparameter sweep
+- `ensemble_seq2scal.py`, `dropout_uncertainty_lstm_seq2seq.py` — uncertainty estimation
+- `compare_seq2seq.py` — cross-model comparison
+- `seq2seq_data.py` — **shared data loader** for all seq2seq experiments; exports `STIM_COLS` (9 stim feature channels) and `AVAILABLE_DATASETS`; loads both synthetic and real parquet data into `(cnr, stim, conditions)` triples
+- `VAE_single_timepoint_state_space.py` — legacy VAE experiment (uses `eval_cvae.py`)
+
 ### Model layer (`model/`)
 - **`model/mechanistic/`** — SymPy-defined ODE models. `mechanistic_model.py` is the base; `egfr_simplified.py` defines the RAS→RAF→MEK→ERK cascade with negative feedback. Symbolic equations convert to numerical callables via `lambdify`.
-- **`model/dl/`** — PyTorch autoencoders. `common.py` has shared components (Conv1dBlock, Decoder, spectral_loss). `ae.py` is a standard MLP autoencoder. `cvae.py` is a convolutional conditional beta-VAE with loss `(1-α)×MSE + α×spectral_loss + β×KL`. `cae.py` is a deterministic conditional autoencoder.
-- **`model/rl/`** — Gymnasium environments for RL-based light control. `ode_env.py` is generic; `egfr_oscillation_env.py` targets oscillation driving with FFT-based rewards.
-
-### Evaluation (`eval_ae.py`, `eval_cvae.py`)
-Model-agnostic evaluation via duck typing. Any model exposing `.encoder(x) → (mu, logvar)` and `.decoder(z, stim)` works with `eval_cvae.py`. Metrics include per-cell MSE, PSD comparison, stimulus invariance, latent traversals.
+- **`model/dl/`** — PyTorch autoencoders. `common.py` has shared components (Conv1dBlock, Decoder, spectral_loss). `ae.py` is a standard MLP autoencoder. `vae.py` is a plain β-VAE. `cvae.py` is a convolutional conditional β-VAE with loss `(1-α)×MSE + α×spectral_loss + β×KL`. `cae.py` is a deterministic conditional autoencoder.
+- **`model/rl/`** — Gymnasium environments for RL-based light control. `ode_env.py` is generic; `egfr_oscillation_env.py` targets oscillation driving with FFT-based rewards. `dynamics.py` provides shared simulator wrappers. `train_egfr_oscillation.py` and `train_mgm.py` are SAC training entrypoints.
 
 ### Experiment serialization (`experiment.py`)
-`save_experiment()` saves a complete training run to a directory: model weights, architecture config, training hyperparams, loss history, evaluation metrics, and figures. `load_experiment()` restores it — the model class is resolved dynamically from the saved fully-qualified class path (no hardcoded registry). Deserialization is best-effort: if the model class has changed, figures and metrics are still accessible; compatibility issues are reported via `bundle.warnings`. Call `bundle.reconstruct_model()` to get the model back in eval mode.
+`ExperimentTracker` is the standard way to persist a training run. It writes incrementally (checkpoints after each epoch/combo) so jobs can resume after crashes. `save_experiment()` writes a full bundle (weights, configs, metrics, figures); `load_experiment()` restores it via dynamic class import — no hardcoded model registry. Call `bundle.reconstruct_model()` to get the model in eval mode. `bundle.warnings` surfaces compatibility issues if the class has changed since save.
+
+Results are written to `utils.results_write_path()` — `/mnt/imaging.data/ppilip/results/models` on cluster, `/Volumes/imaging.data/ppilip/results/models` (Kingston mount) locally. Never hardcode `results/` paths in notebooks.
+
+### Evaluation (`eval_cvae.py`)
+Model-agnostic VAE eval via duck typing — any model exposing `.encoder(x) → (mu, logvar)` and `.decoder(z, stim)` works. Metrics: per-cell MSE, PSD comparison, stimulus invariance, latent traversals. Currently only used by the legacy VAE experiment.
+
+### Utilities (`utils.py`, `data.py`, `launcher.py`)
+- `utils.py` — `get_device()` (CUDA/MPS/CPU inference), `results_write_path()` / `results_read_sources()`, `running_on_cluster()`, `parse_bool()`, and `experiment_mode_widget()` / `experiment_mode_state()` marimo helpers for train/load mode toggle.
+- `data.py` — Legacy helper for loading synthetic state-space parquet with deterministic train/val/test splits (kept for state-space VAE work).
+- `launcher.py` — Defines `Job` dataclasses and dispatches them via `sbatch submit.sh` on cluster or `marimo run` locally.
 
 ### Data pipeline (`notebooks/experiment/preprocessing.py`)
-Loads parquet microscopy data, computes CNR (cytoplasm-to-nucleus ratio as ERK biosensor), filters short tracks, normalizes per-cell baseline, adds 9 stimulation feature channels. Synthetic data generated by `generate_synthetic_data.py` (10K trajectories with varied light patterns).
+Loads parquet microscopy data, computes CNR (cytoplasm-to-nucleus ratio as ERK biosensor), filters short tracks, normalizes per-cell baseline, adds 9 stimulation feature channels (`STIM_COLS` in `experiments/seq2seq_data.py`). Synthetic data generated by `generate_synthetic_data.py` and `stochastic_simulator.py`.
+
+### Light patterns
+JSON pattern files at repo root (`3-2-1minIntervals_pattern.json`, `sustained_light_pattern.json`, `transient_light_pattern.json`) define named stimulation protocols used by the simulator and some notebooks.
+
+### Notebooks (`notebooks/`)
+- `experiment/preprocessing.py` — active, imported by seq2seq experiments
+- `cz_experiment/` — active; dated real-data experiments (2025-08 onward)
+- `vae-full-trajectory/`, `initial_exp_full_trajectory/` — historical VAE/AE work; don't rewrite proactively
+- Remaining loose `.ipynb` files — exploratory / historical
 
 ## Key conventions
 
 - **Never change the parquet path** (`../dataset.parquet`) in notebooks.
 - **Prefer explicit code over abstractions.** If experiments differ, rewrite cells explicitly rather than adding conditional branching or mode switches.
 - **Use `tempfile.mkstemp(suffix=".pt")` for training checkpoints.** Never use name-based paths — stale files cause shape mismatch errors.
-- Device inference is automatic (CUDA/MPS/CPU); never hardcode device strings.
-- **Save training results via `save_experiment()`** from `experiment.py`. This is the standard way to persist a complete training run (weights, configs, metrics, figures) to `results/<name>/`.
-
-## Notebook migration
-
-Migrating from Jupyter to marimo. New notebooks should be written as marimo notebooks (`.py` files with `@app.cell` decorators). Existing Jupyter notebooks in `notebooks/` will be converted incrementally — don't rewrite them proactively, but prefer marimo when creating new experiment notebooks.
-
-## Documentation
-
-- `docs/exp_data_reference.md` — Parquet column schema and calibration tables
-- `docs/eval_cvae_spec.md` — Evaluation module API and metrics reference
+- Device inference via `utils.get_device()`; never hardcode device strings.
+- **Save training results via `ExperimentTracker` / `save_experiment()`** from `experiment.py`. Training notebooks must save partial results after each epoch/combo so runs can be resumed after crash.
+- **New notebooks = marimo** (`.py` with `@app.cell`), not Jupyter. Run `marimo check --fix` after editing.
+- Results live under `utils.results_write_path()` (cluster NFS or Kingston mount). One dir = one experiment; sub-experiments nest inside.
 
 # Marimo notebook assistant
 
