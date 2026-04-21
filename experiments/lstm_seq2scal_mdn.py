@@ -13,6 +13,7 @@ with app.setup:
     import torch
     import torch.nn as nn
 
+
     def _init_forget_bias(lstm):
         for name, param in lstm.named_parameters():
             if "bias" in name:
