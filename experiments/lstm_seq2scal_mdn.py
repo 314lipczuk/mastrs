@@ -10,8 +10,21 @@ with app.setup:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     import math
+    import os
+    import time
+    import tempfile
+    from dataclasses import dataclass
+    from typing import Callable
+
+    import numpy as np
     import torch
     import torch.nn as nn
+    from torch.utils.data import DataLoader, Dataset, Subset
+    from sklearn.model_selection import train_test_split
+
+    from pydantic import BaseModel, Field, ConfigDict, model_validator
+
+    from experiment import ExperimentTracker
 
 
     def _init_forget_bias(lstm):
@@ -20,12 +33,16 @@ with app.setup:
                 n = param.size(0)
                 param.data[n // 4 : n // 2].fill_(1.0)
 
+
     class LSTMEncoder(nn.Module):
         def __init__(self, input_dim, hidden_dim, num_layers, dropout=0.1):
             super().__init__()
             self.lstm = nn.LSTM(
-                input_dim, hidden_dim, num_layers,
-                batch_first=True, dropout=dropout,
+                input_dim,
+                hidden_dim,
+                num_layers,
+                batch_first=True,
+                dropout=dropout,
             )
             _init_forget_bias(self.lstm)
 
@@ -33,11 +50,8 @@ with app.setup:
             _, (h_n, c_n) = self.lstm(x)
             return h_n, c_n
 
-    class MDNHead(nn.Module):
-        """Mixture Density Network head: predicts (pi, mu, sigma) for a scalar target.
 
-        out_feat hardcoded to 1 (delta CNR). sigma parametrized as exp(log_sigma) for positivity.
-        """
+    class MDNHead(nn.Module):
         def __init__(self, in_feat, n_gaussians):
             super().__init__()
             self.n_gaussians = n_gaussians
@@ -51,12 +65,8 @@ with app.setup:
             sigma = torch.exp(self.log_sigma(x)).clamp(min=1e-3)
             return pi, mu, sigma
 
-    def mdn_nll(pi, mu, sigma, target):
-        """Negative log-likelihood of scalar target under mixture. All shapes broadcast-compatible.
 
-        pi, mu, sigma: (..., K). target: (...,).
-        Returns scalar mean NLL.
-        """
+    def mdn_nll(pi, mu, sigma, target):
         y = target.unsqueeze(-1)
         log_gauss = (
             -0.5 * math.log(2 * math.pi)
@@ -66,245 +76,52 @@ with app.setup:
         log_mix = torch.log(pi + 1e-12) + log_gauss
         return -torch.logsumexp(log_mix, dim=-1).mean()
 
-    class Seq2ScalarMDN(nn.Module):
-        """Autoregressive sliding-window encoder + MLP trunk + MDN head.
 
-        At each future step i:
-          - Encode current window -> top hidden state h
-          - MLP trunk on [h, stim_i] -> features
-          - MDN head -> (pi, mu, sigma) over delta CNR
-          - Point estimate = pi-weighted mean of mu; roll window forward with it (or teacher delta).
-        """
-        def __init__(
-            self,
-            encoder_dim,
-            stim_dim,
-            hidden_dim,
-            num_layers,
-            n_gaussians=3,
-            mlp_hidden=None,
-            n_mlp_layers=2,
-            dropout=0.1,
-            **kwargs,
-        ):
-            super().__init__()
-            if mlp_hidden is None:
-                mlp_hidden = hidden_dim
-            self.n_gaussians = n_gaussians
-            self.encoder = LSTMEncoder(encoder_dim, hidden_dim, num_layers, dropout)
+    class ModelConfig(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        encoder_dim: int = Field(..., ge=1)
+        stim_dim: int = Field(..., ge=1)
+        hidden_dim: int = Field(64, ge=1)
+        num_layers: int = Field(2, ge=1)
+        n_gaussians: int = Field(3, ge=1)
+        n_mlp_layers: int = Field(5, ge=1)
+        mlp_hidden: int | None = None
+        dropout: float = Field(0.1, ge=0.0, le=0.9)
+        history_len: int = Field(30, ge=1)
+        future_len: int = Field(5, ge=1)
+        data_source: str = "synthetic"
+        variant: str = "seq2scalar_mdn_ar_tf"
 
-            layers = [nn.Linear(hidden_dim + stim_dim, mlp_hidden), nn.GELU(), nn.Dropout(dropout)]
-            for _ in range(n_mlp_layers - 1):
-                layers += [nn.Linear(mlp_hidden, mlp_hidden), nn.GELU(), nn.Dropout(dropout)]
-            self.trunk = nn.Sequential(*layers)
-            self.head = MDNHead(mlp_hidden, n_gaussians)
-
-        def _step(self, h_top, stim_i):
-            feats = self.trunk(torch.cat([h_top, stim_i], dim=-1))
-            return self.head(feats)  # (B,K),(B,K),(B,K)
-
-        def forward(self, encoder_input, future_stim, targets=None, tf_ratio=0.0):
-            B, H, _ = encoder_input.shape
-            F = future_stim.shape[1]
-
-            current_window = encoder_input
-            pis, mus, sigmas = [], [], []
-
-            for i in range(F):
-                h, _ = self.encoder(current_window)
-                pi, mu, sigma = self._step(h[-1], future_stim[:, i, :])
-                pis.append(pi); mus.append(mu); sigmas.append(sigma)
-
-                if i < F - 1:
-                    last_abs = current_window[:, -1, 0:1]  # (B, 1)
-                    use_teacher = targets is not None and torch.rand(1).item() < tf_ratio
-                    if use_teacher:
-                        delta = targets[:, i:i+1]
-                    else:
-                        point = (pi * mu).sum(dim=-1, keepdim=True)  # (B,1)
-                        delta = point
-                    next_cnr_abs = last_abs + delta
-                    next_input = torch.cat([next_cnr_abs, future_stim[:, i, :]], dim=-1).unsqueeze(1)
-                    current_window = torch.cat([current_window[:, 1:, :], next_input], dim=1)
-
-            return (
-                torch.stack(pis, dim=1),     # (B, F, K)
-                torch.stack(mus, dim=1),     # (B, F, K)
-                torch.stack(sigmas, dim=1),  # (B, F, K)
-            )
-
-        def point_pred(self, pi, mu):
-            return (pi * mu).sum(dim=-1)  # (B, F)
-
-        def pred_std(self, pi, mu, sigma):
-            mean = (pi * mu).sum(dim=-1, keepdim=True)
-            var = (pi * (sigma ** 2 + (mu - mean) ** 2)).sum(dim=-1)
-            return torch.sqrt(var.clamp(min=1e-12))
-
-        def loss(self, preds, target):
-            pi, mu, sigma = preds
-            return mdn_nll(pi, mu, sigma, target)
+        @model_validator(mode="after")
+        def _fill_mlp_hidden(self):
+            if self.mlp_hidden is None:
+                object.__setattr__(self, "mlp_hidden", self.hidden_dim)
+            return self
 
 
-@app.cell
-def _():
-    import marimo as mo
-    import torch.optim as optim
-    import numpy as np
-    import polars as pl
-    import os
-    import time
-    import tempfile
-    from hastyplot import qplot
-    from sklearn.model_selection import train_test_split
-    from torch.utils.data import DataLoader, Dataset, Subset
-
-    from experiment import ExperimentTracker, compute_training_stats
-    from utils import get_device, get_username, running_on_cluster, results_write_path, parse_bool
-    from experiments.seq2seq_data import load, AVAILABLE_DATASETS, STIM_COLS
-
-    device = get_device()
-    n_stim = len(STIM_COLS)
-
-    hostname = get_username()
-    is_cluster = running_on_cluster()
-    results_base = results_write_path()
-    return (
-        AVAILABLE_DATASETS,
-        DataLoader,
-        Dataset,
-        ExperimentTracker,
-        STIM_COLS,
-        Subset,
-        compute_training_stats,
-        device,
-        hostname,
-        is_cluster,
-        load,
-        mo,
-        n_stim,
-        np,
-        optim,
-        os,
-        parse_bool,
-        pl,
-        qplot,
-        results_base,
-        tempfile,
-        time,
-        train_test_split,
-    )
+    class TrainingConfig(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        lr: float = 1e-3
+        weight_decay: float = 1e-4
+        epochs: int = 400
+        batch_size: int = 64
+        patience: int = 100
+        tf_ratio_start: float = 1.0
+        tf_ratio_end: float = 0.0
+        tf_anneal_frac: float = 0.5
+        tf_hold_frac: float = 0.3
+        grad_clip: float = 1.0
 
 
-@app.cell
-def _(AVAILABLE_DATASETS, mo, parse_bool):
-    args = mo.cli_args()
+    @dataclass
+    class TrainContext:
+        device: torch.device
+        model_config: ModelConfig
+        training_config: TrainingConfig
+        tracker: "ExperimentTracker | None" = None
+        progress_cb: "Callable[[int, int, dict], None] | None" = None
+        print_every: int = 20
 
-    EXPERIMENT_NAME = args.get("name", "lstm_seq2scal_mdn")
-    DRY_RUN = parse_bool(args.get("dry_run", True))
-    _cli_source = args.get("source", None)
-
-    source_selector = mo.ui.dropdown(
-        options=list(AVAILABLE_DATASETS), value=_cli_source or "synthetic", label="Data source"
-    )
-    mo.hstack([source_selector], gap=2)
-    return DRY_RUN, EXPERIMENT_NAME, args, source_selector
-
-
-@app.cell
-def _(DRY_RUN, EXPERIMENT_NAME, args, mo, source_selector):
-    DATA_SOURCE = source_selector.value
-
-    config = dict(
-        hidden_dim=int(args.get("hidden_dim", "16" if DRY_RUN else "64")),
-        num_layers=int(args.get("num_layers", "2")),
-        history_len=int(args.get("history_len", "30")),
-        future_len=int(args.get("future_len", "5")),
-        lr=float(args.get("lr", "1e-3")),
-        epochs=int(args.get("epochs", "50" if DRY_RUN else "400")),
-        batch_size=int(args.get("batch_size", "64")),
-        patience=int(args.get("patience", "20" if DRY_RUN else "100")),
-        tf_ratio_start=float(args.get("tf_ratio_start", "1.0")),
-        tf_ratio_end=float(args.get("tf_ratio_end", "0.0")),
-        tf_anneal_frac=float(args.get("tf_anneal_frac", "0.5")),
-        tf_hold_frac=float(args.get("tf_hold_frac", "0.3")),
-        dropout=float(args.get("dropout", "0.1")),
-        mlp_hidden=int(args["mlp_hidden"]) if args.get("mlp_hidden") else None,
-        n_mlp_layers=int(args.get("n_mlp_layers", "5")),
-        n_gaussians=int(args.get("n_gaussians", "3")),
-    )
-    print(config)
-
-    mo.md(f"""
-    # LSTM encoder + MLP trunk + MDN head: `{EXPERIMENT_NAME}`
-
-    Same AR rollout as `lstm_seq2scal_anneal`, but the scalar regressor on the delta is replaced
-    by an MDN head with {config['n_gaussians']} Gaussian components. Training objective is
-    mixture NLL per step (summed, mean-reduced).
-
-    Point prediction for rollout feedback = π-weighted mean of μ. Uncertainty surfaces as
-    mixture std dev at eval time.
-
-    | param | value |
-    |-------|-------|
-    | source | {DATA_SOURCE} |
-    | hidden_dim | {config['hidden_dim']} |
-    | num_layers | {config['num_layers']} |
-    | history_len / future_len | {config['history_len']} / {config['future_len']} |
-    | lr | {config['lr']} |
-    | epochs | {config['epochs']} |
-    | batch_size | {config['batch_size']} |
-    | patience | {config['patience']} |
-    | tf schedule (linear) | {config['tf_ratio_start']} → {config['tf_ratio_end']} (hold={config['tf_hold_frac']}, anneal={config['tf_anneal_frac']}) |
-    | dropout | {config['dropout']} |
-    | mlp_hidden | {config['mlp_hidden'] if config['mlp_hidden'] is not None else 'auto'} |
-    | n_mlp_layers | {config['n_mlp_layers']} |
-    | n_gaussians | {config['n_gaussians']} |
-    | dry_run | {DRY_RUN} |
-    """)
-    return DATA_SOURCE, config
-
-
-@app.cell
-def _(mo):
-    _headless = "name" in mo.cli_args()
-    load_data_button = mo.ui.run_button(label="Load data & prepare datasets")
-    train_button = mo.ui.run_button(label="Start training")
-    mo.hstack([load_data_button, train_button], gap=1) if not _headless else None
-    return load_data_button, train_button
-
-
-@app.cell
-def _(
-    DATA_SOURCE,
-    DRY_RUN,
-    DataLoader,
-    Dataset,
-    STIM_COLS,
-    Subset,
-    config,
-    load,
-    load_data_button,
-    mo,
-    n_stim,
-    np,
-    train_test_split,
-):
-    _headless = "name" in mo.cli_args()
-    mo.stop(not _headless and not load_data_button.value, mo.md("Click **Load data & prepare datasets** to continue."))
-    H = config["history_len"]
-    F_ = config["future_len"]
-    total_window = H + F_
-
-    if DATA_SOURCE == "real":
-        cnr_all, stim_all, conditions_all = load(
-            "real", window_size=total_window, stride=max(1, total_window // 4),
-        )
-    else:
-        cnr_all, stim_all, conditions_all = load(DATA_SOURCE)
-
-    n_traj = len(cnr_all)
-    traj_len = cnr_all.shape[1]
 
     class Seq2SeqDataset(Dataset):
         def __init__(self, cnr, stim, history_len, future_len, stride=5):
@@ -317,9 +134,11 @@ def _(
                     enc_stim = stim[i, :, t : t + history_len]
                     dec_stim = stim[i, :, t + history_len : t + total]
                     full_window = cnr[i, t : t + total]
-                    dec_target = np.diff(full_window)[history_len - 1 : history_len - 1 + future_len]
+                    dec_target = np.diff(full_window)[
+                        history_len - 1 : history_len - 1 + future_len
+                    ]
                     enc_in = np.concatenate(
-                        [enc_cnr[:, np.newaxis], enc_stim.T], axis=-1,
+                        [enc_cnr[:, np.newaxis], enc_stim.T], axis=-1
                     )
                     self.samples.append((enc_in, dec_stim.T, dec_target))
                     t += stride
@@ -335,194 +154,645 @@ def _(
                 torch.tensor(dec_target, dtype=torch.float32),
             )
 
-    traj_ids = np.arange(n_traj)
-    tr_ids, te_ids = train_test_split(traj_ids, test_size=0.2, random_state=42)
-    tr_ids, va_ids = train_test_split(tr_ids, test_size=0.125, random_state=42)
 
-    stride = 15
-    train_ds = Seq2SeqDataset(cnr_all[tr_ids], stim_all[tr_ids], H, F_, stride=stride)
-    val_ds = Seq2SeqDataset(cnr_all[va_ids], stim_all[va_ids], H, F_, stride=stride)
-    test_ds = Seq2SeqDataset(cnr_all[te_ids], stim_all[te_ids], H, F_, stride=stride)
+    def _tf_schedule_linear(tcfg, total_epochs):
+        start, end = tcfg.tf_ratio_start, tcfg.tf_ratio_end
+        frac, hold = tcfg.tf_anneal_frac, tcfg.tf_hold_frac
 
-    if DRY_RUN:
-        n_dry = 5000
-        train_ds = Subset(train_ds, range(min(n_dry, len(train_ds))))
-        val_ds = Subset(val_ds, range(min(n_dry, len(val_ds)) // 4))
-        test_ds = Subset(test_ds, range(min(n_dry, len(test_ds))))
-
-    BS = config["batch_size"]
-    train_loader = DataLoader(train_ds, batch_size=BS, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BS, shuffle=False)
-
-    mo.md(f"""
-    **Data:** {n_traj} trajectories × {traj_len} timepoints ({DATA_SOURCE})
-
-    Encoder input: CNR + {n_stim} stim features ({', '.join(STIM_COLS)}) over {H} history steps
-    Decoder input: {n_stim} stim features over {F_} future steps → MDN over delta CNR
-
-    Train: {len(train_ds)} windows | Val: {len(val_ds)} | Test: {len(test_ds)}
-    """)
-    return F_, H, test_ds, train_loader, val_loader
-
-
-@app.cell
-def _(config, device, mo, n_stim):
-    encoder_dim = 1 + n_stim
-    stim_dim = n_stim
-
-    model = Seq2ScalarMDN(
-        encoder_dim=encoder_dim,
-        stim_dim=stim_dim,
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        n_gaussians=config["n_gaussians"],
-        mlp_hidden=config["mlp_hidden"],
-        n_mlp_layers=config["n_mlp_layers"],
-        dropout=config["dropout"],
-    ).to(device)
-
-    n_params = sum(p.numel() for p in model.parameters())
-    _mlp_h = config["mlp_hidden"] if config["mlp_hidden"] is not None else config["hidden_dim"]
-    mo.md(f"""
-    | model | params | K | mlp_hidden | n_mlp_layers |
-    |-------|-------:|--:|-----------:|-------------:|
-    | `Seq2ScalarMDN` | {n_params:,} | {config['n_gaussians']} | {_mlp_h} | {config['n_mlp_layers']} |
-
-    encoder_in={encoder_dim} | stim_dim={stim_dim} | hidden={config['hidden_dim']} | layers={config['num_layers']} | `{device}`
-    """)
-    return (model,)
-
-
-@app.cell
-def _(
-    DATA_SOURCE,
-    EXPERIMENT_NAME,
-    ExperimentTracker,
-    config,
-    device,
-    mo,
-    model,
-    n_stim,
-    np,
-    optim,
-    os,
-    results_base,
-    tempfile,
-    time,
-    train_button,
-    train_loader,
-    val_loader,
-):
-    _model_config = dict(
-        encoder_dim=1 + n_stim,
-        stim_dim=n_stim,
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        history_len=config["history_len"],
-        future_len=config["future_len"],
-        data_source=DATA_SOURCE,
-        n_gaussians=config["n_gaussians"],
-        mlp_hidden=config["mlp_hidden"] if config["mlp_hidden"] is not None else config["hidden_dim"],
-        n_mlp_layers=config["n_mlp_layers"],
-        variant="seq2scalar_mdn_ar_tf",
-    )
-
-    def _tf_schedule_linear(cfg):
-        start, end = cfg["tf_ratio_start"], cfg["tf_ratio_end"]
-        frac, hold = cfg["tf_anneal_frac"], cfg["tf_hold_frac"]
-
-        def schedule(epoch, total):
-            hold_epochs = int(total * hold)
-            anneal_epochs = max(int(total * frac) - 1, 1)
+        def schedule(epoch):
+            hold_epochs = int(total_epochs * hold)
+            anneal_epochs = max(int(total_epochs * frac) - 1, 1)
             if epoch < hold_epochs:
                 p = 0.0
             else:
                 p = min((epoch - hold_epochs) / anneal_epochs, 1.0)
             return start + (end - start) * p
+
         return schedule
 
-    def _run_epoch(model, loader, device, optimizer, cfg, epoch, is_train, tf_fn=None):
+
+    def _run_epoch(
+        model, loader, device, optimizer, grad_clip, tf_ratio, is_train
+    ):
         if is_train:
             model.train()
-            tf_ratio = tf_fn(epoch, cfg["epochs"]) if tf_fn is not None else 0.0
         else:
             model.eval()
-            tf_ratio = 0.0
         losses = []
         ctx = torch.enable_grad() if is_train else torch.no_grad()
         with ctx:
             for enc_in, dec_stim, dec_target in loader:
-                enc_in, dec_stim, dec_target = enc_in.to(device), dec_stim.to(device), dec_target.to(device)
+                enc_in = enc_in.to(device)
+                dec_stim = dec_stim.to(device)
+                dec_target = dec_target.to(device)
                 targets = dec_target if is_train else None
                 preds = model(enc_in, dec_stim, targets=targets, tf_ratio=tf_ratio)
                 loss = model.loss(preds, dec_target)
                 if is_train:
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=grad_clip
+                    )
                     optimizer.step()
                 losses.append(loss.item())
-        return float(np.mean(losses)), tf_ratio
+        return float(np.mean(losses))
 
-    def train_model(mdl, train_loader, val_loader, cfg, device, tracker):
-        opt = optim.Adam(mdl.parameters(), lr=cfg["lr"], weight_decay=1e-4)
-        sched = optim.lr_scheduler.ReduceLROnPlateau(opt, patience=10, factor=0.5)
-        tf_fn = _tf_schedule_linear(cfg)
-        hist = {"train_loss": [], "val_loss": [], "tf_ratio": []}
 
-        ckpt_fd, ckpt = tempfile.mkstemp(suffix=".pt")
-        os.close(ckpt_fd)
+    class Seq2ScalarMDN(nn.Module):
+        """Autoregressive sliding-window encoder + MLP trunk + MDN head.
 
-        best, wait = float("inf"), 0
-        for epoch in range(cfg["epochs"]):
-            t, tf_r = _run_epoch(mdl, train_loader, device, opt, cfg, epoch, True, tf_fn=tf_fn)
-            v, _ = _run_epoch(mdl, val_loader, device, opt, cfg, epoch, False)
-            hist["train_loss"].append(t)
-            hist["val_loss"].append(v)
-            hist["tf_ratio"].append(tf_r)
-            sched.step(v)
-            if v < best:
-                best, wait = v, 0
-                torch.save(mdl.state_dict(), ckpt)
-            else:
-                wait += 1
-                if wait >= cfg["patience"]:
-                    print(f"Early stopping at epoch {epoch}")
-                    break
-            if epoch % 20 == 0:
-                print(f"Epoch {epoch:3d} | tf={tf_r:.2f} T:{t:.5f} V:{v:.5f}")
+        Config attached as class attribute so external callers can do
+        `Seq2ScalarMDN.Config(...)`. `fit` is the self-contained trainer
+        (named `fit` to avoid shadowing nn.Module.train, which is reserved
+        for setting train/eval mode).
+        """
 
-            _cur = {k: w.clone() for k, w in mdl.state_dict().items()}
-            mdl.load_state_dict(torch.load(ckpt, weights_only=True))
-            tracker.checkpoint(mdl, training_results={"history": hist})
-            mdl.load_state_dict(_cur)
+        Config = ModelConfig
+        TrainingConfigCls = TrainingConfig
 
-        mdl.load_state_dict(torch.load(ckpt, weights_only=True))
-        os.remove(ckpt)
-        return hist
+        def __init__(self, cfg=None, **kwargs):
+            super().__init__()
+            if cfg is None:
+                cfg = kwargs
+            if isinstance(cfg, dict):
+                cfg = ModelConfig.model_validate(cfg)
+            self.cfg = cfg
+            self.n_gaussians = cfg.n_gaussians
+            self.encoder = LSTMEncoder(
+                cfg.encoder_dim, cfg.hidden_dim, cfg.num_layers, cfg.dropout
+            )
+            layers = [
+                nn.Linear(cfg.hidden_dim + cfg.stim_dim, cfg.mlp_hidden),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+            ]
+            for _ in range(cfg.n_mlp_layers - 1):
+                layers += [
+                    nn.Linear(cfg.mlp_hidden, cfg.mlp_hidden),
+                    nn.GELU(),
+                    nn.Dropout(cfg.dropout),
+                ]
+            self.trunk = nn.Sequential(*layers)
+            self.head = MDNHead(cfg.mlp_hidden, cfg.n_gaussians)
 
-    _headless = "name" in mo.cli_args()
-    mo.stop(not _headless and not train_button.value, mo.md("Click **Start training** when ready."))
+        def _step(self, h_top, stim_i):
+            feats = self.trunk(torch.cat([h_top, stim_i], dim=-1))
+            return self.head(feats)
 
-    _exp_dir = mo.cli_args().get("results-dir", f"{results_base}/{EXPERIMENT_NAME}")
-    tracker = ExperimentTracker(
-        directory=_exp_dir,
-        name=EXPERIMENT_NAME,
-        model_config=_model_config,
-        training_config=config,
+        def forward(self, encoder_input, future_stim, targets=None, tf_ratio=0.0):
+            F = future_stim.shape[1]
+            current_window = encoder_input
+            pis, mus, sigmas = [], [], []
+            for i in range(F):
+                h, _ = self.encoder(current_window)
+                pi, mu, sigma = self._step(h[-1], future_stim[:, i, :])
+                pis.append(pi)
+                mus.append(mu)
+                sigmas.append(sigma)
+                if i < F - 1:
+                    last_abs = current_window[:, -1, 0:1]
+                    use_teacher = (
+                        targets is not None and torch.rand(1).item() < tf_ratio
+                    )
+                    if use_teacher:
+                        delta = targets[:, i : i + 1]
+                    else:
+                        delta = (pi * mu).sum(dim=-1, keepdim=True)
+                    next_cnr_abs = last_abs + delta
+                    next_input = torch.cat(
+                        [next_cnr_abs, future_stim[:, i, :]], dim=-1
+                    ).unsqueeze(1)
+                    current_window = torch.cat(
+                        [current_window[:, 1:, :], next_input], dim=1
+                    )
+            return (
+                torch.stack(pis, dim=1),
+                torch.stack(mus, dim=1),
+                torch.stack(sigmas, dim=1),
+            )
+
+        def point_pred(self, pi, mu):
+            return (pi * mu).sum(dim=-1)
+
+        def pred_std(self, pi, mu, sigma):
+            mean = (pi * mu).sum(dim=-1, keepdim=True)
+            var = (pi * (sigma**2 + (mu - mean) ** 2)).sum(dim=-1)
+            return torch.sqrt(var.clamp(min=1e-12))
+
+        def loss(self, preds, target):
+            pi, mu, sigma = preds
+            return mdn_nll(pi, mu, sigma, target)
+
+        @staticmethod
+        def fit(dataset, ctx):
+            """Self-contained training.
+
+            dataset: {"train": (cnr, stim), "val": (cnr, stim)} with numpy arrays
+                     shape (n_traj, T) and (n_traj, n_stim, T).
+            ctx: TrainContext with device, model_config, training_config,
+                 optional tracker and progress_cb.
+            Returns (trained_model, history_dict).
+            """
+            mcfg = ctx.model_config
+            tcfg = ctx.training_config
+
+            cnr_tr, stim_tr = dataset["train"]
+            cnr_va, stim_va = dataset["val"]
+
+            train_ds = Seq2SeqDataset(
+                cnr_tr, stim_tr, mcfg.history_len, mcfg.future_len, stride=15
+            )
+            val_ds = Seq2SeqDataset(
+                cnr_va, stim_va, mcfg.history_len, mcfg.future_len, stride=15
+            )
+            train_loader = DataLoader(
+                train_ds, batch_size=tcfg.batch_size, shuffle=True
+            )
+            val_loader = DataLoader(
+                val_ds, batch_size=tcfg.batch_size, shuffle=False
+            )
+
+            model = Seq2ScalarMDN(mcfg).to(ctx.device)
+            opt = torch.optim.Adam(
+                model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay
+            )
+            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, patience=10, factor=0.5
+            )
+            tf_fn = _tf_schedule_linear(tcfg, tcfg.epochs)
+
+            hist = {"train_loss": [], "val_loss": [], "tf_ratio": []}
+            ckpt_fd, ckpt = tempfile.mkstemp(suffix=".pt")
+            os.close(ckpt_fd)
+
+            best, wait = float("inf"), 0
+            for ep in range(tcfg.epochs):
+                tf_r = tf_fn(ep)
+                t = _run_epoch(
+                    model,
+                    train_loader,
+                    ctx.device,
+                    opt,
+                    tcfg.grad_clip,
+                    tf_r,
+                    True,
+                )
+                v = _run_epoch(
+                    model, val_loader, ctx.device, opt, tcfg.grad_clip, 0.0, False
+                )
+                hist["train_loss"].append(t)
+                hist["val_loss"].append(v)
+                hist["tf_ratio"].append(tf_r)
+                sched.step(v)
+                if v < best:
+                    best, wait = v, 0
+                    torch.save(model.state_dict(), ckpt)
+                else:
+                    wait += 1
+                    if wait >= tcfg.patience:
+                        print(f"Early stopping at epoch {ep}")
+                        break
+                if ep % ctx.print_every == 0:
+                    print(f"Epoch {ep:3d} | tf={tf_r:.2f} T:{t:.5f} V:{v:.5f}")
+                if ctx.progress_cb is not None:
+                    ctx.progress_cb(
+                        ep, tcfg.epochs, {"train": t, "val": v, "tf": tf_r}
+                    )
+                if ctx.tracker is not None:
+                    _cur = {k: w.clone() for k, w in model.state_dict().items()}
+                    model.load_state_dict(torch.load(ckpt, weights_only=True))
+                    ctx.tracker.checkpoint(
+                        model, training_results={"history": hist}
+                    )
+                    model.load_state_dict(_cur)
+
+            model.load_state_dict(torch.load(ckpt, weights_only=True))
+            os.remove(ckpt)
+            return model, hist
+
+
+@app.cell
+def _():
+    import marimo as mo
+    import polars as pl
+    from hastyplot import qplot
+
+    from experiment import load_experiment, compute_training_stats
+    from utils import (
+        get_device,
+        get_username,
+        running_on_cluster,
+        results_write_path,
+        parse_bool,
+        experiment_mode_widget,
+        experiment_mode_state,
     )
-    tracker.register_start()
+    from experiments.seq2seq_data import (
+        load as load_dataset,
+        AVAILABLE_DATASETS,
+        STIM_COLS,
+    )
 
-    _t0 = time.time()
-    history = train_model(model, train_loader, val_loader, config, device, tracker)
-    train_elapsed = time.time() - _t0
+    device = get_device()
+    n_stim = len(STIM_COLS)
+    hostname = get_username()
+    is_cluster = running_on_cluster()
+    results_base = results_write_path()
+    repo_root = Path(__file__).resolve().parent.parent
+    return (
+        AVAILABLE_DATASETS,
+        compute_training_stats,
+        device,
+        experiment_mode_state,
+        experiment_mode_widget,
+        hostname,
+        is_cluster,
+        load_dataset,
+        load_experiment,
+        mo,
+        n_stim,
+        parse_bool,
+        pl,
+        qplot,
+        repo_root,
+        results_base,
+    )
+
+
+@app.cell
+def _(experiment_mode_widget, mo, repo_root):
+    mode_widget, mode_ctx = experiment_mode_widget(
+        mo, "lstm_seq2scal_mdn", repo_root
+    )
+    mode_widget
+    return (mode_ctx,)
+
+
+@app.cell
+def _(experiment_mode_state, mo, mode_ctx):
+    load_widget, mode = experiment_mode_state(mo, mode_ctx)
+    load_widget
+    return (mode,)
+
+
+@app.cell
+def _(AVAILABLE_DATASETS, mo, mode, parse_bool):
+    IS_HEADLESS = "name" in mo.cli_args()
+    _args = mo.cli_args()
+
+    EXPERIMENT_NAME = _args.get("name", "lstm_seq2scal_mdn")
+    DRY_RUN = parse_bool(_args.get("dry_run", True))
+
+
+    def _ui_from_pydantic(model_cls, skip=(), overrides=None):
+        overrides = overrides or {}
+        fields = {}
+        for name, info in model_cls.model_fields.items():
+            if name in skip:
+                continue
+            if name in overrides:
+                fields[name] = overrides[name]
+                continue
+            ann = info.annotation
+            default = info.default if info.default is not None else None
+            if ann is bool:
+                fields[name] = mo.ui.checkbox(
+                    label=name,
+                    value=bool(default) if default is not None else False,
+                )
+            elif ann is int:
+                fields[name] = mo.ui.number(
+                    label=name,
+                    value=int(default) if default is not None else 0,
+                    step=1,
+                )
+            elif ann is float:
+                fields[name] = mo.ui.number(
+                    label=name,
+                    value=float(default) if default is not None else 0.0,
+                    step=0.0001,
+                )
+            elif ann is str:
+                fields[name] = mo.ui.text(
+                    label=name, value=str(default) if default is not None else ""
+                )
+            else:
+                fields[name] = mo.ui.text(
+                    label=name, value="" if default is None else str(default)
+                )
+        return fields
+
+
+    if (not IS_HEADLESS) and (not mode.is_load):
+        _mc_ui = _ui_from_pydantic(
+            ModelConfig,
+            skip={"encoder_dim", "stim_dim", "variant"},
+            overrides={
+                "data_source": mo.ui.dropdown(
+                    options=list(AVAILABLE_DATASETS),
+                    value="synthetic",
+                    label="data_source",
+                ),
+                "mlp_hidden": mo.ui.text(
+                    label="mlp_hidden (blank = hidden_dim)", value=""
+                ),
+            },
+        )
+        _tc_ui = _ui_from_pydantic(TrainingConfig)
+        form = mo.ui.form(
+            mo.ui.dictionary(
+                {
+                    **{f"m.{k}": v for k, v in _mc_ui.items()},
+                    **{f"t.{k}": v for k, v in _tc_ui.items()},
+                }
+            ),
+            label="Experiment config (pydantic-validated on submit)",
+            submit_button_label="Apply",
+        )
+    else:
+        form = None
+
+    form if form is not None else mo.md("")
+    return DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, form
+
+
+@app.cell(hide_code=True)
+def _(DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, form, mo, mode, n_stim):
+    if IS_HEADLESS:
+        _args = mo.cli_args()
+        data_source = _args.get("source", "synthetic")
+        _mc_from_cli = {
+            k: _args[k] for k in ModelConfig.model_fields if k in _args
+        }
+        _mc_from_cli = {
+            "encoder_dim": 1 + n_stim,
+            "stim_dim": n_stim,
+            "data_source": data_source,
+            **_mc_from_cli,
+        }
+        for k in (
+            "hidden_dim",
+            "num_layers",
+            "n_gaussians",
+            "n_mlp_layers",
+            "history_len",
+            "future_len",
+        ):
+            if k in _mc_from_cli:
+                _mc_from_cli[k] = int(_mc_from_cli[k])
+        if "mlp_hidden" in _mc_from_cli and _mc_from_cli["mlp_hidden"] not in (
+            None,
+            "",
+            "None",
+        ):
+            _mc_from_cli["mlp_hidden"] = int(_mc_from_cli["mlp_hidden"])
+        elif "mlp_hidden" in _mc_from_cli:
+            _mc_from_cli["mlp_hidden"] = None
+        if "dropout" in _mc_from_cli:
+            _mc_from_cli["dropout"] = float(_mc_from_cli["dropout"])
+        model_config = ModelConfig.model_validate(_mc_from_cli)
+
+        _tc_from_cli = {
+            k: _args[k] for k in TrainingConfig.model_fields if k in _args
+        }
+        for k in ("epochs", "batch_size", "patience"):
+            if k in _tc_from_cli:
+                _tc_from_cli[k] = int(_tc_from_cli[k])
+        for k in (
+            "lr",
+            "weight_decay",
+            "tf_ratio_start",
+            "tf_ratio_end",
+            "tf_anneal_frac",
+            "tf_hold_frac",
+            "grad_clip",
+        ):
+            if k in _tc_from_cli:
+                _tc_from_cli[k] = float(_tc_from_cli[k])
+        training_config = TrainingConfig.model_validate(_tc_from_cli)
+        ctx_display = mo.md(
+            f"**Headless mode** — experiment `{EXPERIMENT_NAME}` · dry_run={DRY_RUN}"
+        )
+    elif mode.is_load:
+        data_source = "synthetic"
+        model_config = None
+        training_config = None
+        ctx_display = mo.md(
+            "**Load mode** — pick an experiment above and click **Load**. Config will come from the bundle."
+        )
+    else:
+        mo.stop(
+            form.value is None,
+            mo.md("Fill in the form above and click **Apply**."),
+        )
+        _m_vals = {
+            k.removeprefix("m."): v
+            for k, v in form.value.items()
+            if k.startswith("m.")
+        }
+        _t_vals = {
+            k.removeprefix("t."): v
+            for k, v in form.value.items()
+            if k.startswith("t.")
+        }
+        if _m_vals.get("mlp_hidden", "") in ("", None):
+            _m_vals["mlp_hidden"] = None
+        else:
+            _m_vals["mlp_hidden"] = int(_m_vals["mlp_hidden"])
+        _m_vals["encoder_dim"] = 1 + n_stim
+        _m_vals["stim_dim"] = n_stim
+        model_config = ModelConfig.model_validate(_m_vals)
+        training_config = TrainingConfig.model_validate(_t_vals)
+        data_source = model_config.data_source
+        ctx_display = mo.md(
+            f"**Interactive train** — `{EXPERIMENT_NAME}` · source `{data_source}` · pydantic-validated ✓"
+        )
+
+    ctx_display
+    return data_source, model_config, training_config
+
+
+@app.cell
+def _(DRY_RUN, data_source, load_dataset, mo):
+    if data_source == "real":
+        _total_window_guess = 30 + 5
+        cnr_all, stim_all, conditions_all = load_dataset(
+            "real",
+            window_size=_total_window_guess,
+            stride=max(1, _total_window_guess // 4),
+        )
+    else:
+        cnr_all, stim_all, conditions_all = load_dataset(data_source)
+
+    n_traj = len(cnr_all)
+    traj_len = cnr_all.shape[1]
+
+    _traj_ids = np.arange(n_traj)
+    _tr_ids, _te_ids = train_test_split(_traj_ids, test_size=0.2, random_state=42)
+    _tr_ids, _va_ids = train_test_split(_tr_ids, test_size=0.125, random_state=42)
+
+    if DRY_RUN:
+        _tr_ids = _tr_ids[: min(len(_tr_ids), 800)]
+        _va_ids = _va_ids[: min(len(_va_ids), 200)]
+        _te_ids = _te_ids[: min(len(_te_ids), 200)]
+
+    cnr_tr, stim_tr = cnr_all[_tr_ids], stim_all[_tr_ids]
+    cnr_va, stim_va = cnr_all[_va_ids], stim_all[_va_ids]
+    cnr_te, stim_te = cnr_all[_te_ids], stim_all[_te_ids]
 
     mo.md(f"""
-    **Training complete** in {train_elapsed:.0f}s — {len(history['train_loss'])} epochs
+    **Data:** {n_traj} trajectories × {traj_len} timepoints (`{data_source}`)
 
-    Final train NLL: {history['train_loss'][-1]:.4f}  |  Final val NLL: {history['val_loss'][-1]:.4f}
+    Splits: train={len(_tr_ids)} | val={len(_va_ids)} | test={len(_te_ids)} · dry_run={DRY_RUN}
     """)
-    return history, tracker, train_elapsed
+    return cnr_te, cnr_tr, cnr_va, stim_te, stim_tr, stim_va
+
+
+@app.cell(hide_code=True)
+def _(IS_HEADLESS, mo, mode):
+    if (not IS_HEADLESS) and (not mode.is_load):
+        train_button = mo.ui.run_button(label="Start training")
+    else:
+        train_button = None
+
+    train_button if train_button is not None else mo.md("")
+    return (train_button,)
+
+
+@app.cell
+def _(
+    EXPERIMENT_NAME,
+    IS_HEADLESS,
+    cnr_tr,
+    cnr_va,
+    data_source,
+    device,
+    load_experiment,
+    mo,
+    mode,
+    model_config,
+    results_base,
+    stim_tr,
+    stim_va,
+    train_button,
+    training_config,
+):
+    if IS_HEADLESS:
+        _model_config = ModelConfig.model_validate(
+            {
+                **model_config.model_dump(),
+                "data_source": data_source,
+            }
+        )
+        _exp_dir = mo.cli_args().get(
+            "results-dir", f"{results_base}/{EXPERIMENT_NAME}"
+        )
+        tracker = ExperimentTracker(
+            directory=_exp_dir,
+            name=EXPERIMENT_NAME,
+            model_config=_model_config.model_dump(),
+            training_config=training_config.model_dump(),
+        )
+        tracker.register_start()
+        _t0 = time.time()
+        model, history = Seq2ScalarMDN.fit(
+            {"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
+            TrainContext(
+                device=device,
+                model_config=_model_config,
+                training_config=training_config,
+                tracker=tracker,
+            ),
+        )
+        train_elapsed = time.time() - _t0
+        model_config_used = _model_config
+        _model_display = mo.md(
+            f"**Training complete** in {train_elapsed:.0f}s · {len(history['train_loss'])} epochs"
+        )
+    elif mode.is_load:
+        mo.stop(
+            mode.selected_experiment_path is None or not mode.load_button_clicked,
+            mo.md("Pick an experiment above and click **Load**."),
+        )
+        bundle = load_experiment(str(mode.selected_experiment_path))
+        model = bundle.reconstruct_model().to(device)
+        history = bundle.training_results.get(
+            "history", {"train_loss": [], "val_loss": [], "tf_ratio": []}
+        )
+        train_elapsed = bundle.training_results.get("train_elapsed_s", 0.0)
+        tracker = None
+        model_config_used = ModelConfig.model_validate(bundle.model_config)
+        _model_display = mo.md(f"**Loaded** · `{mode.selected_experiment_path}`")
+    else:
+        mo.stop(
+            not train_button.value, mo.md("Click **Start training** when ready.")
+        )
+        _model_config = ModelConfig.model_validate(
+            {
+                **model_config.model_dump(),
+                "data_source": data_source,
+            }
+        )
+        tracker = ExperimentTracker(
+            directory=f"{results_base}/{EXPERIMENT_NAME}",
+            name=EXPERIMENT_NAME,
+            model_config=_model_config.model_dump(),
+            training_config=training_config.model_dump(),
+        )
+        tracker.register_start()
+        _t0 = time.time()
+        with mo.status.progress_bar(total=training_config.epochs) as _bar:
+
+            def _progress_cb(_ep, _total, _m):
+                _bar.update(increment=1, subtitle=f"val={_m['val']:.4f}")
+
+            model, history = Seq2ScalarMDN.fit(
+                {"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
+                TrainContext(
+                    device=device,
+                    model_config=_model_config,
+                    training_config=training_config,
+                    tracker=tracker,
+                    progress_cb=_progress_cb,
+                ),
+            )
+        train_elapsed = time.time() - _t0
+        model_config_used = _model_config
+        _model_display = mo.md(
+            f"**Training complete** in {train_elapsed:.0f}s · {len(history['train_loss'])} epochs"
+        )
+
+    _model_display
+    return history, model, model_config_used, tracker, train_elapsed
+
+
+@app.cell
+def _(cnr_te, data_source, load_dataset, mo, mode, model_config_used, stim_te):
+    H = model_config_used.history_len
+    F_ = model_config_used.future_len
+
+    if mode.is_load and model_config_used.data_source != data_source:
+        _ds_for_test = model_config_used.data_source
+        if _ds_for_test == "real":
+            _tw = H + F_
+            _cnr_ld, _stim_ld, _ = load_dataset(
+                "real", window_size=_tw, stride=max(1, _tw // 4)
+            )
+        else:
+            _cnr_ld, _stim_ld, _ = load_dataset(_ds_for_test)
+        _ids = np.arange(len(_cnr_ld))
+        _tr, _te = train_test_split(_ids, test_size=0.2, random_state=42)
+        cnr_te_used, stim_te_used = _cnr_ld[_te], _stim_ld[_te]
+    else:
+        cnr_te_used, stim_te_used = cnr_te, stim_te
+
+    test_ds = Seq2SeqDataset(cnr_te_used, stim_te_used, H, F_, stride=15)
+
+    mo.md(
+        f"Test windows: {len(test_ds)} (H={H}, F={F_}, source=`{model_config_used.data_source}`)"
+    )
+    return F_, H, test_ds
 
 
 @app.cell
@@ -551,7 +821,7 @@ def _(history, pl, qplot):
 
 
 @app.cell
-def _(DataLoader, device, model, np, test_ds):
+def _(device, model, test_ds):
     """Collect full-test-set MDN outputs + derived point pred / std."""
     _last, _act, _pi_all, _mu_all, _sig_all, _stim_all = [], [], [], [], [], []
     model.eval()
@@ -583,7 +853,7 @@ def _(DataLoader, device, model, np, test_ds):
 
 
 @app.cell
-def _(F_, np, pl, qplot, test_act, test_point, test_std):
+def _(F_, pl, qplot, test_act, test_point, test_std):
     """Per-step residual + uncertainty stats."""
     per_step = pl.DataFrame({
         "step": np.repeat(np.arange(1, F_ + 1), test_act.shape[0]),
@@ -602,7 +872,7 @@ def _(F_, np, pl, qplot, test_act, test_point, test_std):
 
 
 @app.cell
-def _(F_, np, pl, qplot, test_std):
+def _(F_, pl, qplot, test_std):
     std_df = pl.DataFrame({
         "step": np.repeat(np.arange(1, F_ + 1), test_std.shape[0]),
         "pred_std": test_std.flatten(order="F"),
@@ -614,7 +884,7 @@ def _(F_, np, pl, qplot, test_std):
 
 
 @app.cell
-def _(F_, H, device, mo, model, np, pl, qplot, test_ds):
+def _(F_, H, device, mo, model, pl, qplot, test_ds):
     """Sample trajectories with uncertainty band."""
     _n = 8
     _idx_arr = np.linspace(0, len(test_ds) - 1, _n, dtype=int)
@@ -658,7 +928,7 @@ def _(F_, H, device, mo, model, np, pl, qplot, test_ds):
 
 
 @app.cell
-def _(F_, np, pl, qplot, test_act, test_point, test_std):
+def _(F_, pl, qplot, test_act, test_point, test_std):
     """Calibration: fraction of residuals within ±k·σ."""
     _abs_resid = np.abs(test_act - test_point)
     _rows_cal = []
@@ -677,7 +947,7 @@ def _(F_, np, pl, qplot, test_act, test_point, test_std):
 
 
 @app.cell
-def _(mo, np, test_act, test_point, test_std):
+def _(mo, test_act, test_point, test_std):
     _mse = float(np.mean((test_act - test_point) ** 2))
     _mae = float(np.mean(np.abs(test_act - test_point)))
     _nll_proxy = float(np.mean(0.5 * ((test_act - test_point) / test_std) ** 2 + np.log(test_std)))
@@ -710,7 +980,7 @@ def _(mo, test_ds):
 
 
 @app.cell
-def _(F_, H, device, mo, model, np, pl, test_ds, traj_selector):
+def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
     import altair as _alt
 
     _N_MC = 200
@@ -856,7 +1126,7 @@ def _(traj_selector):
 
 
 @app.cell(hide_code=True)
-def _(F_, H, device, mo, model, np, pl, test_ds, traj_selector):
+def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
     import altair as _alt
 
     _idx_k = traj_selector.value
@@ -1167,8 +1437,24 @@ def _(F_, H, device, mo, model, np, pl, test_ds, traj_selector):
     return
 
 
+@app.cell(hide_code=True)
+def _(IS_HEADLESS, mo, tracker):
+    if (not IS_HEADLESS) and tracker is not None:
+        save_all_button = mo.ui.run_button(
+            label="Save experiment (model + figures + stats)"
+        )
+    else:
+        save_all_button = None
+
+    save_all_button if save_all_button is not None else mo.md("")
+    return (save_all_button,)
+
+
 @app.cell
 def _(
+    IS_HEADLESS,
+    cnr_tr,
+    cnr_va,
     compute_training_stats,
     eval_metrics,
     fig_calib,
@@ -1182,19 +1468,10 @@ def _(
     is_cluster,
     mo,
     model,
+    save_all_button,
     tracker,
     train_elapsed,
-    train_loader,
-    val_loader,
 ):
-    _stats = compute_training_stats(
-        train_elapsed_s=train_elapsed,
-        history=history,
-        n_train_samples=len(train_loader.dataset),
-        n_val_samples=len(val_loader.dataset),
-        model=model,
-    )
-
     _figures = {
         "loss_curves": fig_loss,
         "tf_schedule": fig_tf,
@@ -1204,15 +1481,45 @@ def _(
         "coverage": fig_calib,
     }
 
-    _bundle = tracker.save_final(
-        model=model,
-        training_results={"history": history, "train_elapsed_s": train_elapsed, "stats": _stats},
-        metrics=eval_metrics,
-        figures=_figures,
-    )
+    if tracker is None:
+        _save_display = mo.md(
+            "**Load mode** — nothing to save. (Viz rendered from loaded bundle.)"
+        )
+    else:
+        _stats = compute_training_stats(
+            train_elapsed_s=train_elapsed,
+            history=history,
+            n_train_samples=len(cnr_tr),
+            n_val_samples=len(cnr_va),
+            model=model,
+        )
+        _payload = dict(
+            model=model,
+            training_results={
+                "history": history,
+                "train_elapsed_s": train_elapsed,
+                "stats": _stats,
+            },
+            metrics=eval_metrics,
+            figures=_figures,
+        )
+        if IS_HEADLESS:
+            _bundle = tracker.save_final(**_payload)
+            _env = (
+                f"**Cluster** (`{hostname}`)"
+                if is_cluster
+                else f"**Local** (`{hostname}`)"
+            )
+            _save_display = mo.md(f"**Saved** on {_env}\n\n`{_bundle.save_dir}`")
+        else:
+            mo.stop(
+                not save_all_button.value,
+                mo.md("Click **Save experiment** to persist."),
+            )
+            _bundle = tracker.save_final(**_payload)
+            _save_display = mo.md(f"**Saved** → `{_bundle.save_dir}`")
 
-    _env = f"**Cluster** (`{hostname}`)" if is_cluster else f"**Local** (`{hostname}`)"
-    mo.md(f"**Saved** on {_env}\n\n`{_bundle.save_dir}`")
+    _save_display
     return
 
 
