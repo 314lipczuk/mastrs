@@ -25,6 +25,7 @@ with app.setup:
     from pydantic import BaseModel, Field, ConfigDict, model_validator
 
     from experiment import ExperimentTracker
+    from experiments.scaffold import TrainContext
 
 
     def _init_forget_bias(lstm):
@@ -111,16 +112,6 @@ with app.setup:
         tf_anneal_frac: float = 0.5
         tf_hold_frac: float = 0.3
         grad_clip: float = 1.0
-
-
-    @dataclass
-    class TrainContext:
-        device: torch.device
-        model_config: ModelConfig
-        training_config: TrainingConfig
-        tracker: "ExperimentTracker | None" = None
-        progress_cb: "Callable[[int, int, dict], None] | None" = None
-        print_every: int = 20
 
 
     class Seq2SeqDataset(Dataset):
@@ -378,7 +369,7 @@ def _():
     import polars as pl
     from hastyplot import qplot
 
-    from experiment import load_experiment, compute_training_stats
+    from experiment import load_experiment
     from utils import (
         get_device,
         get_username,
@@ -393,6 +384,13 @@ def _():
         AVAILABLE_DATASETS,
         STIM_COLS,
     )
+    from experiments.scaffold import (
+        form_from_configs,
+        configs_from_cli,
+        configs_from_form,
+        run_training,
+        save_bundle,
+    )
 
     device = get_device()
     n_stim = len(STIM_COLS)
@@ -402,14 +400,15 @@ def _():
     repo_root = Path(__file__).resolve().parent.parent
     return (
         AVAILABLE_DATASETS,
-        compute_training_stats,
+        configs_from_cli,
+        configs_from_form,
         device,
         experiment_mode_state,
         experiment_mode_widget,
+        form_from_configs,
         hostname,
         is_cluster,
         load_dataset,
-        load_experiment,
         mo,
         n_stim,
         parse_bool,
@@ -417,6 +416,8 @@ def _():
         qplot,
         repo_root,
         results_base,
+        run_training,
+        save_bundle,
     )
 
 
@@ -437,78 +438,17 @@ def _(experiment_mode_state, mo, mode_ctx):
 
 
 @app.cell
-def _(AVAILABLE_DATASETS, mo, mode, parse_bool):
+def _(AVAILABLE_DATASETS, form_from_configs, mo, mode, parse_bool):
     IS_HEADLESS = "name" in mo.cli_args()
-    _args = mo.cli_args()
-
-    EXPERIMENT_NAME = _args.get("name", "lstm_seq2scal_mdn")
-    DRY_RUN = parse_bool(_args.get("dry_run", True))
-
-
-    def _ui_from_pydantic(model_cls, skip=(), overrides=None):
-        overrides = overrides or {}
-        fields = {}
-        for name, info in model_cls.model_fields.items():
-            if name in skip:
-                continue
-            if name in overrides:
-                fields[name] = overrides[name]
-                continue
-            ann = info.annotation
-            default = info.default if info.default is not None else None
-            if ann is bool:
-                fields[name] = mo.ui.checkbox(
-                    label=name,
-                    value=bool(default) if default is not None else False,
-                )
-            elif ann is int:
-                fields[name] = mo.ui.number(
-                    label=name,
-                    value=int(default) if default is not None else 0,
-                    step=1,
-                )
-            elif ann is float:
-                fields[name] = mo.ui.number(
-                    label=name,
-                    value=float(default) if default is not None else 0.0,
-                    step=0.0001,
-                )
-            elif ann is str:
-                fields[name] = mo.ui.text(
-                    label=name, value=str(default) if default is not None else ""
-                )
-            else:
-                fields[name] = mo.ui.text(
-                    label=name, value="" if default is None else str(default)
-                )
-        return fields
-
+    EXPERIMENT_NAME = mo.cli_args().get("name", "lstm_seq2scal_mdn")
+    DRY_RUN = parse_bool(mo.cli_args().get("dry_run", True))
 
     if (not IS_HEADLESS) and (not mode.is_load):
-        _mc_ui = _ui_from_pydantic(
-            ModelConfig,
-            skip={"encoder_dim", "stim_dim", "variant"},
-            overrides={
-                "data_source": mo.ui.dropdown(
-                    options=list(AVAILABLE_DATASETS),
-                    value="synthetic",
-                    label="data_source",
-                ),
-                "mlp_hidden": mo.ui.text(
-                    label="mlp_hidden (blank = hidden_dim)", value=""
-                ),
-            },
-        )
-        _tc_ui = _ui_from_pydantic(TrainingConfig)
-        form = mo.ui.form(
-            mo.ui.dictionary(
-                {
-                    **{f"m.{k}": v for k, v in _mc_ui.items()},
-                    **{f"t.{k}": v for k, v in _tc_ui.items()},
-                }
-            ),
-            label="Experiment config (pydantic-validated on submit)",
-            submit_button_label="Apply",
+        form = form_from_configs(
+            mo,
+            {"m": ModelConfig, "t": TrainingConfig},
+            skip={"m": {"encoder_dim", "stim_dim", "variant"}},
+            radio_choices={"m": {"data_source": AVAILABLE_DATASETS}},
         )
     else:
         form = None
@@ -518,61 +458,27 @@ def _(AVAILABLE_DATASETS, mo, mode, parse_bool):
 
 
 @app.cell(hide_code=True)
-def _(DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, form, mo, mode, n_stim):
-    if IS_HEADLESS:
-        _args = mo.cli_args()
-        data_source = _args.get("source", "synthetic")
-        _mc_from_cli = {
-            k: _args[k] for k in ModelConfig.model_fields if k in _args
-        }
-        _mc_from_cli = {
-            "encoder_dim": 1 + n_stim,
-            "stim_dim": n_stim,
-            "data_source": data_source,
-            **_mc_from_cli,
-        }
-        for k in (
-            "hidden_dim",
-            "num_layers",
-            "n_gaussians",
-            "n_mlp_layers",
-            "history_len",
-            "future_len",
-        ):
-            if k in _mc_from_cli:
-                _mc_from_cli[k] = int(_mc_from_cli[k])
-        if "mlp_hidden" in _mc_from_cli and _mc_from_cli["mlp_hidden"] not in (
-            None,
-            "",
-            "None",
-        ):
-            _mc_from_cli["mlp_hidden"] = int(_mc_from_cli["mlp_hidden"])
-        elif "mlp_hidden" in _mc_from_cli:
-            _mc_from_cli["mlp_hidden"] = None
-        if "dropout" in _mc_from_cli:
-            _mc_from_cli["dropout"] = float(_mc_from_cli["dropout"])
-        model_config = ModelConfig.model_validate(_mc_from_cli)
+def _(
+    DRY_RUN,
+    EXPERIMENT_NAME,
+    IS_HEADLESS,
+    configs_from_cli,
+    configs_from_form,
+    form,
+    mo,
+    mode,
+    n_stim,
+):
+    _always = {"m": {"encoder_dim": 1 + n_stim, "stim_dim": n_stim}}
+    _config_classes = {"m": ModelConfig, "t": TrainingConfig}
 
-        _tc_from_cli = {
-            k: _args[k] for k in TrainingConfig.model_fields if k in _args
-        }
-        for k in ("epochs", "batch_size", "patience"):
-            if k in _tc_from_cli:
-                _tc_from_cli[k] = int(_tc_from_cli[k])
-        for k in (
-            "lr",
-            "weight_decay",
-            "tf_ratio_start",
-            "tf_ratio_end",
-            "tf_anneal_frac",
-            "tf_hold_frac",
-            "grad_clip",
-        ):
-            if k in _tc_from_cli:
-                _tc_from_cli[k] = float(_tc_from_cli[k])
-        training_config = TrainingConfig.model_validate(_tc_from_cli)
+    if IS_HEADLESS:
+        data_source = mo.cli_args().get("source", "synthetic")
+        _always["m"]["data_source"] = data_source
+        _cfgs = configs_from_cli(mo.cli_args(), _config_classes, always=_always)
+        model_config, training_config = _cfgs["m"], _cfgs["t"]
         ctx_display = mo.md(
-            f"**Headless mode** — experiment `{EXPERIMENT_NAME}` · dry_run={DRY_RUN}"
+            f"**Headless** — `{EXPERIMENT_NAME}` · source `{data_source}` · dry_run={DRY_RUN}"
         )
     elif mode.is_load:
         data_source = "synthetic"
@@ -586,27 +492,11 @@ def _(DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, form, mo, mode, n_stim):
             form.value is None,
             mo.md("Fill in the form above and click **Apply**."),
         )
-        _m_vals = {
-            k.removeprefix("m."): v
-            for k, v in form.value.items()
-            if k.startswith("m.")
-        }
-        _t_vals = {
-            k.removeprefix("t."): v
-            for k, v in form.value.items()
-            if k.startswith("t.")
-        }
-        if _m_vals.get("mlp_hidden", "") in ("", None):
-            _m_vals["mlp_hidden"] = None
-        else:
-            _m_vals["mlp_hidden"] = int(_m_vals["mlp_hidden"])
-        _m_vals["encoder_dim"] = 1 + n_stim
-        _m_vals["stim_dim"] = n_stim
-        model_config = ModelConfig.model_validate(_m_vals)
-        training_config = TrainingConfig.model_validate(_t_vals)
+        _cfgs = configs_from_form(form.value, _config_classes, always=_always)
+        model_config, training_config = _cfgs["m"], _cfgs["t"]
         data_source = model_config.data_source
         ctx_display = mo.md(
-            f"**Interactive train** — `{EXPERIMENT_NAME}` · source `{data_source}` · pydantic-validated ✓"
+            f"**Interactive train** — `{EXPERIMENT_NAME}` · source `{data_source}` · pydantic ✓"
         )
 
     ctx_display
@@ -666,105 +556,41 @@ def _(
     IS_HEADLESS,
     cnr_tr,
     cnr_va,
-    data_source,
     device,
-    load_experiment,
     mo,
     mode,
     model_config,
     results_base,
+    run_training,
     stim_tr,
     stim_va,
     train_button,
     training_config,
 ):
-    if IS_HEADLESS:
-        _model_config = ModelConfig.model_validate(
-            {
-                **model_config.model_dump(),
-                "data_source": data_source,
-            }
-        )
-        _exp_dir = mo.cli_args().get(
-            "results-dir", f"{results_base}/{EXPERIMENT_NAME}"
-        )
-        tracker = ExperimentTracker(
-            directory=_exp_dir,
-            name=EXPERIMENT_NAME,
-            model_config=_model_config.model_dump(),
-            training_config=training_config.model_dump(),
-        )
-        tracker.register_start()
-        _t0 = time.time()
-        model, history = Seq2ScalarMDN.fit(
-            {"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
-            TrainContext(
-                device=device,
-                model_config=_model_config,
-                training_config=training_config,
-                tracker=tracker,
-            ),
-        )
-        train_elapsed = time.time() - _t0
-        model_config_used = _model_config
-        _model_display = mo.md(
-            f"**Training complete** in {train_elapsed:.0f}s · {len(history['train_loss'])} epochs"
-        )
-    elif mode.is_load:
-        mo.stop(
-            mode.selected_experiment_path is None or not mode.load_button_clicked,
-            mo.md("Pick an experiment above and click **Load**."),
-        )
-        bundle = load_experiment(str(mode.selected_experiment_path))
-        model = bundle.reconstruct_model().to(device)
-        history = bundle.training_results.get(
-            "history", {"train_loss": [], "val_loss": [], "tf_ratio": []}
-        )
-        train_elapsed = bundle.training_results.get("train_elapsed_s", 0.0)
-        tracker = None
-        model_config_used = ModelConfig.model_validate(bundle.model_config)
-        _model_display = mo.md(f"**Loaded** · `{mode.selected_experiment_path}`")
-    else:
-        mo.stop(
-            not train_button.value, mo.md("Click **Start training** when ready.")
-        )
-        _model_config = ModelConfig.model_validate(
-            {
-                **model_config.model_dump(),
-                "data_source": data_source,
-            }
-        )
-        tracker = ExperimentTracker(
-            directory=f"{results_base}/{EXPERIMENT_NAME}",
-            name=EXPERIMENT_NAME,
-            model_config=_model_config.model_dump(),
-            training_config=training_config.model_dump(),
-        )
-        tracker.register_start()
-        _t0 = time.time()
-        with mo.status.progress_bar(total=training_config.epochs) as _bar:
+    artifacts = run_training(
+        mo=mo,
+        mode=mode,
+        is_headless=IS_HEADLESS,
+        experiment_name=EXPERIMENT_NAME,
+        results_base=results_base,
+        model_cls=Seq2ScalarMDN,
+        model_config_cls=ModelConfig,
+        dataset={"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
+        model_config=model_config,
+        training_config=training_config,
+        device=device,
+        train_button=train_button,
+    )
+    model = artifacts.model
+    history = artifacts.history
+    train_elapsed = artifacts.train_elapsed
+    tracker = artifacts.tracker
+    model_config_used = artifacts.model_config
 
-            def _progress_cb(_ep, _total, _m):
-                _bar.update(increment=1, subtitle=f"val={_m['val']:.4f}")
-
-            model, history = Seq2ScalarMDN.fit(
-                {"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
-                TrainContext(
-                    device=device,
-                    model_config=_model_config,
-                    training_config=training_config,
-                    tracker=tracker,
-                    progress_cb=_progress_cb,
-                ),
-            )
-        train_elapsed = time.time() - _t0
-        model_config_used = _model_config
-        _model_display = mo.md(
-            f"**Training complete** in {train_elapsed:.0f}s · {len(history['train_loss'])} epochs"
-        )
-
-    _model_display
-    return history, model, model_config_used, tracker, train_elapsed
+    mo.md(
+        f"**Run ready** · {type(model).__name__} · {sum(p.numel() for p in model.parameters()):,} params"
+    )
+    return artifacts, history, model, model_config_used, tracker
 
 
 @app.cell
@@ -1453,9 +1279,9 @@ def _(IS_HEADLESS, mo, tracker):
 @app.cell
 def _(
     IS_HEADLESS,
+    artifacts,
     cnr_tr,
     cnr_va,
-    compute_training_stats,
     eval_metrics,
     fig_calib,
     fig_loss,
@@ -1463,63 +1289,31 @@ def _(
     fig_std,
     fig_tf,
     fig_traj,
-    history,
     hostname,
     is_cluster,
     mo,
-    model,
     save_all_button,
-    tracker,
-    train_elapsed,
+    save_bundle,
 ):
-    _figures = {
-        "loss_curves": fig_loss,
-        "tf_schedule": fig_tf,
-        "residuals": fig_residuals,
-        "pred_std_by_step": fig_std,
-        "sample_trajectories": fig_traj,
-        "coverage": fig_calib,
-    }
-
-    if tracker is None:
-        _save_display = mo.md(
-            "**Load mode** — nothing to save. (Viz rendered from loaded bundle.)"
-        )
-    else:
-        _stats = compute_training_stats(
-            train_elapsed_s=train_elapsed,
-            history=history,
-            n_train_samples=len(cnr_tr),
-            n_val_samples=len(cnr_va),
-            model=model,
-        )
-        _payload = dict(
-            model=model,
-            training_results={
-                "history": history,
-                "train_elapsed_s": train_elapsed,
-                "stats": _stats,
-            },
-            metrics=eval_metrics,
-            figures=_figures,
-        )
-        if IS_HEADLESS:
-            _bundle = tracker.save_final(**_payload)
-            _env = (
-                f"**Cluster** (`{hostname}`)"
-                if is_cluster
-                else f"**Local** (`{hostname}`)"
-            )
-            _save_display = mo.md(f"**Saved** on {_env}\n\n`{_bundle.save_dir}`")
-        else:
-            mo.stop(
-                not save_all_button.value,
-                mo.md("Click **Save experiment** to persist."),
-            )
-            _bundle = tracker.save_final(**_payload)
-            _save_display = mo.md(f"**Saved** → `{_bundle.save_dir}`")
-
-    _save_display
+    save_bundle(
+        mo=mo,
+        is_headless=IS_HEADLESS,
+        artifacts=artifacts,
+        figures={
+            "loss_curves": fig_loss,
+            "tf_schedule": fig_tf,
+            "residuals": fig_residuals,
+            "pred_std_by_step": fig_std,
+            "sample_trajectories": fig_traj,
+            "coverage": fig_calib,
+        },
+        metrics=eval_metrics,
+        n_train=len(cnr_tr),
+        n_val=len(cnr_va),
+        save_button=save_all_button,
+        hostname=hostname,
+        is_cluster=is_cluster,
+    )
     return
 
 
