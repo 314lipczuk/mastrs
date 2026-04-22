@@ -112,6 +112,8 @@ with app.setup:
         tf_anneal_frac: float = 0.5
         tf_hold_frac: float = 0.3
         grad_clip: float = 1.0
+        train_stride: int = Field(5, ge=1)
+        test_stride: int = Field(10, ge=1)
 
 
     class Seq2SeqDataset(Dataset):
@@ -298,10 +300,18 @@ with app.setup:
             cnr_va, stim_va = dataset["val"]
 
             train_ds = Seq2SeqDataset(
-                cnr_tr, stim_tr, mcfg.history_len, mcfg.future_len, stride=15
+                cnr_tr,
+                stim_tr,
+                mcfg.history_len,
+                mcfg.future_len,
+                stride=tcfg.train_stride,
             )
             val_ds = Seq2SeqDataset(
-                cnr_va, stim_va, mcfg.history_len, mcfg.future_len, stride=15
+                cnr_va,
+                stim_va,
+                mcfg.history_len,
+                mcfg.future_len,
+                stride=tcfg.train_stride,
             )
             train_loader = DataLoader(
                 train_ds, batch_size=tcfg.batch_size, shuffle=True
@@ -720,7 +730,16 @@ def _(MODE, experiment_path, load_experiment, mo):
 
 
 @app.cell
-def _(MODE, cnr_te, data_source, load_dataset, mo, model_config_used, stim_te):
+def _(
+    MODE,
+    cnr_te,
+    data_source,
+    load_dataset,
+    mo,
+    model_config_used,
+    stim_te,
+    training_config,
+):
     H = model_config_used.history_len
     F_ = model_config_used.future_len
 
@@ -733,7 +752,12 @@ def _(MODE, cnr_te, data_source, load_dataset, mo, model_config_used, stim_te):
     else:
         cnr_te_used, stim_te_used = cnr_te, stim_te
 
-    test_ds = Seq2SeqDataset(cnr_te_used, stim_te_used, H, F_, stride=15)
+    _test_stride = (
+        training_config.test_stride
+        if training_config is not None and hasattr(training_config, "test_stride")
+        else 10
+    )
+    test_ds = Seq2SeqDataset(cnr_te_used, stim_te_used, H, F_, stride=_test_stride)
 
     mo.md(
         f"Test windows: {len(test_ds)} (H={H}, F={F_}, source=`{model_config_used.data_source}`)"
@@ -1518,6 +1542,425 @@ def _(device, mo, model, n_stim, pl, qplot, stim_col_names, test_ds):
         ]
     )
     return ablation_df, fig_ablation
+
+
+@app.cell
+def _(device, mo, model, n_stim, pl, test_ds):
+    from scipy.special import logsumexp as _logsumexp
+    from scipy.stats import norm as _norm
+
+
+    def _fwd(mod_enc, mod_stim):
+        _pi_l, _mu_l, _sig_l, _y_l = [], [], [], []
+        model.eval()
+        with torch.no_grad():
+            for _eb, _sb, _tb in DataLoader(test_ds, batch_size=512):
+                _eb = _eb.clone()
+                _sb = _sb.clone()
+                if mod_enc is not None:
+                    mod_enc(_eb)
+                if mod_stim is not None:
+                    mod_stim(_sb)
+                _pi, _mu, _sig = model(_eb.to(device), _sb.to(device))
+                _pi_l.append(_pi.cpu().numpy())
+                _mu_l.append(_mu.cpu().numpy())
+                _sig_l.append(_sig.cpu().numpy())
+                _y_l.append(_tb.numpy())
+        return tuple(np.concatenate(x) for x in (_pi_l, _mu_l, _sig_l, _y_l))
+
+
+    def _mix_metrics(pi, mu, sig, y):
+        y_ = y[..., None]
+        log_g = (
+            -0.5 * np.log(2 * np.pi) - np.log(sig) - 0.5 * ((y_ - mu) / sig) ** 2
+        )
+        nll = float(-_logsumexp(np.log(pi + 1e-12) + log_g, axis=-1).mean())
+        mean_exp = (pi * mu).sum(-1, keepdims=True)
+        sigma_eff = float(
+            np.sqrt((pi * (sig**2 + (mu - mean_exp) ** 2)).sum(-1)).mean()
+        )
+
+        def _A(u, s):
+            z = u / (s + 1e-12)
+            return u * (2 * _norm.cdf(z) - 1) + 2 * s * _norm.pdf(z)
+
+        t1 = (pi * _A(y_ - mu, sig)).sum(-1)
+        mu_j, mu_k = mu[..., :, None], mu[..., None, :]
+        sg_j, sg_k = sig[..., :, None], sig[..., None, :]
+        pi_jk = pi[..., :, None] * pi[..., None, :]
+        t2 = 0.5 * (pi_jk * _A(mu_j - mu_k, np.sqrt(sg_j**2 + sg_k**2))).sum(
+            axis=(-1, -2)
+        )
+        crps = float((t1 - t2).mean())
+        return nll, crps, sigma_eff
+
+
+    _pi0, _mu0, _sig0, _y0 = _fwd(None, None)
+    _b_nll, _b_crps, _b_sig = _mix_metrics(_pi0, _mu0, _sig0, _y0)
+
+
+    def _zero_enc_cnr(b):
+        b[..., 0] = 0.0
+
+
+    def _zero_enc_stim(b):
+        b[..., 1:] = 0.0
+
+
+    def _zero_dec_stim(b):
+        b[..., :] = 0.0
+
+
+    _rows = []
+    _pi, _mu, _sig, _y = _fwd(_zero_enc_cnr, None)
+    _nll, _crps, _se = _mix_metrics(_pi, _mu, _sig, _y)
+    _rows.append(
+        {
+            "variant": "cnr_only_zero",
+            "nll": _nll,
+            "crps": _crps,
+            "sigma": _se,
+            "d_nll": _nll - _b_nll,
+            "d_crps": _crps - _b_crps,
+            "sigma_ratio": _se / max(_b_sig, 1e-12),
+        }
+    )
+
+    _pi, _mu, _sig, _y = _fwd(_zero_enc_stim, _zero_dec_stim)
+    _nll, _crps, _se = _mix_metrics(_pi, _mu, _sig, _y)
+    _rows.append(
+        {
+            "variant": "all_stim_zero",
+            "nll": _nll,
+            "crps": _crps,
+            "sigma": _se,
+            "d_nll": _nll - _b_nll,
+            "d_crps": _crps - _b_crps,
+            "sigma_ratio": _se / max(_b_sig, 1e-12),
+        }
+    )
+
+    full_ablation_df = pl.DataFrame(_rows)
+
+    mo.vstack(
+        [
+            mo.md(f"""
+        ## Block ablations — CNR history vs all stim at once
+
+        Per-channel ablation above is noisy because stim channels are
+        correlated; zeroing one leaves redundant signal in others. These two
+        **block** ablations answer the blunt questions:
+
+        - **cnr_only_zero**: zero the CNR column in the encoder input
+          (stim channels untouched). ΔNLL near zero → model ignores
+          history. Large ΔNLL → model is primarily a CNR-autoregressor.
+        - **all_stim_zero**: zero every stim channel everywhere (encoder
+          history columns 1..{n_stim} AND decoder future stim). ΔNLL near
+          zero → stim features carry **no** information the model uses;
+          MPC infeasible with this model. Large ΔNLL → stim matters.
+
+        Baseline NLL = **{_b_nll:.4f}** · CRPS = **{_b_crps:.4f}** · σ_eff = {_b_sig:.4f}.
+        """),
+            full_ablation_df,
+        ]
+    )
+    return
+
+
+@app.cell
+def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
+    from scipy.special import logsumexp as _logsumexp
+
+    _N_WIN = min(500, len(test_ds))
+    _idx = np.linspace(0, len(test_ds) - 1, _N_WIN, dtype=int).tolist()
+    _subset = Subset(test_ds, _idx)
+
+    _stim_max_arr = np.zeros(n_stim, dtype=np.float32)
+    for _s in stim_te_used:
+        _stim_max_arr = np.maximum(_stim_max_arr, np.asarray(_s).max(axis=1))
+
+
+    def _run_cf(cond):
+        _pi_l, _mu_l, _sig_l, _y_l = [], [], [], []
+        model.eval()
+        with torch.no_grad():
+            for _eb, _sb, _tb in DataLoader(_subset, batch_size=256):
+                _sb = _sb.clone()
+                if cond == "on":
+                    _sb[:] = torch.tensor(_stim_max_arr).view(1, 1, n_stim)
+                elif cond == "off":
+                    _sb.zero_()
+                _pi, _mu, _sig = model(_eb.to(device), _sb.to(device))
+                _pi_l.append(_pi.cpu().numpy())
+                _mu_l.append(_mu.cpu().numpy())
+                _sig_l.append(_sig.cpu().numpy())
+                _y_l.append(_tb.numpy())
+        return tuple(np.concatenate(x) for x in (_pi_l, _mu_l, _sig_l, _y_l))
+
+
+    _pi_a, _mu_a, _sig_a, _y_cf = _run_cf("actual")
+    _pi_on, _mu_on, _sig_on, _ = _run_cf("on")
+    _pi_off, _mu_off, _sig_off, _ = _run_cf("off")
+
+    _pt_on = (_pi_on * _mu_on).sum(-1)
+    _pt_off = (_pi_off * _mu_off).sum(-1)
+
+    _pp_diff = np.abs(_pt_on - _pt_off)
+    _pp_mean = float(_pp_diff.mean())
+    _pp_per_step = _pp_diff.mean(axis=0)
+
+    _top_on = _pi_on.argmax(-1)
+    _top_off = _pi_off.argmax(-1)
+    _ix_n = np.arange(_pi_on.shape[0])[:, None]
+    _ix_f = np.arange(_pi_on.shape[1])[None, :]
+    _top_mu_on = _mu_on[_ix_n, _ix_f, _top_on]
+    _top_mu_off = _mu_off[_ix_n, _ix_f, _top_off]
+    _top_mu_diff = float(np.abs(_top_mu_on - _top_mu_off).mean())
+
+    _m = 0.5 * (_pi_on + _pi_off)
+    _js = 0.5 * (_pi_on * np.log((_pi_on + 1e-12) / (_m + 1e-12))).sum(
+        -1
+    ) + 0.5 * (_pi_off * np.log((_pi_off + 1e-12) / (_m + 1e-12))).sum(-1)
+    _js_mean = float(_js.mean())
+    _top_flip = float((_top_on != _top_off).mean())
+
+    _y_std = float(_y_cf.std())
+
+
+    def _nll_only(pi, mu, sig, y):
+        y_ = y[..., None]
+        log_g = (
+            -0.5 * np.log(2 * np.pi) - np.log(sig) - 0.5 * ((y_ - mu) / sig) ** 2
+        )
+        return float(-_logsumexp(np.log(pi + 1e-12) + log_g, axis=-1).mean())
+
+
+    _nll_a = _nll_only(_pi_a, _mu_a, _sig_a, _y_cf)
+    _nll_on = _nll_only(_pi_on, _mu_on, _sig_on, _y_cf)
+    _nll_off = _nll_only(_pi_off, _mu_off, _sig_off, _y_cf)
+
+    counterfactual_step_df = pl.DataFrame(
+        {
+            "step": np.arange(1, _pp_per_step.shape[0] + 1),
+            "mean_abs_point_diff": _pp_per_step.astype(float),
+        }
+    )
+    fig_counterfactual = qplot(
+        counterfactual_step_df,
+        "step",
+        "mean_abs_point_diff",
+        mark="bar",
+        title="Mean |point_on − point_off| per forecast step",
+        height=260,
+    )
+
+    counterfactual_summary = dict(
+        n_windows=int(_N_WIN),
+        mean_abs_point_diff_on_off=_pp_mean,
+        mean_abs_top_mu_diff_on_off=_top_mu_diff,
+        target_std=_y_std,
+        ratio_point_diff_over_std=_pp_mean / max(_y_std, 1e-12),
+        mean_js_pi_on_off=_js_mean,
+        frac_top_component_flips=_top_flip,
+        nll_actual=_nll_a,
+        nll_all_on=_nll_on,
+        nll_all_off=_nll_off,
+    )
+
+    mo.vstack(
+        [
+            mo.md(f"""
+        ## Counterfactual stimulation ({_N_WIN} test windows)
+
+        Swap the *future* stim (decoder input) between three settings and
+        compare predictions against a single fixed history. Encoder input
+        (true history) is identical across the three conditions.
+
+        - **actual**: real future stim from the test set.
+        - **all_on**: every future stim channel set to its per-channel
+          training-set max (so the model sees a "fully stimulated" future).
+        - **all_off**: future stim zeroed everywhere.
+
+        **The MPC viability question**. If swapping all-on ↔ all-off barely
+        moves the point prediction, the model isn't using stim to forecast.
+        A controller can't optimise a signal the model ignores — no matter
+        how calibrated the marginal uncertainty looks.
+
+        | metric | value |
+        |---|---:|
+        | Mean \|point_on − point_off\| (ΔCNR) | **{_pp_mean:.5f}** |
+        | Target std (ΔCNR) | {_y_std:.5f} |
+        | **Ratio — point diff / target std** | **{_pp_mean / max(_y_std, 1e-12):.3f}** |
+        | Mean \|top-component μ(on) − μ(off)\| | {_top_mu_diff:.5f} |
+        | Mean JS(π_on ‖ π_off) (nats) | {_js_mean:.4f} |
+        | Fraction of steps where top-π flips | {_top_flip:.3f} |
+        | NLL (actual stim) | {_nll_a:.4f} |
+        | NLL (all-on) | {_nll_on:.4f} |
+        | NLL (all-off) | {_nll_off:.4f} |
+
+        **Reading the ratio**: ≪ 1 → the model's mean prediction is
+        insensitive to stim, MPC is not viable with this model. ~1 or
+        larger → stim materially shifts forecasts, MPC is at least
+        plausible.
+
+        **Mixing-weight shift**: if JS(π_on, π_off) ≈ 0 and the top-π
+        component rarely flips, the model has **not** learned
+        stimulation-dependent mode assignment — the
+        responder/non-responder structure isn't encoded in π. A
+        stim-driven π shift (JS > 0, flip frac > 0) is direct evidence
+        the MDN uses the mixture to route inputs into stim-conditioned
+        regimes.
+        """),
+            fig_counterfactual,
+        ]
+    )
+    return
+
+
+@app.cell
+def _(F_, H, device, mo, model, n_stim, pl, stim_te_used, test_ds):
+    import altair as _alt
+
+    _N_GRID = 12
+    _idx_grid = np.linspace(0, len(test_ds) - 1, _N_GRID, dtype=int).tolist()
+
+    _stim_max_g = np.zeros(n_stim, dtype=np.float32)
+    for _s in stim_te_used:
+        _stim_max_g = np.maximum(_stim_max_g, np.asarray(_s).max(axis=1))
+    _stim_max_gt = torch.tensor(_stim_max_g).view(1, 1, n_stim)
+
+    _rows_g = []
+    model.eval()
+    with torch.no_grad():
+        for _wi in _idx_grid:
+            _enc_in, _dec_stim, _dec_target = test_ds[int(_wi)]
+            _enc_b = _enc_in.unsqueeze(0).to(device)
+            _s_act = _dec_stim.unsqueeze(0).to(device)
+            _s_on = _stim_max_gt.repeat(1, F_, 1).to(device)
+            _s_off = torch.zeros_like(_s_act)
+
+            _hist = _enc_in[:, 0].numpy()
+            _last_v = float(_hist[-1])
+            _act_abs = _last_v + np.cumsum(_dec_target.numpy())
+            for _t, _v in enumerate(_hist):
+                _rows_g.append(
+                    dict(window=int(_wi), t=int(_t), cnr=float(_v), cond="history")
+                )
+            for _t in range(F_):
+                _rows_g.append(
+                    dict(
+                        window=int(_wi),
+                        t=int(H + _t),
+                        cnr=float(_act_abs[_t]),
+                        cond="truth",
+                    )
+                )
+
+            for _name, _s in [
+                ("actual", _s_act),
+                ("all_on", _s_on),
+                ("all_off", _s_off),
+            ]:
+                _pi, _mu, _sig = model(_enc_b, _s)
+                _pi_np = _pi.cpu().numpy()[0]
+                _mu_np = _mu.cpu().numpy()[0]
+                _pt = (_pi_np * _mu_np).sum(-1)
+                _abs_pt = _last_v + np.cumsum(_pt)
+                _rows_g.append(
+                    dict(window=int(_wi), t=int(H - 1), cnr=_last_v, cond=_name)
+                )
+                for _t in range(F_):
+                    _rows_g.append(
+                        dict(
+                            window=int(_wi),
+                            t=int(H + _t),
+                            cnr=float(_abs_pt[_t]),
+                            cond=_name,
+                        )
+                    )
+
+    cf_grid_df = pl.DataFrame(_rows_g)
+
+    _colors_g = {
+        "history": "#2c3e50",
+        "truth": "#000000",
+        "actual": "#4C78A8",
+        "all_on": "#E45756",
+        "all_off": "#54A24B",
+    }
+    _dom_g = list(_colors_g.keys())
+    _rng_g = [_colors_g[k] for k in _dom_g]
+    _enc_cg = _alt.Color(
+        "cond:N",
+        scale=_alt.Scale(domain=_dom_g, range=_rng_g),
+        legend=_alt.Legend(title="series"),
+    )
+
+    _line_main = (
+        _alt.Chart()
+        .mark_line(strokeWidth=1.8)
+        .encode(
+            x=_alt.X("t:Q", title="t"),
+            y=_alt.Y("cnr:Q", title="CNR", scale=_alt.Scale(zero=False)),
+            color=_enc_cg,
+            detail="cond:N",
+            tooltip=["window", "cond", "t", "cnr"],
+        )
+        .transform_filter(_alt.datum.cond != "truth")
+    )
+
+    _line_truth = (
+        _alt.Chart()
+        .mark_line(strokeWidth=2, strokeDash=[4, 3])
+        .encode(
+            x="t:Q",
+            y="cnr:Q",
+            color=_enc_cg,
+            detail="cond:N",
+        )
+        .transform_filter(_alt.datum.cond == "truth")
+    )
+
+    _boundary_g = (
+        _alt.Chart(pl.DataFrame({"t": [H]}))
+        .mark_rule(
+            color="gray",
+            strokeDash=[2, 3],
+        )
+        .encode(x="t:Q")
+    )
+
+    fig_cf_grid = (
+        _alt.layer(_line_main, _line_truth, _boundary_g, data=cf_grid_df)
+        .properties(
+            width=220,
+            height=150,
+        )
+        .facet(facet=_alt.Facet("window:N", title=None), columns=4)
+        .properties(
+            title=f"Counterfactual future stim — {_N_GRID} sample windows (point predictions)",
+        )
+        .resolve_scale(y="independent")
+    )
+
+    mo.vstack(
+        [
+            mo.md(f"""
+        ## Counterfactual grid — quick orientation
+
+        {_N_GRID} test windows sampled uniformly. Each panel shows the same
+        history (dark blue) and truth-future (dashed black), with three
+        point-prediction rollouts overlaid: **actual** stim, **all-on**
+        stim, **all-off** stim.
+
+        Panels where the three coloured lines overlap → model ignores stim
+        for this input. Panels where all-on and all-off fan out →
+        stim-responsive windows.
+        """),
+            fig_cf_grid,
+        ]
+    )
+    return
 
 
 @app.cell
@@ -2409,6 +2852,190 @@ def _(
                 - **light stim** (amber strip at bottom): stim channel 0 — shape only, scaled to a band below the CNR data."""
             ),
             chart_components,
+        ]
+    )
+    return
+
+
+@app.cell
+def _(
+    F_,
+    H,
+    device,
+    mo,
+    model,
+    n_stim,
+    pl,
+    stim_te_used,
+    win_dec_stim,
+    win_dec_target,
+    win_enc_in,
+    win_label,
+):
+    import altair as _alt
+
+    _stim_max_w = np.zeros(n_stim, dtype=np.float32)
+    for _s in stim_te_used:
+        _stim_max_w = np.maximum(_stim_max_w, np.asarray(_s).max(axis=1))
+
+    _enc_w = win_enc_in.unsqueeze(0).to(device)
+    _stim_act = win_dec_stim.unsqueeze(0).to(device)
+    _stim_on = (
+        torch.tensor(_stim_max_w).view(1, 1, n_stim).repeat(1, F_, 1).to(device)
+    )
+    _stim_off = torch.zeros_like(_stim_act)
+
+    model.eval()
+    with torch.no_grad():
+        _cond_out = {}
+        for _name, _s in [
+            ("actual", _stim_act),
+            ("all_on", _stim_on),
+            ("all_off", _stim_off),
+        ]:
+            _pi, _mu, _sig = model(_enc_w, _s)
+            _pi_np = _pi.cpu().numpy()[0]
+            _mu_np = _mu.cpu().numpy()[0]
+            _sig_np = _sig.cpu().numpy()[0]
+            _pt = (_pi_np * _mu_np).sum(-1)
+            _std = np.sqrt(
+                (_pi_np * (_sig_np**2 + (_mu_np - _pt[:, None]) ** 2)).sum(-1)
+            )
+            _cond_out[_name] = (_pt, _std, _pi_np)
+
+    _hist_cnr = win_enc_in[:, 0].numpy()
+    _last = float(_hist_cnr[-1])
+    _act_abs = _last + np.cumsum(win_dec_target.numpy())
+
+    _rows = []
+    for _t, _v in enumerate(_hist_cnr):
+        _rows.append(
+            dict(
+                t=int(_t),
+                cnr=float(_v),
+                lo=float(_v),
+                hi=float(_v),
+                cond="history",
+            )
+        )
+    for _t in range(F_):
+        _rows.append(
+            dict(
+                t=int(H + _t),
+                cnr=float(_act_abs[_t]),
+                lo=float(_act_abs[_t]),
+                hi=float(_act_abs[_t]),
+                cond="truth",
+            )
+        )
+    for _name, (_pt, _std, _pi_np) in _cond_out.items():
+        _abs = _last + np.cumsum(_pt)
+        _std_abs = np.sqrt(np.cumsum(_std**2))
+        _rows.append(dict(t=int(H - 1), cnr=_last, lo=_last, hi=_last, cond=_name))
+        for _t in range(F_):
+            _rows.append(
+                dict(
+                    t=int(H + _t),
+                    cnr=float(_abs[_t]),
+                    lo=float(_abs[_t] - _std_abs[_t]),
+                    hi=float(_abs[_t] + _std_abs[_t]),
+                    cond=_name,
+                )
+            )
+    cf_win_df = pl.DataFrame(_rows)
+
+    _colors = {
+        "history": "#2c3e50",
+        "truth": "#000000",
+        "actual": "#4C78A8",
+        "all_on": "#E45756",
+        "all_off": "#54A24B",
+    }
+    _domain = list(_colors.keys())
+    _range = [_colors[k] for k in _domain]
+    _enc_c = _alt.Color(
+        "cond:N",
+        scale=_alt.Scale(domain=_domain, range=_range),
+        legend=_alt.Legend(title="series"),
+    )
+
+    _pred = cf_win_df.filter(pl.col("cond").is_in(["actual", "all_on", "all_off"]))
+    _band = (
+        _alt.Chart(_pred)
+        .mark_area(opacity=0.15)
+        .encode(
+            x=_alt.X("t:Q", title="timestep"),
+            y=_alt.Y("lo:Q", title="CNR"),
+            y2="hi:Q",
+            color=_enc_c,
+        )
+    )
+    _line = (
+        _alt.Chart(_pred)
+        .mark_line(strokeWidth=2.5)
+        .encode(
+            x="t:Q",
+            y="cnr:Q",
+            color=_enc_c,
+            tooltip=["cond", "t", "cnr"],
+        )
+    )
+    _hst = (
+        _alt.Chart(cf_win_df.filter(pl.col("cond") == "history"))
+        .mark_line(
+            strokeWidth=2.5,
+        )
+        .encode(x="t:Q", y="cnr:Q", color=_enc_c)
+    )
+    _tr = (
+        _alt.Chart(cf_win_df.filter(pl.col("cond") == "truth"))
+        .mark_line(
+            strokeWidth=2.5,
+            strokeDash=[4, 3],
+        )
+        .encode(x="t:Q", y="cnr:Q", color=_enc_c)
+    )
+    _b = (
+        _alt.Chart(pl.DataFrame({"t": [H]}))
+        .mark_rule(
+            color="gray",
+            strokeDash=[2, 3],
+        )
+        .encode(x="t:Q")
+    )
+
+    fig_cf_window = (
+        (_band + _line + _hst + _tr + _b)
+        .properties(
+            width=820,
+            height=380,
+            title=f"{win_label}: counterfactual future stim (actual / all-on / all-off)",
+        )
+        .interactive()
+    )
+
+    _pi_on_w = _cond_out["all_on"][2]
+    _pi_off_w = _cond_out["all_off"][2]
+    _pt_on_w, _pt_off_w = _cond_out["all_on"][0], _cond_out["all_off"][0]
+    _m_w = 0.5 * (_pi_on_w + _pi_off_w)
+    _js_w = 0.5 * (_pi_on_w * np.log((_pi_on_w + 1e-12) / (_m_w + 1e-12))).sum(
+        -1
+    ) + 0.5 * (_pi_off_w * np.log((_pi_off_w + 1e-12) / (_m_w + 1e-12))).sum(-1)
+    _pp_abs_w = float(np.abs(_pt_on_w - _pt_off_w).sum())
+
+    mo.vstack(
+        [
+            mo.md(f"""
+        **{win_label}** — counterfactual future stim.
+
+        - Σ \|point(on) − point(off)\| over F={F_} steps = **{_pp_abs_w:.5f}**
+        - Mean JS(π_on ‖ π_off) = **{_js_w.mean():.4f}**
+
+        If the three bands overlap almost completely the model has not
+        learned to respond to stim for this window. If they separate, this
+        window is informative for control.
+        """),
+            fig_cf_window,
         ]
     )
     return
