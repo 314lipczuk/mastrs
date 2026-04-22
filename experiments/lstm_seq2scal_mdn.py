@@ -375,9 +375,9 @@ def _():
         get_username,
         running_on_cluster,
         results_write_path,
+        results_read_sources,
         parse_bool,
-        experiment_mode_widget,
-        experiment_mode_state,
+        scan_experiment_dirs,
     )
     from experiments.seq2seq_data import (
         load as load_dataset,
@@ -388,7 +388,8 @@ def _():
         form_from_configs,
         configs_from_cli,
         configs_from_form,
-        run_training,
+        train_model,
+        load_model,
         save_bundle,
     )
 
@@ -403,12 +404,11 @@ def _():
         configs_from_cli,
         configs_from_form,
         device,
-        experiment_mode_state,
-        experiment_mode_widget,
         form_from_configs,
         hostname,
         is_cluster,
         load_dataset,
+        load_model,
         mo,
         n_stim,
         parse_bool,
@@ -416,34 +416,80 @@ def _():
         qplot,
         repo_root,
         results_base,
-        run_training,
+        results_read_sources,
         save_bundle,
+        scan_experiment_dirs,
+        train_model,
     )
 
 
-@app.cell
-def _(experiment_mode_widget, mo, repo_root):
-    mode_widget, mode_ctx = experiment_mode_widget(
-        mo, "lstm_seq2scal_mdn", repo_root
-    )
-    mode_widget
-    return (mode_ctx,)
-
-
-@app.cell
-def _(experiment_mode_state, mo, mode_ctx):
-    load_widget, mode = experiment_mode_state(mo, mode_ctx)
-    load_widget
-    return (mode,)
-
-
-@app.cell
-def _(AVAILABLE_DATASETS, form_from_configs, mo, mode, parse_bool):
+@app.cell(hide_code=True)
+def _(mo, parse_bool):
+    MODE = mo.cli_args().get("mode", "train")
     IS_HEADLESS = "name" in mo.cli_args()
     EXPERIMENT_NAME = mo.cli_args().get("name", "lstm_seq2scal_mdn")
     DRY_RUN = parse_bool(mo.cli_args().get("dry_run", True))
 
-    if (not IS_HEADLESS) and (not mode.is_load):
+    if MODE not in ("train", "load"):
+        raise ValueError(f"--mode must be 'train' or 'load', got {MODE!r}")
+
+    mo.md(f"**Mode:** `{MODE}` · **Headless:** `{IS_HEADLESS}` · **Experiment:** `{EXPERIMENT_NAME}`  · **Dry run :** `{DRY_RUN}` ")
+    return DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, MODE
+
+
+@app.cell
+def _(IS_HEADLESS, MODE, mo, repo_root, results_read_sources):
+    if MODE == "load" and not IS_HEADLESS:
+        _sources = results_read_sources(repo_root)
+        source_selector = mo.ui.dropdown(
+            options=list(_sources.keys()), value="Local", label="Results source",
+        )
+    else:
+        source_selector = None
+
+    source_selector if source_selector is not None else mo.md("")
+    return (source_selector,)
+
+
+@app.cell
+def _(
+    IS_HEADLESS,
+    MODE,
+    mo,
+    repo_root,
+    results_read_sources,
+    scan_experiment_dirs,
+    source_selector,
+):
+    if MODE == "load" and not IS_HEADLESS and source_selector is not None:
+        _src_name = source_selector.value
+        _src_root = Path(results_read_sources(repo_root)[_src_name]) #/ EXPERIMENT_NAME
+        _choices = scan_experiment_dirs(_src_root)
+        if _choices:
+            print(_choices)
+            experiment_picker = mo.ui.dropdown(
+                options=_choices, value=_choices[0], label="Experiment run",
+            )
+            load_button = mo.ui.button(
+                value=0, on_click=lambda n: n + 1, label="Load",
+            )
+            _picker_ui = mo.vstack([experiment_picker, load_button])
+        else:
+            experiment_picker = None
+            load_button = None
+            _picker_ui = mo.md(f"No experiments under `{_src_root}`.")
+    else:
+        experiment_picker = None
+        load_button = None
+        _picker_ui = mo.md("")
+
+    _picker_ui
+    return experiment_picker, load_button
+
+
+@app.cell
+def _(AVAILABLE_DATASETS, IS_HEADLESS, MODE, form_from_configs, mo):
+    if MODE == "train" and not IS_HEADLESS:
         form = form_from_configs(
             mo,
             {"m": ModelConfig, "t": TrainingConfig},
@@ -454,7 +500,7 @@ def _(AVAILABLE_DATASETS, form_from_configs, mo, mode, parse_bool):
         form = None
 
     form if form is not None else mo.md("")
-    return DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, form
+    return (form,)
 
 
 @app.cell(hide_code=True)
@@ -462,30 +508,30 @@ def _(
     DRY_RUN,
     EXPERIMENT_NAME,
     IS_HEADLESS,
+    MODE,
     configs_from_cli,
     configs_from_form,
     form,
     mo,
-    mode,
     n_stim,
 ):
     _always = {"m": {"encoder_dim": 1 + n_stim, "stim_dim": n_stim}}
     _config_classes = {"m": ModelConfig, "t": TrainingConfig}
 
-    if IS_HEADLESS:
+    if MODE == "load":
+        data_source = "synthetic"
+        model_config = None
+        training_config = None
+        ctx_display = mo.md(
+            "**Load mode** — pick an experiment above and click **Load**. Config comes from the bundle."
+        )
+    elif IS_HEADLESS:
         data_source = mo.cli_args().get("source", "synthetic")
         _always["m"]["data_source"] = data_source
         _cfgs = configs_from_cli(mo.cli_args(), _config_classes, always=_always)
         model_config, training_config = _cfgs["m"], _cfgs["t"]
         ctx_display = mo.md(
-            f"**Headless** — `{EXPERIMENT_NAME}` · source `{data_source}` · dry_run={DRY_RUN}"
-        )
-    elif mode.is_load:
-        data_source = "synthetic"
-        model_config = None
-        training_config = None
-        ctx_display = mo.md(
-            "**Load mode** — pick an experiment above and click **Load**. Config will come from the bundle."
+            f"**Headless train** — `{EXPERIMENT_NAME}` · source `{data_source}` · dry_run={DRY_RUN}"
         )
     else:
         mo.stop(
@@ -540,8 +586,8 @@ def _(DRY_RUN, data_source, load_dataset, mo):
 
 
 @app.cell(hide_code=True)
-def _(IS_HEADLESS, mo, mode):
-    if (not IS_HEADLESS) and (not mode.is_load):
+def _(IS_HEADLESS, MODE, mo):
+    if MODE == "train" and not IS_HEADLESS:
         train_button = mo.ui.run_button(label="Start training")
     else:
         train_button = None
@@ -554,36 +600,68 @@ def _(IS_HEADLESS, mo, mode):
 def _(
     EXPERIMENT_NAME,
     IS_HEADLESS,
+    MODE,
     cnr_tr,
     cnr_va,
     device,
+    experiment_picker,
+    load_button,
+    load_model,
     mo,
-    mode,
     model_config,
+    repo_root,
     results_base,
-    run_training,
+    results_read_sources,
+    source_selector,
     stim_tr,
     stim_va,
     train_button,
+    train_model,
     training_config,
 ):
-    artifacts = run_training(
-        mo=mo,
-        mode=mode,
-        is_headless=IS_HEADLESS,
-        experiment_name=EXPERIMENT_NAME,
-        results_base=results_base,
-        model_cls=Seq2ScalarMDN,
-        model_config_cls=ModelConfig,
-        dataset={"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
-        model_config=model_config,
-        training_config=training_config,
-        device=device,
-        train_button=train_button,
-    )
+    if MODE == "load":
+        mo.stop(
+            experiment_picker is None
+            or load_button is None
+            or not bool(load_button.value),
+            mo.md("Pick experiment and click **Load**."),
+        )
+        _src_name = source_selector.value if source_selector is not None else "Local"
+        _src_root = Path(results_read_sources(repo_root)[_src_name]) #/ EXPERIMENT_NAME
+        artifacts = load_model(
+            experiment_path=_src_root / experiment_picker.value,
+            model_cls=Seq2ScalarMDN,
+            model_config_cls=ModelConfig,
+            device=device,
+        )
+    elif IS_HEADLESS:
+        artifacts = train_model(
+            mo=mo,
+            model_cls=Seq2ScalarMDN,
+            dataset={"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
+            model_config=model_config,
+            training_config=training_config,
+            device=device,
+            experiment_name=EXPERIMENT_NAME,
+            results_base=results_base,
+            is_headless=True,
+        )
+    else:
+        mo.stop(not train_button.value, mo.md("Click **Start training**."))
+        artifacts = train_model(
+            mo=mo,
+            model_cls=Seq2ScalarMDN,
+            dataset={"train": (cnr_tr, stim_tr), "val": (cnr_va, stim_va)},
+            model_config=model_config,
+            training_config=training_config,
+            device=device,
+            experiment_name=EXPERIMENT_NAME,
+            results_base=results_base,
+            is_headless=False,
+        )
+
     model = artifacts.model
     history = artifacts.history
-    train_elapsed = artifacts.train_elapsed
     tracker = artifacts.tracker
     model_config_used = artifacts.model_config
 
@@ -594,11 +672,17 @@ def _(
 
 
 @app.cell
-def _(cnr_te, data_source, load_dataset, mo, mode, model_config_used, stim_te):
+def _(model):
+    model
+    return
+
+
+@app.cell
+def _(MODE, cnr_te, data_source, load_dataset, mo, model_config_used, stim_te):
     H = model_config_used.history_len
     F_ = model_config_used.future_len
 
-    if mode.is_load and model_config_used.data_source != data_source:
+    if MODE == "load" and model_config_used.data_source != data_source:
         _ds_for_test = model_config_used.data_source
         if _ds_for_test == "real":
             _tw = H + F_
