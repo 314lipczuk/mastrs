@@ -4,11 +4,6 @@ __generated_with = "0.22.5"
 app = marimo.App(width="medium")
 
 
-@app.cell
-def _():
-    return
-
-
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
@@ -24,11 +19,6 @@ def _():
     import torch.optim as optim
 
     return DF, mo, nn, np, optim, qplot, torch
-
-
-@app.cell
-def _():
-    return
 
 
 @app.cell

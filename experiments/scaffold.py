@@ -273,6 +273,130 @@ def load_model(
     return RunArtifacts(model, history, train_elapsed, None, mc_used, None)
 
 
+def resolve_configs(
+    *,
+    mo,
+    mode: str,
+    is_headless: bool,
+    form: Any,
+    config_classes: dict[str, type[BaseModel]],
+    always: dict[str, dict] | None = None,
+    default_source: str = "synthetic",
+    experiment_name: str = "",
+    dry_run: bool = False,
+) -> tuple[dict[str, BaseModel | None], str, Any]:
+    """Resolve configs and data_source from static MODE / IS_HEADLESS.
+
+    In ``load`` mode: returns ``{prefix: None}`` configs + ``default_source`` +
+    a load-mode message (configs come from the bundle later).
+
+    In headless train: parses CLI via :func:`configs_from_cli`, reads
+    ``--source`` (falls back to ``default_source``), injects ``data_source`` into
+    ``always['m']``.
+
+    In interactive train: validates the form via :func:`configs_from_form`,
+    derives ``data_source`` from ``configs['m'].data_source`` (prefix ``'m'`` is
+    assumed to be the model config).
+
+    Returns ``(configs, data_source, display_md)``.
+    """
+    always = always or {}
+    if mode == "load":
+        return (
+            {k: None for k in config_classes},
+            default_source,
+            mo.md(
+                "**Load mode** — pick an experiment above and click **Load**. "
+                "Config comes from the bundle."
+            ),
+        )
+    if is_headless:
+        data_source = mo.cli_args().get("source", default_source)
+        _always = {k: dict(v) for k, v in always.items()}
+        if "m" in config_classes and "data_source" in config_classes["m"].model_fields:
+            _always.setdefault("m", {})["data_source"] = data_source
+        cfgs = configs_from_cli(mo.cli_args(), config_classes, always=_always)
+        return (
+            cfgs,
+            data_source,
+            mo.md(
+                f"**Headless train** — `{experiment_name}` · source `{data_source}` · dry_run={dry_run}"
+            ),
+        )
+    # interactive train
+    mo.stop(
+        form is None or form.value is None,
+        mo.md("Fill in the form above and click **Apply**."),
+    )
+    cfgs = configs_from_form(form.value, config_classes, always=always)
+    data_source = default_source
+    if "m" in cfgs and hasattr(cfgs["m"], "data_source"):
+        data_source = cfgs["m"].data_source
+    return (
+        cfgs,
+        data_source,
+        mo.md(
+            f"**Interactive train** — `{experiment_name}` · source `{data_source}` · pydantic ✓"
+        ),
+    )
+
+
+def run_experiment(
+    *,
+    mo,
+    mode: str,
+    is_headless: bool,
+    model_cls: type,
+    model_config_cls: type[BaseModel],
+    dataset: Any,
+    model_config: BaseModel | None,
+    training_config: BaseModel | None,
+    device: torch.device,
+    experiment_name: str,
+    results_base: str,
+    experiment_path: Any = None,
+    load_button: Any = None,
+    train_button: Any = None,
+) -> RunArtifacts:
+    """Three-way branch on (MODE, IS_HEADLESS): load / headless-train / interactive-train.
+
+    Handles gating via ``mo.stop`` for both the load button (counter-style,
+    latched) and the interactive train button (one-shot ``run_button``).
+
+    Returns :class:`RunArtifacts` from either :func:`load_model` or
+    :func:`train_model`.
+    """
+    if mode == "load":
+        mo.stop(
+            experiment_path is None
+            or load_button is None
+            or not bool(load_button.value),
+            mo.md("Pick experiment and click **Load**."),
+        )
+        return load_model(
+            experiment_path=experiment_path,
+            model_cls=model_cls,
+            model_config_cls=model_config_cls,
+            device=device,
+        )
+    if not is_headless:
+        mo.stop(
+            train_button is None or not train_button.value,
+            mo.md("Click **Start training**."),
+        )
+    return train_model(
+        mo=mo,
+        model_cls=model_cls,
+        dataset=dataset,
+        model_config=model_config,
+        training_config=training_config,
+        device=device,
+        experiment_name=experiment_name,
+        results_base=results_base,
+        is_headless=is_headless,
+    )
+
+
 def save_bundle(
     *,
     mo,
