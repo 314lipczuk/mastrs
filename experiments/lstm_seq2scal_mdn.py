@@ -115,16 +115,22 @@ with app.setup:
 
 
     class Seq2SeqDataset(Dataset):
+        """Duck-typed on cnr/stim: accepts either 2D numpy (uniform length)
+        or object arrays / lists of per-cell arrays (variable length)."""
+
         def __init__(self, cnr, stim, history_len, future_len, stride=5):
             self.samples = []
             total = history_len + future_len
             for i in range(len(cnr)):
+                cnr_i = cnr[i]
+                stim_i = stim[i]
+                T = len(cnr_i)
                 t = 0
-                while t + total <= cnr.shape[1]:
-                    enc_cnr = cnr[i, t : t + history_len]
-                    enc_stim = stim[i, :, t : t + history_len]
-                    dec_stim = stim[i, :, t + history_len : t + total]
-                    full_window = cnr[i, t : t + total]
+                while t + total <= T:
+                    enc_cnr = cnr_i[t : t + history_len]
+                    enc_stim = stim_i[:, t : t + history_len]
+                    dec_stim = stim_i[:, t + history_len : t + total]
+                    full_window = cnr_i[t : t + total]
                     dec_target = np.diff(full_window)[
                         history_len - 1 : history_len - 1 + future_len
                     ]
@@ -546,17 +552,13 @@ def _(
 @app.cell
 def _(DRY_RUN, data_source, load_dataset, mo):
     if data_source == "real":
-        _total_window_guess = 30 + 5
-        cnr_all, stim_all, conditions_all = load_dataset(
-            "real",
-            window_size=_total_window_guess,
-            stride=max(1, _total_window_guess // 4),
-        )
+        cnr_all, stim_all, conditions_all = load_dataset("real")
     else:
         cnr_all, stim_all, conditions_all = load_dataset(data_source)
 
     n_traj = len(cnr_all)
-    traj_len = cnr_all.shape[1]
+    _lens = np.array([len(cnr_all[i]) for i in range(n_traj)])
+    _traj_len_min, _traj_len_max = int(_lens.min()), int(_lens.max())
 
     _traj_ids = np.arange(n_traj)
     _tr_ids, _te_ids = train_test_split(_traj_ids, test_size=0.2, random_state=42)
@@ -571,10 +573,15 @@ def _(DRY_RUN, data_source, load_dataset, mo):
     cnr_va, stim_va = cnr_all[_va_ids], stim_all[_va_ids]
     cnr_te, stim_te = cnr_all[_te_ids], stim_all[_te_ids]
 
+    _len_str = (
+        f"{_traj_len_min}"
+        if _traj_len_min == _traj_len_max
+        else f"{_traj_len_min}-{_traj_len_max}"
+    )
     mo.md(f"""
-    **Data:** {n_traj} trajectories × {traj_len} timepoints (`{data_source}`)
+    **Data:** {n_traj} trajectories x {_len_str} timepoints (`{data_source}`)
 
-    Splits: train={len(_tr_ids)} | val={len(_va_ids)} | test={len(_te_ids)} · dry_run={DRY_RUN}
+    Splits: train={len(_tr_ids)} | val={len(_va_ids)} | test={len(_te_ids)} * dry_run={DRY_RUN}
     """)
     return cnr_te, cnr_tr, cnr_va, stim_te, stim_tr, stim_va
 
@@ -719,13 +726,7 @@ def _(MODE, cnr_te, data_source, load_dataset, mo, model_config_used, stim_te):
 
     if MODE == "load" and model_config_used.data_source != data_source:
         _ds_for_test = model_config_used.data_source
-        if _ds_for_test == "real":
-            _tw = H + F_
-            _cnr_ld, _stim_ld, _ = load_dataset(
-                "real", window_size=_tw, stride=max(1, _tw // 4)
-            )
-        else:
-            _cnr_ld, _stim_ld, _ = load_dataset(_ds_for_test)
+        _cnr_ld, _stim_ld, _ = load_dataset(_ds_for_test)
         _ids = np.arange(len(_cnr_ld))
         _tr, _te = train_test_split(_ids, test_size=0.2, random_state=42)
         cnr_te_used, stim_te_used = _cnr_ld[_te], _stim_ld[_te]
@@ -737,7 +738,7 @@ def _(MODE, cnr_te, data_source, load_dataset, mo, model_config_used, stim_te):
     mo.md(
         f"Test windows: {len(test_ds)} (H={H}, F={F_}, source=`{model_config_used.data_source}`)"
     )
-    return F_, H, test_ds
+    return F_, H, cnr_te_used, stim_te_used, test_ds
 
 
 @app.cell
@@ -1853,13 +1854,13 @@ def _(mo):
 
 
 @app.cell
-def _(cnr_te, mo):
-    _n_tracks = len(cnr_te)
+def _(cnr_te_used, mo, model_config_used):
+    _n_tracks = len(cnr_te_used)
     track_selector = mo.ui.dropdown(
         options=[str(i) for i in range(_n_tracks)],
         value="0",
         searchable=True,
-        label=f"Test track ({_n_tracks} total)",
+        label=f"Test track ({_n_tracks} total, source=`{model_config_used.data_source}`)",
     )
     track_selector
     return (track_selector,)
@@ -1889,10 +1890,17 @@ def _(get_win_start, mo, set_win_start):
 
 
 @app.cell
-def _(cnr_te, get_win_start, mo, model_config_used, stim_te, track_selector):
+def _(
+    cnr_te_used,
+    get_win_start,
+    mo,
+    model_config_used,
+    stim_te_used,
+    track_selector,
+):
     _track_idx = int(track_selector.value)
-    _cnr_tr = cnr_te[_track_idx]
-    _stim_tr = stim_te[_track_idx]
+    _cnr_tr = cnr_te_used[_track_idx]
+    _stim_tr = stim_te_used[_track_idx]
     _traj_len = int(_cnr_tr.shape[0])
     _H = int(model_config_used.history_len)
     _F = int(model_config_used.future_len)
@@ -1915,10 +1923,16 @@ def _(cnr_te, get_win_start, mo, model_config_used, stim_te, track_selector):
     win_start = _start
     win_label = f"Track {_track_idx} · start {_start}"
 
+    _src = model_config_used.data_source
     _clamp_note = f" _(clamped from {_raw})_" if _raw != _start else ""
+    _range_note = (
+        " _(window fills the whole trajectory — frame-by-frame is a no-op for this dataset)_"
+        if _max_start == 0
+        else ""
+    )
     mo.md(
-        f"**{win_label}** · start {_start} of {_max_start} · "
-        f"traj_len={_traj_len} · H={_H}, F={_F}{_clamp_note}"
+        f"**{win_label}** · source=`{_src}` · start {_start} of {_max_start} · "
+        f"traj_len={_traj_len} · H={_H}, F={_F}{_clamp_note}{_range_note}"
     )
     return win_dec_stim, win_dec_target, win_enc_in, win_label
 
