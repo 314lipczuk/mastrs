@@ -190,6 +190,52 @@ def load_real_uncertain(
     return cnr, stim_all, conditions
 
 
+def load_real_tracks(
+    path: str = "dataset.parquet",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load real microscopy data as per-cell full trajectories (no windowing).
+
+    Returns object arrays so callers can consume per-cell tracks uniformly;
+    variable T across cells is preserved. Downstream ``Seq2SeqDataset``-style
+    classes handle windowing.
+
+    Returns
+    -------
+    cnr : np.ndarray(dtype=object), shape (n_cells,)
+        Each element is a 1D float32 CNR trajectory.
+    stim : np.ndarray(dtype=object), shape (n_cells,)
+        Each element is a 2D float32 array of shape ``(9, T_cell)``.
+    conditions : np.ndarray, shape (n_cells,)
+        ramp_pattern_name per cell.
+    """
+    from notebooks.experiment.preprocessing import (
+        DEFAULT_STIM_COLS,
+        load_and_clean,
+        make_tracks,
+    )
+
+    df = load_and_clean(path, baseline_cnr_max=None)
+    cnr, stim, meta = make_tracks(
+        df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
+    )
+    conditions = meta["ramp_pattern_name"].to_numpy()
+    return cnr, stim, conditions
+
+
+def load_real_uncertain_tracks(
+    path: str = "dataset_real_uncertain.parquet",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Same contract as :func:`load_real_tracks` for the combined dataset."""
+    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS, make_tracks
+
+    df = pd.read_parquet(path)
+    cnr, stim, meta = make_tracks(
+        df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
+    )
+    conditions = meta["ramp_pattern_name"].to_numpy()
+    return cnr, stim, conditions
+
+
 AVAILABLE_DATASETS = ("synthetic", "synthetic_v2", "real", "real_uncertain")
 
 
@@ -199,20 +245,30 @@ def load(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Dispatch to the loader for a named dataset.
 
-    Single source of truth for "which datasets exist". Adding a new dataset
-    means touching this function (and `AVAILABLE_DATASETS`) — notebooks don't
-    need to know the catalog.
+    **Default contract (new)**: ``load("real")`` / ``load("real_uncertain")``
+    return **per-cell full trajectories** as object arrays — suitable for
+    frame-by-frame navigation and in-notebook `Seq2SeqDataset` windowing.
 
-    Returns (cnr, stim, conditions) — same contract as the underlying loaders.
+    **Legacy contract (back-compat)**: passing ``window_size=`` (and/or
+    ``stride=``) routes to the pre-windowed real loaders used by
+    ``ensemble_seq2scal.py`` / ``compare_seq2seq.py`` — these return
+    ``(N_windows, window_size)`` 2D arrays as before.
+
+    Synthetic loaders are unchanged (already return full tracks as uniform
+    2D arrays).
     """
     if ds_name == "synthetic":
         return load_synthetic(**kwargs)
     if ds_name == "synthetic_v2":
         return load_synthetic_v2(**kwargs)
     if ds_name == "real":
-        return load_real(**kwargs)
+        if "window_size" in kwargs or "stride" in kwargs:
+            return load_real(**kwargs)
+        return load_real_tracks(**kwargs)
     if ds_name == "real_uncertain":
-        return load_real_uncertain(**kwargs)
+        if "window_size" in kwargs or "stride" in kwargs:
+            return load_real_uncertain(**kwargs)
+        return load_real_uncertain_tracks(**kwargs)
     raise ValueError(
         f"Unknown dataset {ds_name!r}. Available: {list(AVAILABLE_DATASETS)}"
     )

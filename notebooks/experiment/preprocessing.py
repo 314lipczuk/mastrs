@@ -352,6 +352,63 @@ def make_windows(df, window_size=None, stride=None, value_col="cnr_median_norm",
     return erk, stim, meta
 
 
+def make_tracks(df, value_col="cnr_median_norm", stim_cols=None,
+                drop_nan_cells=True):
+    """Return per-cell full trajectories (no windowing, variable length).
+
+    Each cell contributes one entry in the returned object arrays. Downstream
+    code should treat ``cnr`` / ``stim`` as sequences of per-cell arrays (fancy
+    indexing by track id works; ``.shape[1]`` does not).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Long-format dataset with ``uid``, ``frame``, *value_col*, and *stim_cols*.
+    value_col, stim_cols
+        See ``make_windows``. ``stim_cols`` defaults to ``DEFAULT_STIM_COLS``.
+    drop_nan_cells : bool
+        Skip cells whose trajectory contains any NaN in value or stim columns.
+
+    Returns
+    -------
+    cnr : np.ndarray(dtype=object), shape (n_cells,)
+        Per-cell CNR trajectories, each a 1D float32 array of shape ``(T_cell,)``.
+    stim : np.ndarray(dtype=object), shape (n_cells,)
+        Per-cell stim arrays, each 2D float32 of shape ``(n_stim, T_cell)``.
+    meta : pd.DataFrame
+        One row per kept cell with uid + first-frame metadata + ``T``.
+    """
+    if stim_cols is None:
+        stim_cols = DEFAULT_STIM_COLS
+
+    cnr_list, stim_list, meta_rows = [], [], []
+    for uid, g in df.groupby("uid"):
+        g = g.sort_values("frame")
+        vals = g[value_col].to_numpy(dtype=np.float32)
+        stim_mat = g[stim_cols].to_numpy(dtype=np.float32)  # (T, n_stim)
+        if drop_nan_cells and (np.isnan(vals).any() or np.isnan(stim_mat).any()):
+            continue
+        first = g.iloc[0]
+        cnr_list.append(vals)
+        stim_list.append(stim_mat.T)  # (n_stim, T)
+        meta_rows.append({
+            "uid": uid,
+            "cell_line": first.get("cell_line", None),
+            "ramp_pattern_name": first.get("ramp_pattern_name", None),
+            "fov": first.get("fov", None),
+            "T": int(len(vals)),
+        })
+
+    cnr = np.empty(len(cnr_list), dtype=object)
+    stim = np.empty(len(stim_list), dtype=object)
+    for i, v in enumerate(cnr_list):
+        cnr[i] = v
+    for i, s in enumerate(stim_list):
+        stim[i] = s
+    meta = pd.DataFrame(meta_rows)
+    return cnr, stim, meta
+
+
 def make_windows_sample(df, window_size=None, value_col="cnr_median_norm",
                         stim_cols=None, rng=None):
     """Sample one random window per cell track.
