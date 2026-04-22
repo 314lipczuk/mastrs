@@ -1,52 +1,34 @@
 """Reusable scaffolding for seq2seq-style experiment notebooks.
 
-Each experiment notebook copies ~4 short cells: form-builder, mode branch for
-configs, run_training, save_bundle. Model class, dataset loading, and viz
-cells remain experiment-specific.
+Mode is a static CLI flag (``--mode train|load``) — each notebook cell runs
+or no-ops based on it, so marimo's DAG is stable across a session. Model
+class, dataset loading, and viz cells remain experiment-specific.
 
 Usage pattern:
 
-    # In @app.setup (library scope):
+    # @app.setup (library scope):
     from experiments.scaffold import TrainContext
     class MyModel(nn.Module):
         @staticmethod
         def fit(dataset, ctx: TrainContext) -> tuple["MyModel", dict]: ...
 
-    # Cell: form (interactive train mode only)
-    form = form_from_configs(
-        mo, {"m": ModelConfig, "t": TrainingConfig},
-        skip={"m": {"encoder_dim", "stim_dim", "variant"}},
-        radio_choices={"m": {"data_source": AVAILABLE_DATASETS}},
-    ) if (not IS_HEADLESS and not mode.is_load) else None
-    form if form is not None else mo.md("")
-
-    # Cell: context (all modes)
-    if IS_HEADLESS:
-        cfgs = configs_from_cli(mo.cli_args(), {"m": ModelConfig, "t": TrainingConfig},
-                                always={"m": {"encoder_dim": 1 + n_stim, "stim_dim": n_stim}})
-        model_config, training_config = cfgs["m"], cfgs["t"]
-    elif mode.is_load:
-        model_config = training_config = None
-    else:
-        mo.stop(form.value is None, mo.md("Submit the form."))
-        cfgs = configs_from_form(form.value, {"m": ModelConfig, "t": TrainingConfig},
-                                 always={"m": {"encoder_dim": 1 + n_stim, "stim_dim": n_stim}})
-        model_config, training_config = cfgs["m"], cfgs["t"]
-
-    # Cell: run
-    artifacts = run_training(mo=mo, mode=mode, is_headless=IS_HEADLESS,
-                             experiment_name=EXPERIMENT_NAME, results_base=results_base,
-                             model_cls=MyModel, model_config_cls=ModelConfig,
-                             dataset=my_dataset_dict,
-                             model_config=model_config, training_config=training_config,
-                             device=device, train_button=train_button)
+    # Cell: model assembly (single source of `model`, branches on static MODE)
+    if MODE == "train":
+        if not IS_HEADLESS:
+            mo.stop(not train_button.value, mo.md("Click Start training."))
+        artifacts = train_model(
+            mo=mo, model_cls=MyModel, dataset=my_dataset_dict,
+            model_config=model_config, training_config=training_config,
+            device=device, experiment_name=EXPERIMENT_NAME,
+            results_base=results_base, is_headless=IS_HEADLESS,
+        )
+    else:  # MODE == "load"
+        mo.stop(not load_button.value, mo.md("Pick experiment + click Load."))
+        artifacts = load_model(
+            experiment_path=results_path / experiment_picker.value,
+            model_cls=MyModel, model_config_cls=ModelConfig, device=device,
+        )
     model = artifacts.model
-
-    # Cell: save
-    save_bundle(mo=mo, is_headless=IS_HEADLESS, artifacts=artifacts,
-                figures=figures_dict, metrics=eval_metrics,
-                n_train=len(cnr_tr), n_val=len(cnr_va),
-                save_button=save_all_button, hostname=hostname, is_cluster=is_cluster)
 """
 
 from __future__ import annotations
@@ -217,76 +199,40 @@ class RunArtifacts:
     training_config: BaseModel | None
 
 
-def run_training(
+def train_model(
     *,
     mo,
-    mode,
-    is_headless: bool,
+    model_cls: type,
+    dataset: Any,
+    model_config: BaseModel,
+    training_config: BaseModel,
+    device: torch.device,
     experiment_name: str,
     results_base: str,
-    model_cls: type,
-    model_config_cls: type[BaseModel],
-    dataset: Any,
-    model_config: BaseModel | None,
-    training_config: BaseModel | None,
-    device: torch.device,
-    train_button=None,
+    is_headless: bool,
     progress_bar: bool = True,
 ) -> RunArtifacts:
-    """Uniform three-way branch: headless-train / load / interactive-train.
+    """Train a model under ``ExperimentTracker``. Works headless or interactive.
 
-    `model_cls.fit(dataset, TrainContext) -> (model, history_dict)` is the only
-    hard contract on the caller's model.
+    ``model_cls.fit(dataset, TrainContext) -> (model, history_dict)`` is the
+    only hard contract. The caller is responsible for upstream gating (the
+    train button in interactive mode).
     """
-    if is_headless:
-        exp_dir = mo.cli_args().get("results-dir", f"{results_base}/{experiment_name}")
-        tracker = ExperimentTracker(
-            directory=exp_dir,
-            name=experiment_name,
-            model_config=model_config.model_dump(),
-            training_config=training_config.model_dump(),
-        )
-        tracker.register_start()
-        t0 = time.time()
-        model, history = model_cls.fit(
-            dataset,
-            TrainContext(
-                device=device,
-                model_config=model_config,
-                training_config=training_config,
-                tracker=tracker,
-            ),
-        )
-        return RunArtifacts(model, history, time.time() - t0, tracker, model_config, training_config)
-
-    if mode.is_load:
-        mo.stop(
-            mode.selected_experiment_path is None or not mode.load_button_clicked,
-            mo.md("Pick an experiment above and click **Load**."),
-        )
-        bundle = load_experiment(str(mode.selected_experiment_path))
-        model = bundle.reconstruct_model().to(device)
-        history = bundle.training_results.get(
-            "history", {"train_loss": [], "val_loss": [], "tf_ratio": []}
-        )
-        train_elapsed = bundle.training_results.get("train_elapsed_s", 0.0)
-        mc_used = model_config_cls.model_validate(bundle.model_config)
-        return RunArtifacts(model, history, train_elapsed, None, mc_used, None)
-
-    # interactive train
-    mo.stop(
-        train_button is None or not train_button.value,
-        mo.md("Click **Start training** when ready."),
+    exp_dir = (
+        mo.cli_args().get("results-dir", f"{results_base}/{experiment_name}")
+        if is_headless
+        else f"{results_base}/{experiment_name}"
     )
     tracker = ExperimentTracker(
-        directory=f"{results_base}/{experiment_name}",
+        directory=exp_dir,
         name=experiment_name,
         model_config=model_config.model_dump(),
         training_config=training_config.model_dump(),
     )
     tracker.register_start()
     t0 = time.time()
-    if progress_bar:
+
+    if progress_bar and not is_headless:
         with mo.status.progress_bar(total=training_config.epochs) as bar:
             def _cb(_ep, _total, m):
                 bar.update(increment=1, subtitle=f"val={m['val']:.4f}")
@@ -302,6 +248,29 @@ def run_training(
                          training_config=training_config, tracker=tracker),
         )
     return RunArtifacts(model, history, time.time() - t0, tracker, model_config, training_config)
+
+
+def load_model(
+    *,
+    experiment_path: str | Any,
+    model_cls: type,
+    model_config_cls: type[BaseModel],
+    device: torch.device,
+) -> RunArtifacts:
+    """Reconstruct a saved model. Returns RunArtifacts with tracker=None.
+
+    ``model_cls`` is unused at runtime — the bundle's own model class FQN is
+    used — but passing it documents the contract and helps type-checkers.
+    """
+    del model_cls  # kept in signature for symmetry with train_model
+    bundle = load_experiment(str(experiment_path))
+    model = bundle.reconstruct_model().to(device)
+    history = bundle.training_results.get(
+        "history", {"train_loss": [], "val_loss": [], "tf_ratio": []}
+    )
+    train_elapsed = bundle.training_results.get("train_elapsed_s", 0.0)
+    mc_used = model_config_cls.model_validate(bundle.model_config)
+    return RunArtifacts(model, history, train_elapsed, None, mc_used, None)
 
 
 def save_bundle(
