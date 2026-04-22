@@ -408,6 +408,7 @@ def _():
         hostname,
         is_cluster,
         load_dataset,
+        load_experiment,
         load_model,
         mo,
         n_stim,
@@ -677,6 +678,88 @@ def _(model):
     return
 
 
+@app.cell(hide_code=True)
+def _(
+    MODE,
+    experiment_picker,
+    load_experiment,
+    mo,
+    repo_root,
+    results_read_sources,
+    source_selector,
+):
+    import json as _json
+
+    if (
+        MODE == "load"
+        and experiment_picker is not None
+        and source_selector is not None
+    ):
+        _src_root_ld = Path(results_read_sources(repo_root)[source_selector.value])
+        _exp_path_ld = _src_root_ld / experiment_picker.value
+        _bundle_ld = load_experiment(str(_exp_path_ld))
+
+        _stats = _bundle_ld.training_results.get("stats", {})
+        _elapsed = _bundle_ld.training_results.get("train_elapsed_s")
+
+        _rows = [
+            ("name", _bundle_ld.name),
+            ("timestamp", _bundle_ld.timestamp),
+            ("model_type", _bundle_ld.model_type),
+            ("experiment_path", str(_exp_path_ld)),
+        ]
+        if _elapsed is not None:
+            _rows.append(
+                (
+                    "train_elapsed_s",
+                    f"{float(_elapsed):.1f} ({float(_elapsed) / 60:.1f} min)",
+                )
+            )
+        for _k, _v in _stats.items():
+            _rows.append((_k, _v))
+        for _k, _v in (_bundle_ld.metrics or {}).items():
+            _rows.append((f"metric.{_k}", _v))
+
+        _summary_md = (
+            "## Loaded run summary\n\n| field | value |\n|---|---|\n"
+            + "\n".join(f"| `{_k}` | {_v} |" for _k, _v in _rows)
+        )
+
+        _cfg_md = (
+            "## Saved configs\n\n"
+            f"**model_config**\n```json\n{_json.dumps(_bundle_ld.model_config, indent=2, default=str)}\n```\n\n"
+            f"**training_config**\n```json\n{_json.dumps(_bundle_ld.training_config, indent=2, default=str)}\n```"
+        )
+
+        _slurm_path = _exp_path_ld / "slurm.log"
+        if _slurm_path.exists():
+            _slurm_txt = _slurm_path.read_text(errors="replace")
+            _slurm_md = f"```\n{_slurm_txt}\n```"
+            _slurm_section = mo.accordion(
+                {
+                    f"slurm.log ({_slurm_path.stat().st_size:,} bytes)": mo.md(
+                        _slurm_md
+                    ),
+                }
+            )
+        else:
+            _slurm_section = mo.md(f"_slurm.log not found at `{_slurm_path}`_")
+
+        run_summary = mo.vstack(
+            [
+                mo.md(_summary_md),
+                mo.md(_cfg_md),
+                mo.md("## slurm.log"),
+                _slurm_section,
+            ]
+        )
+    else:
+        run_summary = mo.md("")
+
+    run_summary
+    return
+
+
 @app.cell
 def _(MODE, cnr_te, data_source, load_dataset, mo, model_config_used, stim_te):
     H = model_config_used.history_len
@@ -763,32 +846,98 @@ def _(device, model, test_ds):
 
 
 @app.cell
-def _(F_, pl, qplot, test_act, test_point, test_std):
-    """Per-step residual + uncertainty stats."""
-    per_step = pl.DataFrame({
-        "step": np.repeat(np.arange(1, F_ + 1), test_act.shape[0]),
-        "residual": (test_act - test_point).flatten(order="F"),
-        "pred_std": test_std.flatten(order="F"),
-    })
+def _(F_, pl, test_act, test_point):
+    """Per-step residual histograms — precomputed bins to avoid altair max_rows."""
 
-    fig_residuals = qplot(
-        per_step, "residual",
-        facet_wrap="step", columns=F_,
-        title="Residual distribution per forecast step",
-        height=200, bins=50,
+    import altair as _alt
+
+    _bins = 50
+    _resid_flat = (test_act - test_point).flatten(order="F")
+    _step_flat = np.repeat(np.arange(1, F_ + 1), test_act.shape[0])
+
+    _lo, _hi = float(_resid_flat.min()), float(_resid_flat.max())
+    _edges = np.linspace(_lo, _hi, _bins + 1)
+
+    _rows_h = []
+    for _s in range(1, F_ + 1):
+        _counts, _ = np.histogram(_resid_flat[_step_flat == _s], bins=_edges)
+        for _i, _n in enumerate(_counts):
+            _rows_h.append(
+                {
+                    "step": _s,
+                    "bin_start": float(_edges[_i]),
+                    "bin_end": float(_edges[_i + 1]),
+                    "count": int(_n),
+                }
+            )
+    resid_hist_df = pl.DataFrame(_rows_h)
+
+    fig_residuals = (
+        _alt.Chart(resid_hist_df)
+        .mark_bar()
+        .encode(
+            x=_alt.X("bin_start:Q", bin="binned", title="residual"),
+            x2="bin_end:Q",
+            y=_alt.Y("count:Q", title="count"),
+        )
+        .properties(width=160, height=180)
+        .facet(column=_alt.Column("step:N", title=None))
+        .properties(title="Residual distribution per forecast step")
     )
     fig_residuals
     return (fig_residuals,)
 
 
 @app.cell
-def _(F_, pl, qplot, test_std):
-    std_df = pl.DataFrame({
-        "step": np.repeat(np.arange(1, F_ + 1), test_std.shape[0]),
-        "pred_std": test_std.flatten(order="F"),
-    })
-    fig_std = qplot(std_df, "step", "pred_std", mark="boxplot",
-                    title="Predicted std by forecast step", height=300)
+def _(F_, pl, test_std):
+    """Predicted std per forecast step — precomputed quantiles to avoid altair max_rows."""
+
+    import altair as _alt
+
+    _std_stats_df = (
+        pl.DataFrame(
+            {
+                "step": np.repeat(np.arange(1, F_ + 1), test_std.shape[0]),
+                "pred_std": test_std.flatten(order="F"),
+            }
+        )
+        .group_by("step")
+        .agg(
+            [
+                pl.col("pred_std").quantile(0.05).alias("q05"),
+                pl.col("pred_std").quantile(0.25).alias("q25"),
+                pl.col("pred_std").quantile(0.50).alias("q50"),
+                pl.col("pred_std").quantile(0.75).alias("q75"),
+                pl.col("pred_std").quantile(0.95).alias("q95"),
+            ]
+        )
+        .sort("step")
+    )
+
+    _whisk = (
+        _alt.Chart(_std_stats_df)
+        .mark_rule()
+        .encode(
+            x=_alt.X("step:O", title="forecast step"),
+            y=_alt.Y("q05:Q", title="pred_std"),
+            y2="q95:Q",
+        )
+    )
+    _box = (
+        _alt.Chart(_std_stats_df)
+        .mark_bar(size=22, color="#4C78A8")
+        .encode(x="step:O", y="q25:Q", y2="q75:Q")
+    )
+    _median = (
+        _alt.Chart(_std_stats_df)
+        .mark_tick(color="white", size=22, thickness=2)
+        .encode(x="step:O", y="q50:Q")
+    )
+    fig_std = (_whisk + _box + _median).properties(
+        title="Predicted std by forecast step (5/25/50/75/95 quantiles)",
+        height=300,
+        width=380,
+    )
     fig_std
     return (fig_std,)
 
