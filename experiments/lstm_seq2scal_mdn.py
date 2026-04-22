@@ -1847,19 +1847,99 @@ def _(ablation_df, mixture_metrics_df, mo, pl, test_act, test_point, test_std):
 
 
 @app.cell
-def _(mo, test_ds):
-    traj_selector = mo.ui.slider(0, len(test_ds) - 1, value=0, label="Test window index")
-    traj_selector
-    return (traj_selector,)
+def _(mo):
+    get_win_start, set_win_start = mo.state(0)
+    return get_win_start, set_win_start
 
 
 @app.cell
-def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
+def _(cnr_te, mo):
+    _n_tracks = len(cnr_te)
+    track_selector = mo.ui.dropdown(
+        options=[str(i) for i in range(_n_tracks)],
+        value="0",
+        searchable=True,
+        label=f"Test track ({_n_tracks} total)",
+    )
+    track_selector
+    return (track_selector,)
+
+
+@app.cell
+def _(get_win_start, mo, set_win_start):
+    def _step(delta):
+        return lambda _: set_win_start(get_win_start() + delta)
+
+
+    btn_m10 = mo.ui.button(label="⟨⟨ −10", on_click=_step(-10))
+    btn_m5 = mo.ui.button(label="⟨ −5", on_click=_step(-5))
+    btn_m1 = mo.ui.button(label="⟨ −1", on_click=_step(-1))
+    btn_p1 = mo.ui.button(label="+1 ⟩", on_click=_step(+1))
+    btn_p5 = mo.ui.button(label="+5 ⟩", on_click=_step(+5))
+    btn_p10 = mo.ui.button(label="+10 ⟩⟩", on_click=_step(+10))
+    btn_reset = mo.ui.button(
+        label="⟲ 0", on_click=lambda _: set_win_start(0), kind="warn"
+    )
+
+    mo.hstack(
+        [btn_m10, btn_m5, btn_m1, btn_p1, btn_p5, btn_p10, btn_reset],
+        justify="start",
+    )
+    return btn_m1, btn_m10, btn_m5, btn_p1, btn_p10, btn_p5, btn_reset
+
+
+@app.cell
+def _(cnr_te, get_win_start, mo, model_config_used, stim_te, track_selector):
+    _track_idx = int(track_selector.value)
+    _cnr_tr = cnr_te[_track_idx]
+    _stim_tr = stim_te[_track_idx]
+    _traj_len = int(_cnr_tr.shape[0])
+    _H = int(model_config_used.history_len)
+    _F = int(model_config_used.future_len)
+    _max_start = max(0, _traj_len - (_H + _F))
+
+    _raw = get_win_start()
+    _start = max(0, min(_raw, _max_start))
+
+    _enc_cnr = _cnr_tr[_start : _start + _H]
+    _enc_stim = _stim_tr[:, _start : _start + _H]
+    _dec_stim = _stim_tr[:, _start + _H : _start + _H + _F]
+    _full = _cnr_tr[_start : _start + _H + _F]
+    _dec_target = np.diff(_full)[_H - 1 : _H - 1 + _F]
+    _enc_in = np.concatenate([_enc_cnr[:, np.newaxis], _enc_stim.T], axis=-1)
+
+    win_enc_in = torch.tensor(_enc_in, dtype=torch.float32)
+    win_dec_stim = torch.tensor(_dec_stim.T, dtype=torch.float32)
+    win_dec_target = torch.tensor(_dec_target, dtype=torch.float32)
+    win_track = _track_idx
+    win_start = _start
+    win_label = f"Track {_track_idx} · start {_start}"
+
+    _clamp_note = f" _(clamped from {_raw})_" if _raw != _start else ""
+    mo.md(
+        f"**{win_label}** · start {_start} of {_max_start} · "
+        f"traj_len={_traj_len} · H={_H}, F={_F}{_clamp_note}"
+    )
+    return win_dec_stim, win_dec_target, win_enc_in, win_label
+
+
+@app.cell
+def _(
+    F_,
+    H,
+    device,
+    mo,
+    model,
+    pl,
+    win_dec_stim,
+    win_dec_target,
+    win_enc_in,
+    win_label,
+):
     import altair as _alt
 
     _N_MC = 200
-    _idx = traj_selector.value
-    _enc_in, _dec_stim, _dec_target = test_ds[_idx]
+    _enc_in, _dec_stim, _dec_target = win_enc_in, win_dec_stim, win_dec_target
 
     _enc_batch = _enc_in.unsqueeze(0).repeat(_N_MC, 1, 1).to(device)
     _stim_batch = _dec_stim.unsqueeze(0).repeat(_N_MC, 1, 1).to(device)
@@ -1979,13 +2059,13 @@ def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
     ).properties(
         width=750,
         height=400,
-        title=f"Window {_idx}: history (solid) | actual future (faded) | MDN median + 50/90% MC bands",
+        title=f"{win_label}: history (solid) | actual future (faded) | MDN median + 50/90% MC bands",
     )
 
     mo.vstack(
         [
             mo.md(
-                f"**Window {_idx}** — {_N_MC} Monte Carlo rollouts from MDN (sample component + Gaussian per step)"
+                f"**{win_label}** — {_N_MC} Monte Carlo rollouts from MDN (sample component + Gaussian per step)"
             ),
             _chart,
         ]
@@ -1993,18 +2073,26 @@ def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
     return
 
 
-@app.cell
-def _(traj_selector):
-    traj_selector
-    return
-
-
 @app.cell(hide_code=True)
-def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
+def _(
+    F_,
+    H,
+    device,
+    mo,
+    model,
+    pl,
+    win_dec_stim,
+    win_dec_target,
+    win_enc_in,
+    win_label,
+):
     import altair as _alt
 
-    _idx_k = traj_selector.value
-    _enc_in_k, _dec_stim_k, _dec_target_k = test_ds[_idx_k]
+    _enc_in_k, _dec_stim_k, _dec_target_k = (
+        win_enc_in,
+        win_dec_stim,
+        win_dec_target,
+    )
 
     _K = model.n_gaussians
     _enc_b = _enc_in_k.unsqueeze(0).repeat(_K, 1, 1).to(device)
@@ -2290,7 +2378,7 @@ def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
         .properties(
             width=820,
             height=460,
-            title=f"Window {_idx_k}: real | model π-weighted ±σ | K={_K} components | light stim (bottom strip)",
+            title=f"{win_label}: real | model π-weighted ±σ | K={_K} components | light stim (bottom strip)",
         )
         .resolve_scale(size="independent", opacity="independent")
         .interactive()
@@ -2299,14 +2387,34 @@ def _(F_, H, device, mo, model, pl, test_ds, traj_selector):
     mo.vstack(
         [
             mo.md(
-                f"**Window {_idx_k}** — legend covers every series. "
-                f"**real** (black): ground truth. "
-                f"**model (π-weighted)** (purple): whole-model rollout with ±1 mixture-σ band. "
-                f"**k0…kN**: forced per-component rollouts; dot size/opacity = π_k at step. "
-                f"**light stim** (amber strip at bottom): stim channel 0 — shape only, scaled to a band below the CNR data."
+                f"""
+                - **{win_label}** — legend covers every series.
+                - **real** (black): ground truth. 
+                - **model (π-weighted)** (purple): whole-model rollout with ±1 mixture-σ band. 
+                - **k0…kN**: forced per-component rollouts; dot size/opacity = π_k at step. 
+                - **light stim** (amber strip at bottom): stim channel 0 — shape only, scaled to a band below the CNR data."""
             ),
             chart_components,
         ]
+    )
+    return
+
+
+@app.cell
+def _(
+    btn_m1,
+    btn_m10,
+    btn_m5,
+    btn_p1,
+    btn_p10,
+    btn_p5,
+    btn_reset,
+    mo,
+    track_selector,
+):
+    track_selector, mo.hstack(
+        [btn_m10, btn_m5, btn_m1, btn_p1, btn_p5, btn_p10, btn_reset],
+        justify="start",
     )
     return
 
