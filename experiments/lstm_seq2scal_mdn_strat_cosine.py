@@ -11,6 +11,7 @@ with app.setup:
 
     import math
     import os
+    import random
     import time
     import tempfile
     from dataclasses import dataclass
@@ -109,11 +110,14 @@ with app.setup:
         patience: int = 100
         tf_ratio_start: float = 1.0
         tf_ratio_end: float = 0.0
-        tf_anneal_frac: float = 0.5
-        tf_hold_frac: float = 0.3
+        tf_anneal_frac: float = 0.3
+        tf_hold_frac: float = 0.0
         grad_clip: float = 1.0
         train_stride: int = Field(5, ge=1)
         test_stride: int = Field(10, ge=1)
+        use_stratified_sampler: bool = True
+        n_strata: int = Field(3, ge=2)
+        seed: int = 42
 
 
     class Seq2SeqDataset(Dataset):
@@ -152,6 +156,62 @@ with app.setup:
                 torch.tensor(dec_stim, dtype=torch.float32),
                 torch.tensor(dec_target, dtype=torch.float32),
             )
+
+
+    def compute_response_scores(dataset):
+        """Per-window dynamism score: std(Δfuture) + |mean(Δfuture)|."""
+        scores = np.empty(len(dataset), dtype=np.float32)
+        for i, (_, _, dec_target) in enumerate(dataset.samples):
+            d = np.asarray(dec_target, dtype=np.float32)
+            scores[i] = float(d.std() + abs(d.mean()))
+        return scores
+
+
+    def stratify_by_quantile(scores, n_strata):
+        """Return list of index arrays, one per stratum (low → high score)."""
+        edges = np.quantile(scores, np.linspace(0.0, 1.0, n_strata + 1))
+        edges[0] -= 1e-9
+        edges[-1] += 1e-9
+        bin_idx = np.digitize(scores, edges[1:-1])
+        return [np.where(bin_idx == k)[0] for k in range(n_strata)]
+
+
+    class StratifiedSampler(torch.utils.data.Sampler):
+        """Batch-sampler: each batch draws `batch_size // n_strata` indices
+        from each stratum. Caps epoch length at `min(stratum_sizes) //
+        per_stratum` batches so every batch is balanced. Shuffles within
+        each stratum every epoch."""
+
+        def __init__(self, stratum_indices, batch_size, generator=None):
+            self.stratum_indices = [
+                np.asarray(s, dtype=np.int64) for s in stratum_indices
+            ]
+            self.n_strata = len(self.stratum_indices)
+            if batch_size % self.n_strata != 0:
+                raise ValueError(
+                    f"batch_size ({batch_size}) must be divisible by "
+                    f"n_strata ({self.n_strata})"
+                )
+            self.per_stratum = batch_size // self.n_strata
+            self.batch_size = batch_size
+            self.generator = generator
+
+        def __iter__(self):
+            rng = np.random.default_rng()
+            shuffled = [rng.permutation(s) for s in self.stratum_indices]
+            n_batches = len(self)
+            for b in range(n_batches):
+                batch = []
+                start = b * self.per_stratum
+                end = start + self.per_stratum
+                for s in shuffled:
+                    batch.extend(s[start:end].tolist())
+                rng.shuffle(batch)
+                yield batch
+
+        def __len__(self):
+            min_size = min(len(s) for s in self.stratum_indices)
+            return min_size // self.per_stratum
 
 
     def _tf_schedule_linear(tcfg, total_epochs):
@@ -296,6 +356,10 @@ with app.setup:
             mcfg = ctx.model_config
             tcfg = ctx.training_config
 
+            torch.manual_seed(tcfg.seed)
+            np.random.seed(tcfg.seed)
+            random.seed(tcfg.seed)
+
             cnr_tr, stim_tr = dataset["train"]
             cnr_va, stim_va = dataset["val"]
 
@@ -313,9 +377,22 @@ with app.setup:
                 mcfg.future_len,
                 stride=tcfg.train_stride,
             )
-            train_loader = DataLoader(
-                train_ds, batch_size=tcfg.batch_size, shuffle=True
-            )
+            if tcfg.use_stratified_sampler:
+                _scores = compute_response_scores(train_ds)
+                _strata = stratify_by_quantile(_scores, tcfg.n_strata)
+                _sampler = StratifiedSampler(_strata, tcfg.batch_size)
+                train_loader = DataLoader(train_ds, batch_sampler=_sampler)
+                _sizes = ", ".join(str(len(s)) for s in _strata)
+                _q = np.quantile(_scores, np.linspace(0.0, 1.0, tcfg.n_strata + 1))
+                print(
+                    f"StratifiedSampler: n_strata={tcfg.n_strata} sizes=[{_sizes}] "
+                    f"per_stratum={_sampler.per_stratum} batches/epoch={len(_sampler)} "
+                    f"edges={_q.round(4).tolist()}"
+                )
+            else:
+                train_loader = DataLoader(
+                    train_ds, batch_size=tcfg.batch_size, shuffle=True
+                )
             val_loader = DataLoader(
                 val_ds, batch_size=tcfg.batch_size, shuffle=False
             )
@@ -324,14 +401,15 @@ with app.setup:
             opt = torch.optim.Adam(
                 model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay
             )
-            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, patience=10, factor=0.5
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=tcfg.epochs, eta_min=1e-5
             )
             tf_fn = _tf_schedule_linear(tcfg, tcfg.epochs)
 
             hist = {"train_loss": [], "val_loss": [], "tf_ratio": []}
             ckpt_fd, ckpt = tempfile.mkstemp(suffix=".pt")
             os.close(ckpt_fd)
+            torch.save(model.state_dict(), ckpt)
 
             best, wait = float("inf"), 0
             for ep in range(tcfg.epochs):
@@ -351,15 +429,16 @@ with app.setup:
                 hist["train_loss"].append(t)
                 hist["val_loss"].append(v)
                 hist["tf_ratio"].append(tf_r)
-                sched.step(v)
-                if v < best:
-                    best, wait = v, 0
-                    torch.save(model.state_dict(), ckpt)
-                else:
-                    wait += 1
-                    if wait >= tcfg.patience:
-                        print(f"Early stopping at epoch {ep}")
-                        break
+                sched.step()
+                if tf_r < 0.5:
+                    if v < best:
+                        best, wait = v, 0
+                        torch.save(model.state_dict(), ckpt)
+                    else:
+                        wait += 1
+                        if wait >= tcfg.patience:
+                            print(f"Early stopping at epoch {ep}")
+                            break
                 if ep % ctx.print_every == 0:
                     print(f"Epoch {ep:3d} | tf={tf_r:.2f} T:{t:.5f} V:{v:.5f}")
                 if ctx.progress_cb is not None:
@@ -443,7 +522,7 @@ def _():
 def _(mo, parse_bool):
     MODE = mo.cli_args().get("mode", "train")
     IS_HEADLESS = "name" in mo.cli_args()
-    EXPERIMENT_NAME = mo.cli_args().get("name", "lstm_seq2scal_mdn")
+    EXPERIMENT_NAME = mo.cli_args().get("name", "lstm_seq2scal_mdn_strat_cosine")
     DRY_RUN = parse_bool(mo.cli_args().get("dry_run", True))
 
     if MODE not in ("train", "load"):
@@ -1788,10 +1867,10 @@ def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
 
         | metric | value |
         |---|---:|
-        | Mean \|point_on − point_off\| (ΔCNR) | **{_pp_mean:.5f}** |
+        | Mean \\|point_on − point_off\\| (ΔCNR) | **{_pp_mean:.5f}** |
         | Target std (ΔCNR) | {_y_std:.5f} |
         | **Ratio — point diff / target std** | **{_pp_mean / max(_y_std, 1e-12):.3f}** |
-        | Mean \|top-component μ(on) − μ(off)\| | {_top_mu_diff:.5f} |
+        | Mean \\|top-component μ(on) − μ(off)\\| | {_top_mu_diff:.5f} |
         | Mean JS(π_on ‖ π_off) (nats) | {_js_mean:.4f} |
         | Fraction of steps where top-π flips | {_top_flip:.3f} |
         | NLL (actual stim) | {_nll_a:.4f} |
@@ -2859,6 +2938,25 @@ def _(
 
 @app.cell
 def _(
+    btn_m1,
+    btn_m10,
+    btn_m5,
+    btn_p1,
+    btn_p10,
+    btn_p5,
+    btn_reset,
+    mo,
+    track_selector,
+):
+    track_selector, mo.hstack(
+        [btn_m10, btn_m5, btn_m1, btn_p1, btn_p5, btn_p10, btn_reset],
+        justify="start",
+    )
+    return
+
+
+@app.cell
+def _(
     F_,
     H,
     device,
@@ -3028,7 +3126,7 @@ def _(
             mo.md(f"""
         **{win_label}** — counterfactual future stim.
 
-        - Σ \|point(on) − point(off)\| over F={F_} steps = **{_pp_abs_w:.5f}**
+        - Σ \\|point(on) − point(off)\\| over F={F_} steps = **{_pp_abs_w:.5f}**
         - Mean JS(π_on ‖ π_off) = **{_js_w.mean():.4f}**
 
         If the three bands overlap almost completely the model has not
@@ -3057,6 +3155,430 @@ def _(
         [btn_m10, btn_m5, btn_m1, btn_p1, btn_p5, btn_p10, btn_reset],
         justify="start",
     )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    # Baseline comparison
+
+    Evaluate the stratified-sampler run against a previously-saved
+    **unweighted** baseline on the same test set. The comparison
+    uses per-window NLL, stratified by the same score used to build
+    training batches (`std(Δfuture) + |mean(Δfuture)|`), plus a
+    phase split (`sign(mean(Δfuture))`). Worst-case baseline windows
+    are plotted side-by-side with stratified predictions.
+    """)
+    return
+
+
+@app.cell
+def _(IS_HEADLESS, mo, repo_root, results_read_sources):
+    if not IS_HEADLESS:
+        _sources = results_read_sources(repo_root)
+        baseline_source = mo.ui.dropdown(
+            options=list(_sources.keys()),
+            value="Local",
+            label="Baseline results source",
+        )
+    else:
+        baseline_source = None
+    baseline_source if baseline_source is not None else mo.md("")
+    return (baseline_source,)
+
+
+@app.cell
+def _(
+    IS_HEADLESS,
+    baseline_source,
+    mo,
+    repo_root,
+    results_read_sources,
+    scan_experiment_dirs,
+):
+    if not IS_HEADLESS and baseline_source is not None:
+        _src = Path(results_read_sources(repo_root)[baseline_source.value])
+        _choices = scan_experiment_dirs(_src)
+        if _choices:
+            baseline_picker = mo.ui.dropdown(
+                options=_choices,
+                value=_choices[0],
+                label="Baseline experiment (unweighted run)",
+            )
+            baseline_load_button = mo.ui.button(
+                value=0, on_click=lambda n: n + 1, label="Load baseline"
+            )
+            baseline_source_root = _src
+            _ui = mo.vstack([baseline_picker, baseline_load_button])
+        else:
+            baseline_picker = None
+            baseline_load_button = None
+            baseline_source_root = None
+            _ui = mo.md(f"No experiments under `{_src}`.")
+    else:
+        baseline_picker = None
+        baseline_load_button = None
+        baseline_source_root = None
+        _ui = mo.md("")
+    _ui
+    return baseline_load_button, baseline_picker, baseline_source_root
+
+
+@app.cell
+def _(
+    baseline_load_button,
+    baseline_picker,
+    baseline_source_root,
+    device,
+    load_experiment,
+    mo,
+):
+    if (
+        baseline_load_button is not None
+        and baseline_load_button.value > 0
+        and baseline_picker is not None
+        and baseline_source_root is not None
+    ):
+        _path = baseline_source_root / baseline_picker.value
+        _bundle = load_experiment(str(_path))
+        baseline_model = _bundle.reconstruct_model().to(device).eval()
+        baseline_name = baseline_picker.value
+        _md = mo.md(
+            f"**Baseline loaded**: `{baseline_name}` · "
+            f"{type(baseline_model).__name__} · "
+            f"{sum(p.numel() for p in baseline_model.parameters()):,} params"
+        )
+    else:
+        baseline_model = None
+        baseline_name = None
+        _md = mo.md(
+            "_Pick a baseline experiment and press **Load baseline** to compare._"
+        )
+    _md
+    return (baseline_model,)
+
+
+@app.cell
+def _(
+    baseline_model,
+    device,
+    mo,
+    test_act,
+    test_ds,
+    test_mu,
+    test_pi,
+    test_sigma,
+):
+    from scipy.special import logsumexp as _logsumexp
+
+    if baseline_model is None:
+        compare_ready = False
+        base_pi = base_mu = base_sigma = base_point = None
+        base_nll_per = None
+        strat_nll_per = None
+        _md = mo.md("_No baseline loaded — skip comparison._")
+    else:
+        compare_ready = True
+        _pi_l, _mu_l, _sig_l = [], [], []
+        baseline_model.eval()
+        with torch.no_grad():
+            for _eb, _sb, _tb in DataLoader(test_ds, batch_size=512):
+                _pi, _mu, _sig = baseline_model(_eb.to(device), _sb.to(device))
+                _pi_l.append(_pi.cpu().numpy())
+                _mu_l.append(_mu.cpu().numpy())
+                _sig_l.append(_sig.cpu().numpy())
+        base_pi = np.concatenate(_pi_l)
+        base_mu = np.concatenate(_mu_l)
+        base_sigma = np.concatenate(_sig_l)
+        base_point = (base_pi * base_mu).sum(-1)
+
+        _y = test_act[..., None]
+        _lg_b = (
+            -0.5 * np.log(2 * np.pi)
+            - np.log(base_sigma)
+            - 0.5 * ((_y - base_mu) / base_sigma) ** 2
+        )
+        base_nll_per = -_logsumexp(np.log(base_pi + 1e-12) + _lg_b, axis=-1)
+
+        _lg_s = (
+            -0.5 * np.log(2 * np.pi)
+            - np.log(test_sigma)
+            - 0.5 * ((_y - test_mu) / test_sigma) ** 2
+        )
+        strat_nll_per = -_logsumexp(np.log(test_pi + 1e-12) + _lg_s, axis=-1)
+
+        _md = mo.md(
+            f"Baseline forward pass complete · N={base_pi.shape[0]} "
+            f"windows × F={base_pi.shape[1]} steps."
+        )
+    _md
+    return base_nll_per, base_point, compare_ready, strat_nll_per
+
+
+@app.cell
+def _(base_nll_per, compare_ready, mo, pl, qplot, strat_nll_per, test_act):
+    if not compare_ready:
+        comparison_df = None
+        fig_compare_bars = None
+        _out = mo.md("_Load a baseline to see per-group NLL comparison._")
+    else:
+        _scores = test_act.std(axis=1) + np.abs(test_act.mean(axis=1))
+        _edges = np.quantile(_scores, [0.0, 1 / 3, 2 / 3, 1.0])
+        _edges[0] -= 1e-9
+        _edges[-1] += 1e-9
+        _bin = np.digitize(_scores, _edges[1:-1])
+        _stratum = np.array(["flat", "moderate", "dynamic"])[_bin]
+
+        _mean_delta = test_act.mean(axis=1)
+        _phase = np.where(
+            _mean_delta > 0.005,
+            "rising",
+            np.where(_mean_delta < -0.005, "falling", "phase_flat"),
+        )
+
+        _groups = [
+            ("all", np.ones(len(_scores), dtype=bool)),
+            ("flat", _stratum == "flat"),
+            ("moderate", _stratum == "moderate"),
+            ("dynamic", _stratum == "dynamic"),
+            ("rising", _phase == "rising"),
+            ("falling", _phase == "falling"),
+            ("phase_flat", _phase == "phase_flat"),
+        ]
+        _rows = []
+        for _name, _mask in _groups:
+            _n = int(_mask.sum())
+            if _n == 0:
+                continue
+            _b = float(base_nll_per[_mask].mean())
+            _s = float(strat_nll_per[_mask].mean())
+            _rows.append(
+                {
+                    "group": _name,
+                    "n": _n,
+                    "baseline_nll": _b,
+                    "stratified_nll": _s,
+                    "delta_nll": _s - _b,
+                    "rel_delta": (_s - _b) / max(abs(_b), 1e-6),
+                }
+            )
+        comparison_df = pl.DataFrame(_rows)
+
+        _long = pl.concat(
+            [
+                comparison_df.select(
+                    [
+                        pl.col("group"),
+                        pl.col("baseline_nll").alias("nll"),
+                        pl.lit("baseline").alias("model"),
+                    ]
+                ),
+                comparison_df.select(
+                    [
+                        pl.col("group"),
+                        pl.col("stratified_nll").alias("nll"),
+                        pl.lit("stratified").alias("model"),
+                    ]
+                ),
+            ]
+        )
+        fig_compare_bars = qplot(
+            _long,
+            "group",
+            "nll",
+            color="model",
+            mark="bar",
+            title="Per-group mixture NLL: baseline (unweighted) vs stratified sampler (lower = better)",
+            height=320,
+        )
+
+        _out = mo.vstack(
+            [
+                mo.md(
+                    """
+            ## Per-group NLL: baseline vs stratified
+
+            Each test window gets a scalar **response score**
+            `std(Δfuture) + |mean(Δfuture)|` (same score the training
+            sampler uses) and a **phase** from `sign(mean(Δfuture))`
+            with ±0.005 threshold. Windows are grouped by tercile of
+            score (flat / moderate / dynamic) and by phase
+            (rising / falling / phase_flat).
+
+            `delta_nll = stratified − baseline`. **Negative delta =
+            stratified wins for that group**.
+
+            **What the stratified sampler is *meant* to do**:
+            - small positive `delta_nll` on `flat` (mild regression —
+              fewer flat windows per batch means slightly worse fit
+              on the easy majority),
+            - clearly negative `delta_nll` on `dynamic` / `rising` /
+              `falling` (the payoff — dynamic windows were
+              underweighted in random sampling).
+
+            If *every* row is positive, stratified sampling hurt
+            overall — maybe batch size too small per stratum,
+            n_strata too large, or score too noisy. If every row is
+            negative, both populations benefit (best case).
+            """
+                ),
+                comparison_df,
+                fig_compare_bars,
+            ]
+        )
+    _out
+    return
+
+
+@app.cell
+def _(
+    F_,
+    H,
+    base_nll_per,
+    base_point,
+    compare_ready,
+    mo,
+    pl,
+    test_act,
+    test_ds,
+    test_point,
+):
+    import altair as _alt
+
+    if not compare_ready:
+        worst_case_df = None
+        fig_worst_cases = None
+        _out_w = mo.md("_Load a baseline to see worst-case comparison._")
+    else:
+        _mean_delta = test_act.mean(axis=1)
+        _dyn_mask = np.abs(_mean_delta) > 0.005
+        _win_nll = base_nll_per.sum(axis=1)
+        _cand = np.where(_dyn_mask)[0]
+        _sorted = _cand[np.argsort(-_win_nll[_cand])]
+        _N_WORST = min(12, len(_sorted))
+        _worst_idx = _sorted[:_N_WORST]
+
+        _rows_w = []
+        for _wi in _worst_idx:
+            _enc, _dec_stim, _dec_target = test_ds[int(_wi)]
+            _hist = _enc[:, 0].numpy()
+            _last = float(_hist[-1])
+            _actual = _last + np.cumsum(_dec_target.numpy())
+            _base_abs = _last + np.cumsum(base_point[int(_wi)])
+            _strat_abs = _last + np.cumsum(test_point[int(_wi)])
+            _rows_w.append(
+                dict(window=int(_wi), t=int(H - 1), cnr=_last, cond="baseline")
+            )
+            _rows_w.append(
+                dict(
+                    window=int(_wi), t=int(H - 1), cnr=_last, cond="stratified"
+                )
+            )
+            for _t, _v in enumerate(_hist):
+                _rows_w.append(
+                    dict(window=int(_wi), t=int(_t), cnr=float(_v), cond="history")
+                )
+            for _t in range(F_):
+                _rows_w.append(
+                    dict(
+                        window=int(_wi),
+                        t=int(H + _t),
+                        cnr=float(_actual[_t]),
+                        cond="truth",
+                    )
+                )
+                _rows_w.append(
+                    dict(
+                        window=int(_wi),
+                        t=int(H + _t),
+                        cnr=float(_base_abs[_t]),
+                        cond="baseline",
+                    )
+                )
+                _rows_w.append(
+                    dict(
+                        window=int(_wi),
+                        t=int(H + _t),
+                        cnr=float(_strat_abs[_t]),
+                        cond="stratified",
+                    )
+                )
+        worst_case_df = pl.DataFrame(_rows_w)
+
+        _colors = {
+            "history": "#2c3e50",
+            "truth": "#000000",
+            "baseline": "#E45756",
+            "stratified": "#4C78A8",
+        }
+        _dom = list(_colors.keys())
+        _rng = [_colors[k] for k in _dom]
+        _enc_c = _alt.Color(
+            "cond:N",
+            scale=_alt.Scale(domain=_dom, range=_rng),
+            legend=_alt.Legend(title="series"),
+        )
+
+        _lines = (
+            _alt.Chart()
+            .mark_line(strokeWidth=1.8)
+            .encode(
+                x=_alt.X("t:Q", title="t"),
+                y=_alt.Y("cnr:Q", title="CNR", scale=_alt.Scale(zero=False)),
+                color=_enc_c,
+                detail="cond:N",
+                tooltip=["window", "cond", "t", "cnr"],
+            )
+            .transform_filter(_alt.datum.cond != "truth")
+        )
+        _truth = (
+            _alt.Chart()
+            .mark_line(strokeWidth=2, strokeDash=[4, 3])
+            .encode(x="t:Q", y="cnr:Q", color=_enc_c, detail="cond:N")
+            .transform_filter(_alt.datum.cond == "truth")
+        )
+        _boundary = (
+            _alt.Chart(pl.DataFrame({"t": [H]}))
+            .mark_rule(color="gray", strokeDash=[2, 3])
+            .encode(x="t:Q")
+        )
+
+        fig_worst_cases = (
+            _alt.layer(_lines, _truth, _boundary, data=worst_case_df)
+            .properties(width=220, height=150)
+            .facet(facet=_alt.Facet("window:N", title=None), columns=4)
+            .properties(
+                title=f"Top-{_N_WORST} worst-NLL dynamic windows (ranked by baseline)"
+            )
+            .resolve_scale(y="independent")
+        )
+
+        _out_w = mo.vstack(
+            [
+                mo.md(
+                    f"""
+            ## Worst-case windows (ranked by baseline NLL)
+
+            Top {_N_WORST} test windows the **baseline** model predicts
+            worst, filtered to dynamic phase
+            (`|mean(Δfuture)| > 0.005`). These are the rises the
+            baseline underpredicts and the drops it lags. Each panel
+            overlays truth (black dashed), baseline (red), stratified
+            (blue).
+
+            If the blue line hugs black more closely than red on these
+            panels, the stratified sampler transferred its
+            dynamic-heavy training signal to inference. If the two
+            prediction lines are nearly identical, changing the
+            sampling didn't help this failure mode — likely because
+            the model capacity, not the data mix, is the bottleneck.
+            """
+                ),
+                fig_worst_cases,
+            ]
+        )
+    _out_w
     return
 
 

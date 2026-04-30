@@ -108,7 +108,6 @@ def _(MDN, loader, mdn_loss, nn, optim, torch):
         if epoch % 20 == 0:
             print(f"Epoch {epoch:3d} | loss {avg:.4f}")
 
-
     return (model,)
 
 

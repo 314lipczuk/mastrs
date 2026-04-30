@@ -11,6 +11,7 @@ with app.setup:
 
     import math
     import os
+    import random
     import time
     import tempfile
     from dataclasses import dataclass
@@ -109,11 +110,12 @@ with app.setup:
         patience: int = 100
         tf_ratio_start: float = 1.0
         tf_ratio_end: float = 0.0
-        tf_anneal_frac: float = 0.5
-        tf_hold_frac: float = 0.3
+        tf_anneal_frac: float = 0.3
+        tf_hold_frac: float = 0.0
         grad_clip: float = 1.0
         train_stride: int = Field(5, ge=1)
         test_stride: int = Field(10, ge=1)
+        seed: int = 42
 
 
     class Seq2SeqDataset(Dataset):
@@ -296,6 +298,10 @@ with app.setup:
             mcfg = ctx.model_config
             tcfg = ctx.training_config
 
+            torch.manual_seed(tcfg.seed)
+            np.random.seed(tcfg.seed)
+            random.seed(tcfg.seed)
+
             cnr_tr, stim_tr = dataset["train"]
             cnr_va, stim_va = dataset["val"]
 
@@ -324,14 +330,15 @@ with app.setup:
             opt = torch.optim.Adam(
                 model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay
             )
-            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, patience=10, factor=0.5
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=tcfg.epochs, eta_min=1e-5
             )
             tf_fn = _tf_schedule_linear(tcfg, tcfg.epochs)
 
             hist = {"train_loss": [], "val_loss": [], "tf_ratio": []}
             ckpt_fd, ckpt = tempfile.mkstemp(suffix=".pt")
             os.close(ckpt_fd)
+            torch.save(model.state_dict(), ckpt)
 
             best, wait = float("inf"), 0
             for ep in range(tcfg.epochs):
@@ -351,15 +358,16 @@ with app.setup:
                 hist["train_loss"].append(t)
                 hist["val_loss"].append(v)
                 hist["tf_ratio"].append(tf_r)
-                sched.step(v)
-                if v < best:
-                    best, wait = v, 0
-                    torch.save(model.state_dict(), ckpt)
-                else:
-                    wait += 1
-                    if wait >= tcfg.patience:
-                        print(f"Early stopping at epoch {ep}")
-                        break
+                sched.step()
+                if tf_r < 0.5:
+                    if v < best:
+                        best, wait = v, 0
+                        torch.save(model.state_dict(), ckpt)
+                    else:
+                        wait += 1
+                        if wait >= tcfg.patience:
+                            print(f"Early stopping at epoch {ep}")
+                            break
                 if ep % ctx.print_every == 0:
                     print(f"Epoch {ep:3d} | tf={tf_r:.2f} T:{t:.5f} V:{v:.5f}")
                 if ctx.progress_cb is not None:
@@ -2853,6 +2861,25 @@ def _(
             ),
             chart_components,
         ]
+    )
+    return
+
+
+@app.cell
+def _(
+    btn_m1,
+    btn_m10,
+    btn_m5,
+    btn_p1,
+    btn_p10,
+    btn_p5,
+    btn_reset,
+    mo,
+    track_selector,
+):
+    track_selector, mo.hstack(
+        [btn_m10, btn_m5, btn_m1, btn_p1, btn_p5, btn_p10, btn_reset],
+        justify="start",
     )
     return
 

@@ -51,27 +51,30 @@ def get_device():
 # --- Experiment directory scanning ---
 
 def scan_experiment_dirs(results_path: str | Path) -> list[str]:
-    """Return experiment subdir names under results_path, newest first.
+    """Return **loadable** experiment paths under results_path, newest first.
 
-    An entry counts as an experiment if it contains any of: bundle.pt,
-    checkpoints/bundle.pt, experiment.json, started.txt, or a nested dir
-    with bundle.pt (grouped runs like ensembles).
+    A path is loadable if it contains ``bundle.pt`` or
+    ``checkpoints/bundle.pt``. For grouped parents (ensembles etc.) whose
+    bundles live one level deeper, the nested children are surfaced as
+    ``"parent/child"`` paths. Parents with no usable bundle are skipped.
     """
     results_path = Path(results_path)
     if not results_path.is_dir():
         return []
-    dirs = []
+
+    def _is_loadable(p: Path) -> bool:
+        return (p / "bundle.pt").exists() or (p / "checkpoints" / "bundle.pt").exists()
+
+    entries: list[tuple[Path, float]] = []
     for subdir in results_path.iterdir():
         if not subdir.is_dir():
             continue
-        has_final = (subdir / "bundle.pt").exists()
-        has_checkpoint = (subdir / "checkpoints" / "bundle.pt").exists()
-        has_manifest = (subdir / "experiment.json").exists()
-        has_started = (subdir / "started.txt").exists()
-        has_sub_bundles = any(
-            sub.glob("bundle.pt") for sub in subdir.iterdir() if sub.is_dir()
-        )
-        if has_final or has_checkpoint or has_manifest or has_sub_bundles or has_started:
-            dirs.append(subdir)
-    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return [d.name for d in dirs]
+        if _is_loadable(subdir):
+            entries.append((subdir, subdir.stat().st_mtime))
+            continue
+        for nested in subdir.iterdir():
+            if nested.is_dir() and _is_loadable(nested):
+                entries.append((nested, nested.stat().st_mtime))
+
+    entries.sort(key=lambda t: t[1], reverse=True)
+    return [str(p.relative_to(results_path)) for p in (e[0] for e in entries)]

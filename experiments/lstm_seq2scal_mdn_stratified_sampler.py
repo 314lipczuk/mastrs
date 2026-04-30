@@ -11,6 +11,7 @@ with app.setup:
 
     import math
     import os
+    import random
     import time
     import tempfile
     from dataclasses import dataclass
@@ -109,13 +110,14 @@ with app.setup:
         patience: int = 100
         tf_ratio_start: float = 1.0
         tf_ratio_end: float = 0.0
-        tf_anneal_frac: float = 0.5
-        tf_hold_frac: float = 0.3
+        tf_anneal_frac: float = 0.3
+        tf_hold_frac: float = 0.0
         grad_clip: float = 1.0
         train_stride: int = Field(5, ge=1)
         test_stride: int = Field(10, ge=1)
         use_stratified_sampler: bool = True
         n_strata: int = Field(3, ge=2)
+        seed: int = 42
 
 
     class Seq2SeqDataset(Dataset):
@@ -354,6 +356,10 @@ with app.setup:
             mcfg = ctx.model_config
             tcfg = ctx.training_config
 
+            torch.manual_seed(tcfg.seed)
+            np.random.seed(tcfg.seed)
+            random.seed(tcfg.seed)
+
             cnr_tr, stim_tr = dataset["train"]
             cnr_va, stim_va = dataset["val"]
 
@@ -403,6 +409,7 @@ with app.setup:
             hist = {"train_loss": [], "val_loss": [], "tf_ratio": []}
             ckpt_fd, ckpt = tempfile.mkstemp(suffix=".pt")
             os.close(ckpt_fd)
+            torch.save(model.state_dict(), ckpt)
 
             best, wait = float("inf"), 0
             for ep in range(tcfg.epochs):
@@ -423,14 +430,15 @@ with app.setup:
                 hist["val_loss"].append(v)
                 hist["tf_ratio"].append(tf_r)
                 sched.step(v)
-                if v < best:
-                    best, wait = v, 0
-                    torch.save(model.state_dict(), ckpt)
-                else:
-                    wait += 1
-                    if wait >= tcfg.patience:
-                        print(f"Early stopping at epoch {ep}")
-                        break
+                if tf_r < 0.5:
+                    if v < best:
+                        best, wait = v, 0
+                        torch.save(model.state_dict(), ckpt)
+                    else:
+                        wait += 1
+                        if wait >= tcfg.patience:
+                            print(f"Early stopping at epoch {ep}")
+                            break
                 if ep % ctx.print_every == 0:
                     print(f"Epoch {ep:3d} | tf={tf_r:.2f} T:{t:.5f} V:{v:.5f}")
                 if ctx.progress_cb is not None:
@@ -1050,7 +1058,7 @@ def _(F_, pl, qplot, test_act, test_point, test_std):
         title="Empirical coverage (|residual| ≤ k·σ) per step", height=300,
     )
     fig_calib
-    return (fig_calib,)
+    return calib_df, fig_calib
 
 
 @app.cell
@@ -1428,7 +1436,7 @@ def _(mo, pl, test_pi):
             fig_modes,
         ]
     )
-    return (fig_modes,)
+    return active_df, fig_modes
 
 
 @app.cell
@@ -1735,7 +1743,7 @@ def _(device, mo, model, n_stim, pl, test_ds):
             full_ablation_df,
         ]
     )
-    return
+    return (full_ablation_df,)
 
 
 @app.cell
@@ -1885,7 +1893,7 @@ def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
             fig_counterfactual,
         ]
     )
-    return
+    return (counterfactual_summary,)
 
 
 @app.cell
@@ -2153,7 +2161,7 @@ def _(mixture_metrics_df, mo, pl, qplot, test_ds):
             fig_stratified,
         ]
     )
-    return (fig_stratified,)
+    return fig_stratified, strat_df
 
 
 @app.cell
@@ -2294,7 +2302,7 @@ def _(mixture_metrics_df, mo, pl):
             fig_sharpness,
         ]
     )
-    return (fig_sharpness,)
+    return fig_sharpness, sharp_df
 
 
 @app.cell
@@ -3616,6 +3624,273 @@ def _(
         hostname=hostname,
         is_cluster=is_cluster,
     )
+    return
+
+
+@app.cell
+def _(
+    EXPERIMENT_NAME,
+    MODE,
+    ablation_df,
+    active_df,
+    artifacts,
+    calib_df,
+    cnr_te_used,
+    cnr_tr,
+    cnr_va,
+    counterfactual_summary,
+    data_source,
+    eval_metrics,
+    experiment_path,
+    full_ablation_df,
+    history,
+    hostname,
+    is_cluster,
+    load_experiment,
+    model,
+    model_config_used,
+    pl,
+    sharp_df,
+    strat_df,
+    test_ds,
+    test_pi,
+    training_config,
+):
+    _sep = "=" * 72
+    _sub = "-" * 72
+    print(_sep)
+    print(f" RUN SUMMARY - {EXPERIMENT_NAME}")
+    print(_sep)
+    print(f" Mode           : {MODE}")
+    print(f" Host           : {hostname} ({'cluster' if is_cluster else 'local'})")
+    if experiment_path is not None:
+        print(f" Experiment dir : {experiment_path}")
+    elif artifacts.tracker is not None and getattr(
+        artifacts.tracker, "directory", None
+    ):
+        print(f" Experiment dir : {artifacts.tracker.directory}")
+
+    _loaded_tcfg = None
+    _loaded_stats = None
+    _loaded_metrics = None
+    if MODE == "load" and experiment_path is not None:
+        try:
+            _bundle = load_experiment(str(experiment_path))
+            _loaded_tcfg = _bundle.training_config
+            _loaded_stats = (_bundle.training_results or {}).get("stats")
+            _loaded_metrics = _bundle.metrics
+            print(f" Run name       : {_bundle.name}")
+            print(f" Saved at       : {_bundle.timestamp}")
+        except Exception as _e:
+            print(f" [warn] load_experiment failed: {_e}")
+
+    print(_sub)
+    print(" MODEL")
+    print(_sub)
+    _n_params = sum(p.numel() for p in model.parameters())
+    _n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f" Class          : {type(model).__name__}")
+    print(f" Params (total) : {_n_params:,}")
+    print(f" Params (train) : {_n_trainable:,}")
+    print(f" Device         : {next(model.parameters()).device}")
+    try:
+        _mc = model_config_used.model_dump()
+    except AttributeError:
+        _mc = dict(model_config_used) if model_config_used is not None else {}
+    for _k, _v in _mc.items():
+        print(f"   - {_k:<22} {_v}")
+
+    print(_sub)
+    print(" TRAINING CONFIG")
+    print(_sub)
+    if training_config is not None:
+        try:
+            _tc = training_config.model_dump()
+        except AttributeError:
+            _tc = dict(training_config)
+    elif _loaded_tcfg is not None:
+        _tc = dict(_loaded_tcfg)
+    else:
+        _tc = {}
+    if _tc:
+        for _k, _v in _tc.items():
+            print(f"   - {_k:<22} {_v}")
+    else:
+        print("   (not available)")
+
+    print(_sub)
+    print(" DATA")
+    print(_sub)
+    print(f" Source         : {data_source}")
+    print(
+        f" Trajectories   : train={len(cnr_tr)}  val={len(cnr_va)}  test={len(cnr_te_used)}"
+    )
+    print(f" Test windows   : {len(test_ds)}")
+    print(
+        f" History/Future : H={model_config_used.history_len}  F={model_config_used.future_len}"
+    )
+
+    print(_sub)
+    print(" TRAINING STATS")
+    print(_sub)
+    _elapsed = float(artifacts.train_elapsed or 0.0)
+    if (
+        _elapsed == 0.0
+        and _loaded_stats
+        and _loaded_stats.get("train_elapsed_s") is not None
+    ):
+        _elapsed = float(_loaded_stats["train_elapsed_s"])
+    print(f" Elapsed        : {_elapsed:.1f}s ({_elapsed / 60:.2f} min)")
+    _tr_l = list(history.get("train_loss") or [])
+    _va_l = list(history.get("val_loss") or [])
+    _tf = list(history.get("tf_ratio") or [])
+    print(f" Epochs run     : {len(_tr_l)}")
+    if _tr_l:
+        print(
+            f" Train loss     : first={_tr_l[0]:.5f}  last={_tr_l[-1]:.5f}  min={min(_tr_l):.5f}"
+        )
+    if _va_l:
+        _best_i = int(np.argmin(_va_l))
+        print(
+            f" Val loss       : first={_va_l[0]:.5f}  last={_va_l[-1]:.5f}  best={_va_l[_best_i]:.5f} @ epoch {_best_i}"
+        )
+    if _tf:
+        print(f" TF ratio       : start={_tf[0]:.3f}  end={_tf[-1]:.3f}")
+    if _loaded_stats:
+        for _k, _v in _loaded_stats.items():
+            if _k == "train_elapsed_s":
+                continue
+            print(f"   - {_k:<22} {_v}")
+
+    print(_sub)
+    print(" EVALUATION METRICS (core)")
+    print(_sub)
+    _em = eval_metrics or _loaded_metrics or {}
+    for _k, _v in _em.items():
+        if isinstance(_v, float):
+            print(f"   - {_k:<32} {_v:.6f}")
+        else:
+            print(f"   - {_k:<32} {_v}")
+
+    print(_sub)
+    print(" CALIBRATION COVERAGE (ideal 1s=0.683 2s=0.954 3s=0.997)")
+    print(_sub)
+    _cov_piv = calib_df.pivot(on="k_sigma", index="step", values="coverage").sort("step")
+    _cov_cols = [c for c in _cov_piv.columns if c != "step"]
+    print(" step  " + "  ".join(f"{c:>8}" for c in _cov_cols))
+    for _row in _cov_piv.iter_rows(named=True):
+        _vals = "  ".join(f"{float(_row[c]):>8.4f}" for c in _cov_cols)
+        print(f" {int(_row['step']):>4}  {_vals}")
+    _cov_mean = {c: float(_cov_piv[c].mean()) for c in _cov_cols}
+    print(" mean  " + "  ".join(f"{_cov_mean[c]:>8.4f}" for c in _cov_cols))
+
+    print(_sub)
+    print(" MODE USAGE")
+    print(_sub)
+    _K = int(test_pi.shape[-1])
+    _active_inline = (test_pi > 0.05).sum(axis=-1)
+    _entropy_inline = -(test_pi * np.log(test_pi + 1e-12)).sum(axis=-1)
+    print(f" K components              : {_K}")
+    print(f" Max entropy (log K)       : {float(np.log(_K)):.4f}")
+    print(f" Mean active count (pi>.05): {float(_active_inline.mean()):.4f}")
+    print(f" Frac single-mode preds    : {float((_active_inline == 1).mean()):.4f}")
+    print(f" Frac all-K-active preds   : {float((_active_inline == _K).mean()):.4f}")
+    print(f" Mean pi entropy           : {float(_entropy_inline.mean()):.4f}")
+    print(f" Median pi entropy         : {float(np.median(_entropy_inline)):.4f}")
+    print(" active-count histogram    :")
+    for _row in active_df.sort("active_count").iter_rows(named=True):
+        print(f"   k={int(_row['active_count'])}: {int(_row['count'])}")
+
+    print(_sub)
+    print(" INPUT FEATURE ABLATION (zero each stim channel)")
+    print(_sub)
+    _abl = ablation_df.filter(pl.col("idx") >= 0).sort("d_nll", descending=True)
+    print(f" {'channel':<24}  {'d_nll':>10}  {'d_crps':>10}  {'sigma_ratio':>12}")
+    for _row in _abl.iter_rows(named=True):
+        print(
+            f" {str(_row['channel']):<24}  {float(_row['d_nll']):>+10.5f}  {float(_row['d_crps']):>+10.5f}  {float(_row['sigma_ratio']):>12.5f}"
+        )
+    print(f" sum |d_nll|              : {float(_abl['d_nll'].abs().sum()):.5f}")
+    print(f" max |d_nll|              : {float(_abl['d_nll'].abs().max()):.5f}")
+    _base_row = ablation_df.filter(pl.col("idx") == -1).row(0, named=True)
+    print(f" baseline nll             : {float(_base_row['nll']):.5f}")
+    print(f" baseline crps            : {float(_base_row['crps']):.5f}")
+    print(f" baseline sigma_eff       : {float(_base_row['sigma']):.5f}")
+
+    print(_sub)
+    print(" BLOCK ABLATIONS (zero CNR history / all stim)")
+    print(_sub)
+    print(
+        f" {'variant':<18}  {'nll':>10}  {'crps':>10}  {'sigma':>10}  {'d_nll':>10}  {'d_crps':>10}  {'sigma_ratio':>12}"
+    )
+    for _row in full_ablation_df.iter_rows(named=True):
+        print(
+            f" {str(_row['variant']):<18}  {float(_row['nll']):>10.5f}  {float(_row['crps']):>10.5f}  {float(_row['sigma']):>10.5f}  {float(_row['d_nll']):>+10.5f}  {float(_row['d_crps']):>+10.5f}  {float(_row['sigma_ratio']):>12.5f}"
+        )
+
+    print(_sub)
+    print(" COUNTERFACTUAL STIMULATION (future actual/all_on/all_off)")
+    print(_sub)
+    for _k in sorted(counterfactual_summary.keys()):
+        _v = counterfactual_summary[_k]
+        if isinstance(_v, float):
+            print(f"   - {_k:<32} {_v:.6f}")
+        else:
+            print(f"   - {_k:<32} {_v}")
+
+    print(_sub)
+    print(" STRATIFIED BY RESPONSE MAGNITUDE (mean across forecast steps)")
+    print(_sub)
+    _strat_mean = (
+        strat_df.group_by("bin")
+        .agg(
+            [
+                pl.col("nll").mean().alias("nll"),
+                pl.col("crps").mean().alias("crps"),
+                pl.col("sigma").mean().alias("sigma"),
+                pl.col("mae").mean().alias("mae"),
+                pl.col("n").sum().alias("n"),
+            ]
+        )
+        .sort("bin")
+    )
+    print(
+        f" {'bin':<18}  {'nll':>10}  {'crps':>10}  {'sigma':>10}  {'mae':>10}  {'n':>8}"
+    )
+    for _row in _strat_mean.iter_rows(named=True):
+        print(
+            f" {str(_row['bin']):<18}  {float(_row['nll']):>10.5f}  {float(_row['crps']):>10.5f}  {float(_row['sigma']):>10.5f}  {float(_row['mae']):>10.5f}  {int(_row['n']):>8}"
+        )
+
+    print(_sub)
+    print(" SHARPNESS vs ACCURACY (deciles of predicted sigma_eff)")
+    print(_sub)
+    print(
+        f" {'bin':>4}  {'sigma_mean':>10}  {'E|resid|':>10}  {'ideal':>10}  {'dev':>10}  {'n':>8}"
+    )
+    _sharp_sorted = sharp_df.sort("sigma_bin")
+    for _row in _sharp_sorted.iter_rows(named=True):
+        _sm = float(_row["sigma_mean"])
+        _er = float(_row["abs_resid_mean"])
+        _id = float(_row["ideal_abs_resid"])
+        _dv = _er - _id
+        print(
+            f" {int(_row['sigma_bin']):>4}  {_sm:>10.5f}  {_er:>10.5f}  {_id:>10.5f}  {_dv:>+10.5f}  {int(_row['n']):>8}"
+        )
+    _sm_arr = np.asarray(_sharp_sorted["sigma_mean"].to_numpy(), dtype=float)
+    _er_arr = np.asarray(_sharp_sorted["abs_resid_mean"].to_numpy(), dtype=float)
+    if len(_sm_arr) > 1:
+        _pearson = float(np.corrcoef(_sm_arr, _er_arr)[0, 1])
+    else:
+        _pearson = float("nan")
+    _id_arr = np.asarray(_sharp_sorted["ideal_abs_resid"].to_numpy(), dtype=float)
+    _mean_dev = float((_er_arr - _id_arr).mean())
+    print(f" Pearson(sigma_mean, E|resid|): {_pearson:+.4f}")
+    print(
+        f" Mean deviation from ideal    : {_mean_dev:+.5f}  (+ = underconfident, - = overconfident)"
+    )
+
+    print(_sep)
     return
 
 
