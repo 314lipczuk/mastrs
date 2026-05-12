@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 
 def load_and_clean(
-    parquet_path: str,
+    parquet_path: "str | pd.DataFrame",
     cell_selection_csv: str | None = None,
     tracking_threshold: float = 0.9,
     norm_until_timepoint: int = 10,
@@ -15,8 +15,9 @@ def load_and_clean(
 
     Parameters
     ----------
-    parquet_path : str
-        Path to the parquet file with raw tracking data.
+    parquet_path : str or pd.DataFrame
+        Path to the parquet file with raw tracking data, or a preloaded
+        dataframe (used by adapter loaders like ``load_and_clean_bo``).
     cell_selection_csv : str or None
         Path to a ``cell_selection.csv`` for manual filtering.  Rows whose
         ``deleted`` column is ``True`` are removed.  Pass ``None`` to skip.
@@ -29,7 +30,10 @@ def load_and_clean(
     baseline_cnr_max : float or None
         If set, cells whose ``median_cnr_0_9`` exceeds this value are dropped.
     """
-    df = pd.read_parquet(parquet_path)
+    if isinstance(parquet_path, pd.DataFrame):
+        df = parquet_path.copy()
+    else:
+        df = pd.read_parquet(parquet_path)
 
     # --- derived columns ---------------------------------------------------
     df["cnr"] = df["mean_intensity_C1_ring"] / df["mean_intensity_C1_nuc"]
@@ -103,6 +107,56 @@ def load_and_clean(
     return df
 
 
+
+
+def load_and_clean_bo(
+    parquet_path: str,
+    cell_selection_csv: str | None = None,
+    tracking_threshold: float = 0.9,
+    norm_until_timepoint: int = 10,
+    baseline_cnr_max: float | None = 0.8,
+    cell_line: str | None = 'EGFR',
+) -> pd.DataFrame:
+    """Adapter loader for BO oscillation parquet files.
+
+    BO datasets carry ``phase_name`` / ``phase_id`` / ``condition_idx`` instead
+    of ``ramp_pattern_name``, ``area_nuc`` instead of ``area``, and no
+    ``cell_line`` column. This function reads the parquet in-memory, adds the
+    columns that ``load_and_clean`` expects, and then delegates to it. The
+    source parquet is not modified.
+
+    The synthesized ``ramp_pattern_name`` encodes ``condition_idx`` so that
+    different optimizer-chosen conditions remain distinguishable downstream.
+    """
+    df = pd.read_parquet(parquet_path)
+
+    drop_object_cols = [c for c in ('channels', 'ref_channels', 'img_shape')
+                        if c in df.columns]
+    if drop_object_cols:
+        df = df.drop(columns=drop_object_cols)
+
+    if 'condition_idx' in df.columns:
+        df['ramp_pattern_name'] = 'bo_osc_c' + df['condition_idx'].astype('string')
+    else:
+        df['ramp_pattern_name'] = 'bo_osc'
+
+    if 'area' not in df.columns and 'area_nuc' in df.columns:
+        df['area'] = df['area_nuc']
+
+    if 'cell_line' not in df.columns:
+        df['cell_line'] = cell_line if cell_line is not None else 'EGFR'
+
+    if 'stim_power' in df.columns:
+        df['stim_power'] = df['stim_power'].fillna(0)
+
+    return load_and_clean(
+        df,
+        cell_selection_csv=cell_selection_csv,
+        tracking_threshold=tracking_threshold,
+        norm_until_timepoint=norm_until_timepoint,
+        baseline_cnr_max=baseline_cnr_max,
+        cell_line=cell_line,
+    )
 
 
 cal_power_pct = [0,1,2,4,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100]
@@ -528,24 +582,26 @@ def check_df(df):
 
 if __name__ == '__main__':
     exp_paths = [
-    '/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-11-03_3-2-1minIntervals/', # 660 cells, # 180 min
-    '/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-10-12_DoseResponse', # 800 cells, 40min
-    '/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-11-02_Sustained_1min', # 1350 cells, 120 min
-    '/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-09-04_RampReverse',
+    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-11-03_3-2-1minIntervals/', load_and_clean), # 660 cells, # 180 min
+    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-10-12_DoseResponse', load_and_clean), # 800 cells, 40min
+    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-11-02_Sustained_1min', load_and_clean), # 1350 cells, 120 min
+    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-09-04_RampReverse', load_and_clean),
+    ('/Volumes/imaging.data/PertzLab/Alex/Oscillation_BO/2026-05-01_bo_erk_oscillation_v8_freq_range_wider', load_and_clean_bo),
     ]
     # load these and process according to the above-defined pipeline, then save as dataset.parquet
     dfs = []
-    for ep in exp_paths:    
+    for ep, loader in exp_paths:
+        print('starting ', ep, flush=True)
         exp = Path(ep)
-        p = exp / 'exp_data.parquet' 
+        p = exp / 'exp_data.parquet'
         if not p.exists():
             raise FileNotFoundError(f"Data file not found: {p}")
 
         cell_sel_path = exp / 'cell_selection.csv'
         if cell_sel_path.exists():
-            df_i = load_and_clean(p, cell_selection_csv=cell_sel_path)
+            df_i = loader(p, cell_selection_csv=cell_sel_path)
         else:
-            df_i = load_and_clean(p)
+            df_i = loader(p)
         dfs.append(df_i.copy())
 
     df = pd.concat(dfs, ignore_index=True)
