@@ -31,6 +31,7 @@ dependencies = [
     "tabulate>=0.10.0",
     "hastyplot",
     "panel>=1.8.10",
+    "h5py>=3.16.0",
 ]
 
 [tool.uv.sources]

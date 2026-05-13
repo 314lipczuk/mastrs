@@ -133,7 +133,7 @@ def load_synthetic_v2(
 
 
 def load_real(
-    path: str = "dataset.parquet",
+    path: str = "dataset.parquet.v0",
     window_size: int = 20,
     stride: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -191,7 +191,7 @@ def load_real_uncertain(
 
 
 def load_real_tracks(
-    path: str = "dataset.parquet",
+    path: str = "dataset.parquet.v0",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load real microscopy data as per-cell full trajectories (no windowing).
 
@@ -236,7 +236,31 @@ def load_real_uncertain_tracks(
     return cnr, stim, conditions
 
 
-AVAILABLE_DATASETS = ("synthetic", "synthetic_v2", "real", "real_uncertain")
+def load_real_plus_bo_tracks(
+    path: str = "dataset.parquet",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Post-BO real dataset (`dataset.parquet`); pre-BO snapshot is `real`."""
+    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS, make_tracks
+
+    df = pd.read_parquet(path)
+    cnr, stim, meta = make_tracks(
+        df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
+    )
+    conditions = meta["ramp_pattern_name"].to_numpy()
+    return cnr, stim, conditions
+
+
+AVAILABLE_DATASETS = (
+    "synthetic", "synthetic_v2", "real", "real_uncertain", "real_plus_bo",
+)
+
+
+# `real` is the pre-BO snapshot (preserves the semantics of past experiments
+# that recorded data_source="real"). `real_plus_bo` is the post-BO file.
+REAL_DATASET_PATHS = {
+    "real": "dataset.parquet.v0",
+    "real_plus_bo": "dataset.parquet",
+}
 
 
 def load(
@@ -269,6 +293,8 @@ def load(
         if "window_size" in kwargs or "stride" in kwargs:
             return load_real_uncertain(**kwargs)
         return load_real_uncertain_tracks(**kwargs)
+    if ds_name == "real_plus_bo":
+        return load_real_plus_bo_tracks(**kwargs)
     raise ValueError(
         f"Unknown dataset {ds_name!r}. Available: {list(AVAILABLE_DATASETS)}"
     )
