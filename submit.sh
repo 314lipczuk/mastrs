@@ -3,6 +3,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=4G
 #SBATCH --time=04:00:00
+#SBATCH --mail-user=przemyslaw.pilipczuk@students.unibe.ch
+#SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
 
