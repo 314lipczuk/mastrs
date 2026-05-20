@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.22.5"
+__generated_with = "0.23.6"
 app = marimo.App(width="full")
 
 with app.setup:
@@ -2651,9 +2651,35 @@ def _(device, mo, model, n_stim, pl, test_ds):
 def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
     from scipy.special import logsumexp as _logsumexp
 
-    _N_WIN = min(500, len(test_ds))
-    _idx = np.linspace(0, len(test_ds) - 1, _N_WIN, dtype=int).tolist()
+    # Magnitude-stratified subsampling: 125 windows per response-magnitude
+    # quartile (Q1=flat .. Q4=responsive) instead of a linspace through the
+    # dataloader's order, which over-samples whatever resp_mag mix that order
+    # happens to produce and inflates the all-windows ratio (Q1 has tiny
+    # target_std → ratio looks artificially good). Match the quartile binning
+    # used by the "STRATIFIED BY RESPONSE MAGNITUDE" cell below so numbers
+    # are directly comparable.
+    _N_PER_BIN = 125
+    _resp_mag_full = np.empty(len(test_ds), dtype=np.float32)
+    for _i in range(len(test_ds)):
+        _enc_in_i, _, _dec_tgt_i = test_ds[_i][:3]
+        _hist_cnr_i = _enc_in_i[:, 0].numpy()
+        _last_i = float(_hist_cnr_i[-1])
+        _future_i = _last_i + np.cumsum(_dec_tgt_i.numpy())
+        _resp_mag_full[_i] = float(
+            np.concatenate([_hist_cnr_i, _future_i]).std()
+        )
+    _q_edges = np.quantile(_resp_mag_full, [0.25, 0.5, 0.75])
+    _bin_idx_full = np.digitize(_resp_mag_full, _q_edges)  # 0..3
+    _rng_cf = np.random.default_rng(0)
+    _picked = []
+    for _b in range(4):
+        _ids_b = np.where(_bin_idx_full == _b)[0]
+        _take = min(_N_PER_BIN, len(_ids_b))
+        _picked.append(_rng_cf.choice(_ids_b, size=_take, replace=False))
+    _idx = np.sort(np.concatenate(_picked)).tolist()
+    _N_WIN = len(_idx)
     _subset = Subset(test_ds, _idx)
+    _bin_idx = _bin_idx_full[_idx]  # quartile id per row of the cf outputs
 
     _stim_max_arr = np.zeros(n_stim, dtype=np.float32)
     for _s in stim_te_used:
@@ -2714,6 +2740,38 @@ def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
 
     _y_std = float(_y_cf.std())
 
+    # Per-quartile ratios (the diagnostic that actually answers "MPC viable
+    # on responsive cells?"). Q1's ratio is denominator-driven and not
+    # meaningful — Q4 and "all except Q1" are the numbers to read.
+    _bin_keys = ["q1", "q2", "q3", "q4"]
+    _bin_labels = {
+        "q1": "Q1 (flat)", "q2": "Q2", "q3": "Q3", "q4": "Q4 (responsive)",
+        "all_except_q1": "All except Q1", "all_windows": "All windows",
+    }
+    def _bin_stats(mask):
+        if mask.sum() == 0:
+            return dict(point_diff=float("nan"), target_std=float("nan"),
+                        ratio=float("nan"), n=0)
+        _pp = float(_pp_diff[mask].mean())
+        _ts = float(_y_cf[mask].std())
+        return dict(point_diff=_pp, target_std=_ts,
+                    ratio=_pp / max(_ts, 1e-12), n=int(mask.sum()))
+
+    cf_strat = {k: _bin_stats(_bin_idx == i) for i, k in enumerate(_bin_keys)}
+    cf_strat["all_except_q1"] = _bin_stats(_bin_idx >= 1)
+    cf_strat["all_windows"] = _bin_stats(np.ones_like(_bin_idx, dtype=bool))
+
+    def _strat_row(k):
+        s = cf_strat[k]
+        return (
+            f"| {_bin_labels[k]} | {s['point_diff']:.5f} | "
+            f"{s['target_std']:.5f} | **{s['ratio']:.3f}** | {s['n']} |"
+        )
+    _strat_table_md = "\n".join(
+        _strat_row(k) for k in
+        ["q1", "q2", "q3", "q4", "all_except_q1", "all_windows"]
+    )
+
 
     def _nll_only(pi, mu, sig, y):
         y_ = y[..., None]
@@ -2744,6 +2802,7 @@ def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
 
     counterfactual_summary = dict(
         n_windows=int(_N_WIN),
+        sampling="stratified_by_resp_mag_quartile",
         mean_abs_point_diff_on_off=_pp_mean,
         mean_abs_top_mu_diff_on_off=_top_mu_diff,
         target_std=_y_std,
@@ -2753,12 +2812,14 @@ def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
         nll_actual=_nll_a,
         nll_all_on=_nll_on,
         nll_all_off=_nll_off,
+        stratified=cf_strat,
+        magnitude_quartile_edges=[float(x) for x in _q_edges],
     )
 
     mo.vstack(
         [
             mo.md(f"""
-        ## Counterfactual stimulation ({_N_WIN} test windows)
+        ## Counterfactual stimulation ({_N_WIN} test windows, magnitude-stratified)
 
         Swap the *future* stim (decoder input) between three settings and
         compare predictions against a single fixed history. Encoder input
@@ -2769,16 +2830,27 @@ def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
           training-set max (so the model sees a "fully stimulated" future).
         - **all_off**: future stim zeroed everywhere.
 
+        **Sampling**: windows are drawn in equal counts ({int(_N_WIN/4)} each)
+        from the four response-magnitude quartiles defined in the stratified
+        block below. A linspace / dataloader-order subsample would
+        over-represent flat (Q1) windows, where target_std is tiny and the
+        ratio is denominator-driven nonsense.
+
         **The MPC viability question**. If swapping all-on ↔ all-off barely
         moves the point prediction, the model isn't using stim to forecast.
         A controller can't optimise a signal the model ignores — no matter
-        how calibrated the marginal uncertainty looks.
+        how calibrated the marginal uncertainty looks. Read **Q4** for the
+        regime that actually matters; **All except Q1** for an honest
+        aggregate; ignore the **Q1** ratio (small num / small denom).
+
+        | bin | mean \\|point_on − point_off\\| | target std (ΔCNR) | **ratio** | n |
+        |---|---:|---:|---:|---:|
+    {_strat_table_md}
+
+        Other diagnostics ({_N_WIN}-window aggregate):
 
         | metric | value |
         |---|---:|
-        | Mean \\|point_on − point_off\\| (ΔCNR) | **{_pp_mean:.5f}** |
-        | Target std (ΔCNR) | {_y_std:.5f} |
-        | **Ratio — point diff / target std** | **{_pp_mean / max(_y_std, 1e-12):.3f}** |
         | Mean \\|top-component μ(on) − μ(off)\\| | {_top_mu_diff:.5f} |
         | Mean JS(π_on ‖ π_off) (nats) | {_js_mean:.4f} |
         | Fraction of steps where top-π flips | {_top_flip:.3f} |
@@ -2789,7 +2861,9 @@ def _(device, mo, model, n_stim, pl, qplot, stim_te_used, test_ds):
         **Reading the ratio**: ≪ 1 → the model's mean prediction is
         insensitive to stim, MPC is not viable with this model. ~1 or
         larger → stim materially shifts forecasts, MPC is at least
-        plausible.
+        plausible. A monotonic decline Q1→Q4 is the signature of a model
+        that learned the marginal stim response but not the responder-specific
+        one — sample reweighting toward Q4 is the canonical fix.
 
         **Mixing-weight shift**: if JS(π_on, π_off) ≈ 0 and the top-π
         component rarely flips, the model has **not** learned

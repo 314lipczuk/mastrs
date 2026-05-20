@@ -267,9 +267,9 @@ def _(DATA_SOURCE, DRY_RUN, config, load_data_button):
     F_ = config["future_len"]
     total_window = H + F_
 
-    if DATA_SOURCE == "real":
+    if DATA_SOURCE in ("real", "real_plus_bo"):
         cnr_all, stim_all, conditions_all = load(
-            "real", window_size=total_window, stride=max(1, total_window // 4),
+            DATA_SOURCE, window_size=total_window, stride=max(1, total_window // 4),
         )
     else:
         cnr_all, stim_all, conditions_all = load(DATA_SOURCE)

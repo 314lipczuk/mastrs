@@ -4,8 +4,7 @@ __generated_with = "0.22.5"
 app = marimo.App(width="full")
 
 
-@app.cell
-def _():
+with app.setup:
     import sys
     from pathlib import Path
 
@@ -172,36 +171,6 @@ def _():
         def loss(self, predictions, target):
             return nn.functional.mse_loss(predictions, target)
 
-    return (
-        AVAILABLE_DATASETS,
-        DataLoader,
-        Dataset,
-        ExperimentTracker,
-        Path,
-        STIM_COLS,
-        Seq2Scalar,
-        Seq2Seq,
-        Subset,
-        compute_training_stats,
-        device,
-        hostname,
-        is_cluster,
-        load,
-        mo,
-        n_stim,
-        nn,
-        np,
-        optim,
-        os,
-        parse_bool,
-        plt,
-        results_base,
-        tempfile,
-        time,
-        torch,
-        train_test_split,
-    )
-
 
 @app.cell
 def _(AVAILABLE_DATASETS, mo, parse_bool):
@@ -304,9 +273,9 @@ def _(
     F_ = config["future_len"]
     total_window = H + F_
 
-    if DATA_SOURCE == "real":
+    if DATA_SOURCE in ("real", "real_plus_bo"):
         cnr_all, stim_all, conditions_all = load(
-            "real", window_size=total_window, stride=max(1, total_window // 4),
+            DATA_SOURCE, window_size=total_window, stride=max(1, total_window // 4),
         )
     else:
         cnr_all, stim_all, conditions_all = load(DATA_SOURCE)

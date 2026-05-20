@@ -250,6 +250,26 @@ def load_real_plus_bo_tracks(
     return cnr, stim, conditions
 
 
+def load_real_plus_bo(
+    path: str = "dataset.parquet",
+    window_size: int = 20,
+    stride: int = 5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Windowed post-BO real dataset — counterpart to :func:`load_real`."""
+    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS, make_windows
+
+    df = pd.read_parquet(path)
+    cnr, stim_all, meta = make_windows(
+        df,
+        window_size=window_size,
+        stride=stride,
+        value_col="cnr_median_norm",
+        stim_cols=DEFAULT_STIM_COLS,
+    )
+    conditions = meta["ramp_pattern_name"].values
+    return cnr, stim_all, conditions
+
+
 AVAILABLE_DATASETS = (
     "synthetic", "synthetic_v2", "real", "real_uncertain", "real_plus_bo",
 )
@@ -294,6 +314,8 @@ def load(
             return load_real_uncertain(**kwargs)
         return load_real_uncertain_tracks(**kwargs)
     if ds_name == "real_plus_bo":
+        if "window_size" in kwargs or "stride" in kwargs:
+            return load_real_plus_bo(**kwargs)
         return load_real_plus_bo_tracks(**kwargs)
     raise ValueError(
         f"Unknown dataset {ds_name!r}. Available: {list(AVAILABLE_DATASETS)}"
