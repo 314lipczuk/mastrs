@@ -1,10 +1,12 @@
-"""Generate an mp4 walking a trained model through full single-cell trajectories.
+"""Generate mp4 videos walking a trained model through full single-cell trajectories.
 
-Cells are stratified by trajectory std (quartiles) and sampled
-``(n_low, n_mid, n_high)`` per stratum. For each picked cell, the context
-window slides forward in time; each frame shows the true trajectory plus the
-model's ``future_len``-step prediction with bands from the GMM's per-step
-``pred_std`` (no MC dropout — matches notebook eval semantics).
+Default behaviour: **one video per per-cell condition**, each video a 2×2 grid
+of panels — one panel per response-magnitude quartile (Q1..Q4 of ``std(cnr)``
+*within that condition*). One cell per panel by default; ``--n-per-bucket k``
+renders ``k`` videos per condition (set0..set{k-1}), each cycling through a
+different cell pick. Each frame shows the true trajectory plus the model's
+``future_len``-step prediction with bands from the GMM's per-step ``pred_std``
+(no MC dropout — matches notebook eval semantics).
 
 Both prediction and per-frame plotting are pluggable. ``predict_fn`` is
 required (model contracts differ); reference impls for the MDN minfeats family
@@ -14,6 +16,7 @@ live in this module (``predict_mdn_minfeats``, ``predict_mdn_minfeats_ewma``).
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +42,7 @@ class CellData:
     cnr: np.ndarray            # (T,) absolute CNR
     stim: np.ndarray           # (n_stim, T)
     condition: str
-    stratum: str               # "low" | "mid" | "high"
+    stratum: str               # "q1" | "q2" | "q3" | "q4"
 
 
 PredictFn = Callable[
@@ -119,38 +122,56 @@ def _resolve_main_model(
 
 def stratify_by_std(
     cnr_tracks: Sequence[np.ndarray],
+    indices: Sequence[int] | None = None,
     n_strata: int = 4,
 ) -> list[np.ndarray]:
-    """Quartile bins of per-cell ``std(cnr)``. Returns list of index arrays low→high."""
-    scores = np.array([np.std(np.asarray(c)) for c in cnr_tracks])
+    """Quantile bins of per-cell ``std(cnr)``, returned low→high.
+
+    If ``indices`` is given, stratification is done *within* that subset and the
+    returned arrays contain values from ``indices`` — useful for stratifying
+    inside a per-condition subgroup. With fewer cells than bins, some bins may
+    come back empty (caller should skip them).
+    """
+    if indices is None:
+        pool = np.arange(len(cnr_tracks))
+    else:
+        pool = np.asarray(list(indices), dtype=int)
+    if len(pool) == 0:
+        return [np.array([], dtype=int) for _ in range(n_strata)]
+    scores = np.array([np.std(np.asarray(cnr_tracks[i])) for i in pool])
     edges = np.quantile(scores, np.linspace(0.0, 1.0, n_strata + 1))
+    # nudge endpoints so digitize includes the extremes.
     edges[0] -= 1e-9
     edges[-1] += 1e-9
     bin_idx = np.digitize(scores, edges[1:-1])
-    return [np.where(bin_idx == k)[0] for k in range(n_strata)]
+    return [pool[bin_idx == k] for k in range(n_strata)]
 
 
-def select_cells(
-    strata: list[np.ndarray],
-    n_low: int,
-    n_mid: int,
-    n_high: int,
+def pick_per_quartile(
+    quartiles: list[np.ndarray],
+    n_per_bucket: int,
     rng: np.random.Generator,
-) -> list[tuple[int, str]]:
-    """Pick ``(idx, stratum_label)`` from low / mid (Q2∪Q3) / high pools."""
-    low_pool = strata[0]
-    mid_pool = np.concatenate(strata[1:-1]) if len(strata) > 2 else strata[1]
-    high_pool = strata[-1]
+) -> list[list[int]]:
+    """Sample ``min(n_per_bucket, |q|)`` cell indices from each quartile.
 
-    def _sample(pool, k):
-        k = min(k, len(pool))
-        return rng.choice(pool, size=k, replace=False)
+    Returns a list of 4 lists (one per quartile, in Q1..Q4 order). Empty
+    quartiles return ``[]`` and produce blank panels downstream.
+    """
+    out: list[list[int]] = []
+    for qpool in quartiles:
+        k = min(n_per_bucket, len(qpool))
+        if k == 0:
+            out.append([])
+        else:
+            out.append([int(x) for x in rng.choice(qpool, size=k, replace=False)])
+    return out
 
-    picks: list[tuple[int, str]] = []
-    picks += [(int(i), "low") for i in _sample(low_pool, n_low)]
-    picks += [(int(i), "mid") for i in _sample(mid_pool, n_mid)]
-    picks += [(int(i), "high") for i in _sample(high_pool, n_high)]
-    return picks
+
+def _safe_filename(s: str) -> str:
+    """Reduce a condition label to something safe for a filename."""
+    s = str(s).strip()
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    return s or "unlabeled"
 
 
 # ---------------------------------------------------- reference predict_fn
@@ -269,9 +290,59 @@ def predict_mdn_minfeats(
     return abs_mean.astype(np.float32), abs_sigma.astype(np.float32)
 
 
+def predict_seq2seq_deltas(
+    model: "torch.nn.Module",
+    cell: CellData,
+    t: int,
+    future_len: int,
+    history_len: int,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Deterministic delta predictor for the vanilla seq2seq / seq2scal notebooks.
+
+    Encoder input: ``[cnr, *STIM_COLS]`` over the H-step history; decoder consumes
+    the full stim-feature vector over the F-step future. Model returns ``(B, F)``
+    per-step CNR deltas. No aleatoric output, so ``sigma`` comes back as zeros —
+    the video bands collapse to the mean line, matching what those models give us.
+    """
+    H = history_len
+    T = cell.cnr.shape[0]
+    if t < H or t >= T:
+        raise ValueError(f"t={t} out of bounds for history_len={H}, T={T}")
+    F = min(future_len, T - t)
+
+    cnr = cell.cnr.astype(np.float32)
+    stim = cell.stim.astype(np.float32)  # (n_stim, T)
+
+    enc_in = np.concatenate(
+        [cnr[t - H:t, None], stim[:, t - H:t].T], axis=-1,
+    )                                                       # (H, 1 + n_stim)
+    dec_stim = stim[:, t:t + F].T                           # (F, n_stim)
+
+    enc_t = torch.from_numpy(enc_in).float().unsqueeze(0).to(device)
+    dec_t = torch.from_numpy(dec_stim).float().unsqueeze(0).to(device)
+    last_val = float(cnr[t - 1])
+
+    model.eval()
+    with torch.no_grad():
+        delta = model(enc_t, dec_t).cpu().numpy()[0]        # (F,)
+
+    abs_mean = last_val + np.cumsum(delta)
+    abs_sigma = np.zeros_like(abs_mean, dtype=np.float32)
+    return abs_mean.astype(np.float32), abs_sigma
+
+
 PREDICT_FN_BY_MODULE: dict[str, PredictFn] = {
     "experiments.lstm_seq2scal_mdn_minfeats": predict_mdn_minfeats,
     "experiments.lstm_seq2scal_mdn_minfeats_image_ewma": predict_mdn_minfeats_ewma,
+    # seq2scal_variant uses the same 5-feature EWMA encoder layout and the same
+    # (pi, mu, sigma) MDN forward contract — wire-compatible with the ewma fn.
+    # Only valid for head_type=mdn variants (gaussian-head bundles need a
+    # different predict_fn since model() returns (mu, sigma) instead).
+    "experiments.lstm_seq2scal_variant": predict_mdn_minfeats_ewma,
+    # Deterministic notebooks: forward returns (B, F) future deltas directly.
+    "experiments.lstm_seq2seq": predict_seq2seq_deltas,
+    "experiments.lstm_seq2scal": predict_seq2seq_deltas,
 }
 
 
@@ -319,12 +390,97 @@ def default_frame_fn(
     ax.set_xlabel("frame")
     ax.set_ylabel("CNR")
     ax.set_title(
-        f"cell #{cell.idx}  [{cell.stratum}]  cond={cell.condition}  t={t}/{T - 1}"
+        f"[{cell.stratum.upper()}] cell #{cell.idx}  t={t}/{T - 1}",
+        fontsize=10,
     )
-    ax.legend(loc="upper right", fontsize=8)
+    ax.legend(loc="upper right", fontsize=7)
 
 
 # ------------------------------------------------------------- main entry
+
+def _render_one_video(
+    panel_cells: list[CellData | None],
+    *,
+    predict_fn: PredictFn,
+    frame_fn: FrameFn,
+    model,
+    history_len: int,
+    future_len: int,
+    stride: int,
+    display_history: int | None,
+    ylim: tuple[float, float],
+    fps: int,
+    dpi: int,
+    device,
+    title: str,
+    out_path: Path,
+) -> Path:
+    """Render a 2×2 grid mp4 for up to 4 cells (None entries leave blank panels).
+
+    Panels are laid out:
+        TL=Q1   TR=Q2
+        BL=Q3   BR=Q4
+    Frame schedule advances each panel independently — a panel that runs out of
+    trajectory just stays frozen on its last frame.
+    """
+    # Each panel's frame schedule (list of ts). Panels with None or too-short
+    # trajectories contribute an empty schedule.
+    schedules: list[list[int]] = []
+    for cell in panel_cells:
+        if cell is None or cell.cnr.shape[0] <= history_len + 1:
+            schedules.append([])
+            continue
+        T = cell.cnr.shape[0]
+        schedules.append(list(range(history_len, T - 1, max(stride, 1))))
+
+    n_frames = max((len(s) for s in schedules), default=0)
+    if n_frames == 0:
+        print(f"[cell_video] skipping {out_path.name}: no panel had a usable schedule")
+        return out_path
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), dpi=dpi)
+    fig.suptitle(title, fontsize=12)
+    axes_flat = list(axes.flat)
+
+    def render(frame_i: int):
+        for panel_i, cell in enumerate(panel_cells):
+            ax = axes_flat[panel_i]
+            if cell is None or not schedules[panel_i]:
+                ax.clear()
+                ax.set_axis_off()
+                ax.set_title(f"[Q{panel_i + 1}] (no cell)", fontsize=10)
+                continue
+            sched = schedules[panel_i]
+            t = sched[min(frame_i, len(sched) - 1)]
+            mean, sigma = predict_fn(model, cell, t, future_len, history_len, device)
+            frame_fn(ax, cell, t, history_len, mean, sigma, display_history, ylim)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+    anim = FuncAnimation(fig, render, frames=n_frames, interval=1000 // max(fps, 1))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer: FFMpegWriter | PillowWriter
+    if FFMpegWriter.isAvailable():
+        writer = FFMpegWriter(fps=fps, bitrate=2400)
+    else:
+        gif_path = out_path.with_suffix(".gif")
+        print(f"[cell_video] ffmpeg not on PATH; writing {gif_path} instead")
+        out_path = gif_path
+        writer = PillowWriter(fps=fps)
+
+    pbar = tqdm(total=n_frames, desc=out_path.name, unit="frame", leave=False)
+    try:
+        anim.save(
+            str(out_path),
+            writer=writer,
+            dpi=dpi,
+            progress_callback=lambda i, n: pbar.update(1),
+        )
+    finally:
+        pbar.close()
+        plt.close(fig)
+    return out_path
+
 
 def make_cell_video(
     result_path: str | Path,
@@ -332,9 +488,8 @@ def make_cell_video(
     *,
     experiment_module: str | None = None,
     dataset_name: str | None = None,
-    n_low: int = 0,
-    n_mid: int = 2,
-    n_high: int = 2,
+    n_per_bucket: int = 1,
+    conditions_filter: Sequence[str] | None = None,
     future_len: int | None = None,
     fps: int = 8,
     stride: int = 1,
@@ -343,11 +498,11 @@ def make_cell_video(
     ylim: tuple[float, float] | None = None,
     ylim_pad: float = 0.15,
     frame_fn: FrameFn | None = None,
-    out_path: str | Path | None = None,
+    out_dir: str | Path | None = None,
     seed: int = 0,
     dpi: int = 100,
-) -> Path:
-    """Render an mp4 of a model rolling through full single-cell trajectories.
+) -> list[Path]:
+    """Render one mp4 per per-cell condition, each a 2×2 grid of quartile panels.
 
     Parameters
     ----------
@@ -356,32 +511,28 @@ def make_cell_video(
     predict_fn
         Required. ``(model, cell, t, future_len, history_len, device) → (mean (F,), sigma (F,))``
         absolute CNR prediction with cumulative-variance uncertainty.
-        Use :func:`predict_mdn_minfeats_ewma` for the MDN minfeats+EWMA models.
     experiment_module
-        Module containing the model class for ``__main__``-saved bundles, e.g.
-        ``"experiments.lstm_seq2scal_mdn_minfeats_image_ewma"``. If omitted,
-        inferred from ``<result_path>/slurm.log`` (``Notebook : experiments/<x>.py``).
+        Module containing the model class for ``__main__``-saved bundles.
+        Inferred from ``<result_path>/slurm.log`` if omitted.
     dataset_name
-        Override the dataset; defaults to ``training_config["data_source"]`` then
-        ``model_config["data_source"]`` if present.
-    n_low, n_mid, n_high
-        Cells per stratum (Q1, Q2∪Q3, Q4 of std(cnr)).
-    future_len
-        Steps ahead to predict per frame. Defaults to ``model_config["future_len"]``
-        (matches training horizon).
-    stride
-        Step (in frames) between successive context-window positions.
-    history_len
-        Encoder window size. Defaults to ``model_config["history_len"]`` then
-        ``training_config["history_len"]``.
-    display_history
-        If set, frame plots clip the left x-axis to ``[t - display_history, T-1]``
-        instead of showing the full trajectory from frame 0.
-    ylim
-        Fixed y-axis range for every frame. If None, computed from the true CNR
-        across all selected cells with ``ylim_pad`` fractional padding.
-    out_path
-        mp4 destination. Default: ``<result_path>/video.mp4``.
+        Override the dataset; defaults to ``training_config["data_source"]``.
+    n_per_bucket
+        Cells per (condition, quartile). ``1`` (default) = one mp4 per
+        condition. ``k > 1`` = ``k`` mp4s per condition (set0..set{k-1}),
+        each picking a different cell per panel.
+    conditions_filter
+        Whitelist of condition labels to render. Default: render all.
+    out_dir
+        Directory for the family of mp4s. Default: ``<result_path>/videos``.
+
+    Other args
+    ----------
+    future_len, stride, history_len, display_history, ylim, ylim_pad, fps, dpi —
+        see module docstring; defaults pulled from the bundle's configs.
+
+    Returns
+    -------
+    List of written paths.
     """
     result_path = Path(result_path)
     bundle_dir = result_path
@@ -427,69 +578,95 @@ def make_cell_video(
     stim_list = [stim_list[i] for i in keep]
     conditions = np.asarray(conditions)[keep]
 
-    rng = np.random.default_rng(seed)
-    strata = stratify_by_std(cnr_list, n_strata=4)
-    picks = select_cells(strata, n_low, n_mid, n_high, rng)
-    if not picks:
-        raise RuntimeError("No cells selected — check n_low/n_mid/n_high and dataset size.")
+    unique_conditions = sorted({str(c) for c in conditions})
+    if conditions_filter is not None:
+        keepset = set(conditions_filter)
+        unique_conditions = [c for c in unique_conditions if c in keepset]
+        missing = sorted(keepset - set(unique_conditions))
+        if missing:
+            print(f"[cell_video] warning: requested conditions not in dataset: {missing}")
 
-    cells: list[CellData] = [
-        CellData(idx=i, cnr=cnr_list[i], stim=stim_list[i],
-                 condition=str(conditions[i]), stratum=label)
-        for i, label in picks
-    ]
+    if not unique_conditions:
+        raise RuntimeError(
+            f"No conditions to render from dataset {dataset_name!r} "
+            f"(filter={conditions_filter})."
+        )
 
     _frame_fn = frame_fn or default_frame_fn
-
     if ylim is None:
-        all_cnr = np.concatenate([c.cnr for c in cells])
+        all_cnr = np.concatenate(cnr_list)
         lo, hi = float(all_cnr.min()), float(all_cnr.max())
         pad = (hi - lo) * ylim_pad
-        ylim = (lo - pad, hi + pad)
+        # Cap the upper bound at 4: rare cells with extreme CNR spikes blow
+        # the y-axis up to ~12 and squash all the interesting dynamics flat.
+        ylim = (lo - pad, min(hi + pad, 4.0))
 
-    schedule: list[tuple[CellData, int]] = []
-    for cell in cells:
-        T = cell.cnr.shape[0]
-        ts = range(history_len, T - 1, max(stride, 1))
-        schedule.extend((cell, int(t)) for t in ts)
+    if out_dir is None:
+        out_dir = result_path / "videos"
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not schedule:
-        raise RuntimeError("Empty frame schedule — history_len too large for selected cells.")
+    rng = np.random.default_rng(seed)
+    written: list[Path] = []
 
-    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=dpi)
+    print(
+        f"[cell_video] dataset={dataset_name}  n_cells={len(cnr_list)}  "
+        f"H={history_len} F={future_len}  conditions={len(unique_conditions)}  "
+        f"n_per_bucket={n_per_bucket}  out_dir={out_dir}"
+    )
 
-    def render(frame_i: int):
-        cell, t = schedule[frame_i]
-        mean, sigma = predict_fn(model, cell, t, future_len, history_len, device)
-        _frame_fn(ax, cell, t, history_len, mean, sigma, display_history, ylim)
-
-    anim = FuncAnimation(fig, render, frames=len(schedule), interval=1000 // max(fps, 1))
-
-    out_path = Path(out_path) if out_path is not None else result_path / "video.mp4"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    writer: FFMpegWriter | PillowWriter
-    if FFMpegWriter.isAvailable():
-        writer = FFMpegWriter(fps=fps, bitrate=2400)
-    else:
-        gif_path = out_path.with_suffix(".gif")
-        print(f"[cell_video] ffmpeg not on PATH; writing {gif_path} instead")
-        out_path = gif_path
-        writer = PillowWriter(fps=fps)
-
-    pbar = tqdm(total=len(schedule), desc="cell_video", unit="frame")
-    try:
-        anim.save(
-            str(out_path),
-            writer=writer,
-            dpi=dpi,
-            progress_callback=lambda i, n: pbar.update(1),
+    for cond in unique_conditions:
+        cond_idx = np.where(conditions == cond)[0]
+        if len(cond_idx) == 0:
+            continue
+        quartiles = stratify_by_std(cnr_list, indices=cond_idx, n_strata=4)
+        picks = pick_per_quartile(quartiles, n_per_bucket, rng)
+        bucket_counts = [len(q) for q in quartiles]
+        print(
+            f"[cell_video] condition={cond!r}  n_cells={len(cond_idx)}  "
+            f"quartile sizes Q1..Q4 = {bucket_counts}"
         )
-    finally:
-        pbar.close()
-        plt.close(fig)
 
-    return out_path
+        for set_i in range(n_per_bucket):
+            panel_cells: list[CellData | None] = []
+            for q_i in range(4):
+                if set_i < len(picks[q_i]):
+                    i = picks[q_i][set_i]
+                    panel_cells.append(
+                        CellData(
+                            idx=i,
+                            cnr=cnr_list[i],
+                            stim=stim_list[i],
+                            condition=str(conditions[i]),
+                            stratum=f"q{q_i + 1}",
+                        )
+                    )
+                else:
+                    panel_cells.append(None)
+
+            tag = f"_set{set_i}" if n_per_bucket > 1 else ""
+            out_path = out_dir / f"video_{_safe_filename(cond)}{tag}.mp4"
+            title = f"{cond}{'  · set ' + str(set_i) if n_per_bucket > 1 else ''}"
+            written_path = _render_one_video(
+                panel_cells,
+                predict_fn=predict_fn,
+                frame_fn=_frame_fn,
+                model=model,
+                history_len=history_len,
+                future_len=future_len,
+                stride=stride,
+                display_history=display_history,
+                ylim=ylim,
+                fps=fps,
+                dpi=dpi,
+                device=device,
+                title=title,
+                out_path=out_path,
+            )
+            written.append(written_path)
+
+    print(f"[cell_video] wrote {len(written)} videos under {out_dir}")
+    return written
 
 
 if __name__ == "__main__":
@@ -508,11 +685,17 @@ if __name__ == "__main__":
         default=None,
         help="Module that defines the bundle's model class. Inferred from slurm.log if omitted.",
     )
-    parser.add_argument("--future-len", type=int, default=None, help="Steps ahead per frame; defaults to model's training future_len.")
+    parser.add_argument("--future-len", type=int, default=None,
+                        help="Steps ahead per frame; defaults to model's training future_len.")
     parser.add_argument("--fps", type=int, default=8)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--display-history", type=int, default=None)
-    parser.add_argument("--out", default=None)
+    parser.add_argument("--n-per-bucket", type=int, default=1,
+                        help="Cells per (condition, quartile). >1 renders that many mp4s per condition.")
+    parser.add_argument("--conditions", default=None,
+                        help="Comma-separated whitelist of condition labels.")
+    parser.add_argument("--out-dir", default=None,
+                        help="Output directory (default: <result_path>/videos).")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     result_path = args.result_path or args.result_path_flag
@@ -529,15 +712,23 @@ if __name__ == "__main__":
             "Add an entry to PREDICT_FN_BY_MODULE or call make_cell_video() from Python."
         )
 
-    path = make_cell_video(
+    conds = None
+    if args.conditions:
+        conds = [c.strip() for c in args.conditions.split(",") if c.strip()]
+
+    paths = make_cell_video(
         result_path,
         PREDICT_FN_BY_MODULE[exp_mod],
         experiment_module=exp_mod,
+        n_per_bucket=args.n_per_bucket,
+        conditions_filter=conds,
         future_len=args.future_len,
         fps=args.fps,
         stride=args.stride,
         display_history=args.display_history,
-        out_path=args.out,
+        out_dir=args.out_dir,
         seed=args.seed,
     )
-    print(f"wrote {path}")
+    print(f"wrote {len(paths)} files")
+    for p in paths:
+        print(f"  {p}")
