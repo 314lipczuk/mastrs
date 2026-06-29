@@ -1,4 +1,9 @@
-"""Shared evaluation battery for :mod:`experiments.seq2scal_models` forecasters.
+"""Evaluation battery for :mod:`experiments.seq2scal_models_abs` forecasters.
+
+Absolute-output variant of ``eval_seq2scal.py``: the model already emits
+absolute CNR, so ``base.target`` and the point forecast are in CNR units and
+the headline NLL/CRPS/MAE are computed natively there. The ``absolute`` block
+is therefore the native error (no delta ``cumsum`` reconstruction).
 
 Head-agnostic: the Gaussian head is the K=1 special case of the MDN, so every
 metric is computed on ``(pi, mu, sigma)`` arrays of shape ``(N, F, K)`` and
@@ -23,7 +28,7 @@ import torch
 from scipy.special import logsumexp
 from scipy.stats import norm
 
-from experiments.seq2scal_models import Seq2SeqDataset
+from experiments.seq2scal_models_abs import Seq2SeqDataset
 
 IDEAL_COVERAGE = {1: 0.6826895, 2: 0.9544997, 3: 0.9973002}
 
@@ -79,7 +84,7 @@ class _Outputs:
     pi: np.ndarray
     mu: np.ndarray
     sigma: np.ndarray
-    target: np.ndarray   # (N, F) delta-CNR
+    target: np.ndarray   # (N, F) absolute CNR
     last: np.ndarray     # (N,)   last observed CNR
     resp_std: np.ndarray  # (N,)  full-window response std
     boundary_slope: np.ndarray  # (N,) OLS slope of last-5 history CNR
@@ -186,17 +191,14 @@ def evaluate(model, test_arrays, mcfg, *, device, test_stride=10, fluence_on=Non
         np.mean(cov_table[k]) - IDEAL_COVERAGE[k] for k in (1, 2, 3)
     ]))
 
-    # --- absolute-CNR reconstruction --------------------------------------
-    # The model predicts per-step delta-CNR; absolute CNR at step s is the last
-    # observed value plus the cumulative predicted delta (matches the model's
-    # own autoregressive decode, next_cnr = last_abs + delta). Sigma about the
-    # absolute value accumulates as sqrt(cumsum(sigma_step**2)) under the
-    # per-step-independence approximation the bands assume.
-    last = base.last[:, None]
-    abs_point = last + np.cumsum(point, axis=1)          # (N, F)
-    abs_target = last + np.cumsum(base.target, axis=1)   # (N, F)
-    abs_sigma = np.sqrt(np.cumsum(std ** 2, axis=1))     # (N, F)
-    abs_cnr_resid = np.abs(abs_point - abs_target)       # cumulative |error|
+    # --- absolute-CNR metrics ---------------------------------------------
+    # This model emits absolute CNR directly, so the point forecast, target and
+    # sigma are already in CNR units — no delta cumsum reconstruction. The
+    # "absolute" block below is thus the native per-step error in CNR units.
+    abs_point = point                                    # (N, F)
+    abs_target = base.target                             # (N, F)
+    abs_sigma = std                                       # (N, F)
+    abs_cnr_resid = np.abs(abs_point - abs_target)       # per-step |error|
     abs_cov_1sig = [
         float(np.mean(abs_cnr_resid[:, s] <= abs_sigma[:, s])) for s in range(mcfg.future_len)
     ]
@@ -270,9 +272,8 @@ def evaluate(model, test_arrays, mcfg, *, device, test_stride=10, fluence_on=Non
                 "mae": float(abs_resid[m].mean()), "sigma": float(std[m].mean()),
             })
 
-    # Interior vs onset split: with baseline-prepend, windows starting inside the
-    # prepended region forecast into the previously-unreachable trajectory onset.
-    # prepend == 0 (no prepend) -> all windows interior, onset empty.
+    # Interior vs onset split (see eval_seq2scal). Here metrics are already in
+    # absolute CNR units (this model predicts absolute), so mae == abs_mae.
     prepend = mcfg.history_len if getattr(mcfg, "prepend_baseline", False) else 0
     onset_mask = ds.t_starts < prepend
     by_window_class = {}
@@ -283,7 +284,6 @@ def evaluate(model, test_arrays, mcfg, *, device, test_stride=10, fluence_on=Non
                 "nll": float(nll[msk].mean()),
                 "crps": float(crps[msk].mean()),
                 "mae": float(abs_resid[msk].mean()),
-                "abs_mae": float(abs_cnr_resid[msk].mean()),
                 "sigma": float(std[msk].mean()),
             }
         else:
@@ -379,26 +379,24 @@ def step0_diagnostics(model, test_arrays, mcfg, *, device, test_stride=10):
 
 
 def absolute_outputs(model, test_arrays, mcfg, *, device, test_stride=10):
-    """Reconstruct absolute-CNR forecasts from the per-step delta mixture.
+    """Return the model's absolute-CNR forecasts, ready to plot vs the truth.
 
-    The model is trained on delta-CNR; this returns the model's output in actual
-    (baseline-normalized) CNR units, ready to plot against the true trajectory.
+    This model emits absolute (baseline-normalized) CNR directly, so the
+    mixture mean is the forecast and the mixture std is the per-step band — no
+    delta cumsum reconstruction.
 
     Returns a dict of ``(N, F)`` arrays:
-        pred   : last + cumsum(E[delta])      — mixture-mean absolute forecast
-        sigma  : sqrt(cumsum(std**2))         — cumulative 1σ band (indep. approx.)
-        target : last + cumsum(delta_target)  — observed absolute trajectory
+        pred   : E[CNR]   — mixture-mean absolute forecast
+        sigma  : std(CNR) — per-step 1σ band
+        target : observed absolute CNR trajectory
     plus ``last`` (N,) the forecast origin and ``resp_std`` (N,) for stratified plots.
     """
     ds = Seq2SeqDataset(test_arrays, mcfg.history_len, mcfg.future_len, stride=test_stride)
     o = _collect(model, ds, device)
-    point = _point(o.pi, o.mu)
-    std = _std(o.pi, o.mu, o.sigma)
-    last = o.last[:, None]
     return {
-        "pred": last + np.cumsum(point, axis=1),
-        "sigma": np.sqrt(np.cumsum(std ** 2, axis=1)),
-        "target": last + np.cumsum(o.target, axis=1),
+        "pred": _point(o.pi, o.mu),
+        "sigma": _std(o.pi, o.mu, o.sigma),
+        "target": o.target,
         "last": o.last,
         "resp_std": o.resp_std,
     }

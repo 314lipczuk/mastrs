@@ -332,14 +332,79 @@ def predict_seq2seq_deltas(
     return abs_mean.astype(np.float32), abs_sigma
 
 
+def _predict_seq2scal_minfeats(
+    model, cell, t, future_len, history_len, device, *, absolute
+):
+    """Correct predictor for the seq2scal_models(_abs) + FiLM family.
+
+    These models train on the 5 minfeats ``[cnr, fluence, baseline,
+    ewma_slow(cnr), ewma_fast(cnr)]`` where the EWMA channels are EWMAs of the
+    *CNR* (not the light) — so we recompute them here from ``cell.cnr`` using the
+    model's own ``cfg`` alphas, rather than reading the light-EWMA stim channels.
+    ``absolute``: the abs model emits the future CNR directly (no delta cumsum).
+    """
+    from experiments.seq2scal_models import _ewma_1d
+
+    H = history_len
+    cnr = cell.cnr.astype(np.float32)
+    T = cnr.shape[0]
+    if t < H or t >= T:
+        raise ValueError(f"t={t} out of bounds for history_len={H}, T={T}")
+    F = min(future_len, T - t)
+
+    flu = cell.stim[STIM_COLS.index("u_t")].astype(np.float32)
+    cfg = getattr(model, "cfg", None)
+    a_slow = float(getattr(cfg, "ewma_slow_alpha", 0.05))
+    a_fast = float(getattr(cfg, "ewma_fast_alpha", 0.30))
+    ewma_s = _ewma_1d(cnr, a_slow)
+    ewma_f = _ewma_1d(cnr, a_fast)
+    baseline = float(np.median(cnr[: min(10, T)]))
+
+    enc_in = np.stack(
+        [
+            cnr[t - H:t],
+            flu[t - H:t],
+            np.full(H, baseline, dtype=np.float32),
+            ewma_s[t - H:t],
+            ewma_f[t - H:t],
+        ],
+        axis=-1,
+    )
+    dec_stim = flu[t:t + F, None]
+    enc_t = torch.from_numpy(enc_in).float().unsqueeze(0).to(device)
+    dec_t = torch.from_numpy(dec_stim).float().unsqueeze(0).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        pi, mu, sigma = model(enc_t, dec_t)
+        mean = (pi * mu).sum(dim=-1).cpu().numpy()[0]              # (F,)
+        step_std = _gmm_pred_std(pi, mu, sigma).cpu().numpy()[0]   # (F,)
+
+    if absolute:
+        abs_mean = mean
+        abs_sigma = step_std
+    else:
+        last_val = float(cnr[t - 1])
+        abs_mean = last_val + np.cumsum(mean)
+        abs_sigma = np.sqrt(np.cumsum(step_std ** 2))
+    return abs_mean.astype(np.float32), abs_sigma.astype(np.float32)
+
+
+def predict_seq2scal_minfeats_delta(model, cell, t, future_len, history_len, device):
+    return _predict_seq2scal_minfeats(model, cell, t, future_len, history_len, device, absolute=False)
+
+
+def predict_seq2scal_minfeats_abs(model, cell, t, future_len, history_len, device):
+    return _predict_seq2scal_minfeats(model, cell, t, future_len, history_len, device, absolute=True)
+
+
 PREDICT_FN_BY_MODULE: dict[str, PredictFn] = {
     "experiments.lstm_seq2scal_mdn_minfeats": predict_mdn_minfeats,
     "experiments.lstm_seq2scal_mdn_minfeats_image_ewma": predict_mdn_minfeats_ewma,
-    # seq2scal_variant uses the same 5-feature EWMA encoder layout and the same
-    # (pi, mu, sigma) MDN forward contract — wire-compatible with the ewma fn.
-    # Only valid for head_type=mdn variants (gaussian-head bundles need a
-    # different predict_fn since model() returns (mu, sigma) instead).
-    "experiments.lstm_seq2scal_variant": predict_mdn_minfeats_ewma,
+    # seq2scal_variant / _abs train on EWMA-of-CNR minfeats (recomputed in the
+    # predictor from the model's cfg alphas). variant = delta output, abs = absolute.
+    "experiments.lstm_seq2scal_variant": predict_seq2scal_minfeats_delta,
+    "experiments.lstm_seq2scal_abs": predict_seq2scal_minfeats_abs,
     # Deterministic notebooks: forward returns (B, F) future deltas directly.
     "experiments.lstm_seq2seq": predict_seq2seq_deltas,
     "experiments.lstm_seq2scal": predict_seq2seq_deltas,
@@ -501,8 +566,17 @@ def make_cell_video(
     out_dir: str | Path | None = None,
     seed: int = 0,
     dpi: int = 100,
+    holdout_only: bool = True,
+    split_seed: int = 42,
+    baseline_prepend: int | None = None,
 ) -> list[Path]:
     """Render one mp4 per per-cell condition, each a 2×2 grid of quartile panels.
+
+    By default only **held-out test cells** are rendered (``holdout_only=True``),
+    reproducing the project-standard split
+    ``train_test_split(arange(n), test_size=0.2, random_state=split_seed)`` that
+    every seq2seq/seq2scal notebook uses — so videos never show cells the model
+    trained on. Pass ``holdout_only=False`` to render all cells.
 
     Parameters
     ----------
@@ -566,7 +640,15 @@ def make_cell_video(
     device = get_device()
     model = _resolve_main_model(bundle, experiment_module).to(device)
 
-    cnr_arr, stim_arr, conditions = seq2seq_data.load(dataset_name)
+    # Match the training-time baseline prepend so the video shows the same
+    # onset-inclusive trajectories the model was trained/evaluated on.
+    if baseline_prepend is None:
+        baseline_prepend = history_len if bundle.model_config.get("prepend_baseline") else 0
+    if baseline_prepend:
+        print(f"[cell_video] baseline_prepend={baseline_prepend} (prepended baseline frames)")
+    cnr_arr, stim_arr, conditions = seq2seq_data.load(
+        dataset_name, baseline_prepend=baseline_prepend
+    )
     cnr_list = [np.asarray(c, dtype=np.float32) for c in cnr_arr]
     if isinstance(stim_arr, np.ndarray) and stim_arr.dtype != object:
         stim_list = [stim_arr[i].astype(np.float32) for i in range(len(stim_arr))]
@@ -574,6 +656,29 @@ def make_cell_video(
         stim_list = [np.asarray(s, dtype=np.float32) for s in stim_arr]
 
     keep = [i for i, c in enumerate(cnr_list) if len(c) > history_len + 1]
+    if holdout_only:
+        # Prefer the bundle's persisted split (correct for any regime, incl.
+        # condition_held_out); fall back to reproducing the random 70/10/20.
+        _persisted = bundle.metrics.get("splits") if isinstance(bundle.metrics, dict) else None
+        if _persisted and "test_indist" in _persisted:
+            _test_set = {int(i) for i in _persisted.get("test_indist", [])}
+            for _cids in (_persisted.get("test_ood") or {}).values():
+                _test_set |= {int(i) for i in _cids}
+            _source = f"bundle.splits ({_persisted.get('regime', '?')})"
+        else:
+            from sklearn.model_selection import train_test_split
+
+            _, _test_ids = train_test_split(
+                np.arange(len(cnr_list)), test_size=0.2, random_state=split_seed
+            )
+            _test_set = {int(i) for i in _test_ids}
+            _source = f"reproduced random split (seed={split_seed})"
+        before = len(keep)
+        keep = [i for i in keep if i in _test_set]
+        print(
+            f"[cell_video] holdout_only: {len(keep)}/{before} cells are held out "
+            f"via {_source}; rendering only those"
+        )
     cnr_list = [cnr_list[i] for i in keep]
     stim_list = [stim_list[i] for i in keep]
     conditions = np.asarray(conditions)[keep]
@@ -697,6 +802,10 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", default=None,
                         help="Output directory (default: <result_path>/videos).")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--all-cells", action="store_true",
+                        help="Render all cells, not just the held-out test split (default: test only).")
+    parser.add_argument("--split-seed", type=int, default=42,
+                        help="random_state for the train/test split (must match training; default 42).")
     args = parser.parse_args()
     result_path = args.result_path or args.result_path_flag
     if not result_path:
@@ -728,6 +837,8 @@ if __name__ == "__main__":
         display_history=args.display_history,
         out_dir=args.out_dir,
         seed=args.seed,
+        holdout_only=not args.all_cells,
+        split_seed=args.split_seed,
     )
     print(f"wrote {len(paths)} files")
     for p in paths:

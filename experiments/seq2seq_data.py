@@ -17,6 +17,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from baseline_prepend import prepend_channels  # noqa: E402
+
 STIM_COLS = [
     "u_t", "m_t", "recency", "ewma_fast", "ewma_slow",
     "n_5", "slope_5", "burst_pos", "s_cum",
@@ -85,6 +87,37 @@ def _stim_features(light: np.ndarray, tau: float = 5.0, window: int = 5) -> np.n
         [u_t, m_t, recency, ewma_fast, ewma_slow, n_5, slope_5, burst_pos, s_cum],
         axis=1,
     ).astype(np.float32)
+
+
+def _prepend_baseline_tracks(
+    cnr: np.ndarray,
+    stim: np.ndarray,
+    n_prepend: int,
+    *,
+    seed: int = 42,
+    block_len: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prepend ``n_prepend`` baseline-like frames to per-cell tracks.
+
+    For each cell: block-bootstrap the CNR baseline, prepend zero light, then
+    re-derive all 9 stim features over the full (prepended+real) sequence so the
+    EWMA / recency / cumulative channels enter the real region correctly (no
+    prior stimulation). ``cnr``/``stim`` are object arrays of per-cell tracks.
+    """
+    if n_prepend <= 0:
+        return cnr, stim
+    rng = np.random.default_rng(seed)
+    cnr_out = np.empty(len(cnr), dtype=object)
+    stim_out = np.empty(len(stim), dtype=object)
+    for i in range(len(cnr)):
+        ci = np.asarray(cnr[i], dtype=np.float32)
+        light = np.asarray(stim[i][0], dtype=np.float32)  # u_t channel
+        new_cnr, new_light = prepend_channels(
+            [ci, light], n_prepend, zero_channels={1}, block_len=block_len, rng=rng
+        )
+        cnr_out[i] = new_cnr.astype(np.float32)
+        stim_out[i] = _stim_features(new_light[None, :])[0].astype(np.float32)
+    return cnr_out, stim_out
 
 
 def load_synthetic(
@@ -192,6 +225,7 @@ def load_real_uncertain(
 
 def load_real_tracks(
     path: str = "dataset.parquet.v0",
+    baseline_prepend: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load real microscopy data as per-cell full trajectories (no windowing).
 
@@ -219,6 +253,7 @@ def load_real_tracks(
         df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
     )
     conditions = meta["ramp_pattern_name"].to_numpy()
+    cnr, stim = _prepend_baseline_tracks(cnr, stim, baseline_prepend)
     return cnr, stim, conditions
 
 
@@ -238,6 +273,7 @@ def load_real_uncertain_tracks(
 
 def load_real_plus_bo_tracks(
     path: str = "dataset.parquet",
+    baseline_prepend: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Post-BO real dataset (`dataset.parquet`); pre-BO snapshot is `real`."""
     from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS, make_tracks
@@ -247,6 +283,7 @@ def load_real_plus_bo_tracks(
         df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
     )
     conditions = meta["ramp_pattern_name"].to_numpy()
+    cnr, stim = _prepend_baseline_tracks(cnr, stim, baseline_prepend)
     return cnr, stim, conditions
 
 
@@ -276,7 +313,9 @@ AVAILABLE_DATASETS = (
 
 
 # `real` is the pre-BO snapshot (preserves the semantics of past experiments
-# that recorded data_source="real"). `real_plus_bo` is the post-BO file.
+# that recorded data_source="real"). `real_plus_bo` is the post-BO file
+# (includes BO oscillation v8, v10, v11_10s, v11_20s; ramp_pattern_name carries
+# the per-experiment tag, e.g. `bo_osc_v10_c<idx>`).
 REAL_DATASET_PATHS = {
     "real": "dataset.parquet.v0",
     "real_plus_bo": "dataset.parquet",
@@ -285,6 +324,8 @@ REAL_DATASET_PATHS = {
 
 def load(
     ds_name: str,
+    *,
+    baseline_prepend: int = 0,
     **kwargs,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Dispatch to the loader for a named dataset.
@@ -300,7 +341,21 @@ def load(
 
     Synthetic loaders are unchanged (already return full tracks as uniform
     2D arrays).
+
+    ``baseline_prepend > 0`` prepends that many block-bootstrapped baseline
+    frames (zero light) to each per-cell track so the stimulation onset becomes
+    predictable. Only supported for the ``real`` / ``real_plus_bo`` track
+    contract (raises otherwise).
     """
+    if baseline_prepend and (
+        ds_name not in ("real", "real_plus_bo")
+        or "window_size" in kwargs
+        or "stride" in kwargs
+    ):
+        raise ValueError(
+            "baseline_prepend is only supported for the 'real'/'real_plus_bo' "
+            "per-cell track loaders (no window_size/stride)."
+        )
     if ds_name == "synthetic":
         return load_synthetic(**kwargs)
     if ds_name == "synthetic_v2":
@@ -308,7 +363,7 @@ def load(
     if ds_name == "real":
         if "window_size" in kwargs or "stride" in kwargs:
             return load_real(**kwargs)
-        return load_real_tracks(**kwargs)
+        return load_real_tracks(baseline_prepend=baseline_prepend, **kwargs)
     if ds_name == "real_uncertain":
         if "window_size" in kwargs or "stride" in kwargs:
             return load_real_uncertain(**kwargs)
@@ -316,7 +371,7 @@ def load(
     if ds_name == "real_plus_bo":
         if "window_size" in kwargs or "stride" in kwargs:
             return load_real_plus_bo(**kwargs)
-        return load_real_plus_bo_tracks(**kwargs)
+        return load_real_plus_bo_tracks(baseline_prepend=baseline_prepend, **kwargs)
     raise ValueError(
         f"Unknown dataset {ds_name!r}. Available: {list(AVAILABLE_DATASETS)}"
     )

@@ -11,7 +11,7 @@ with app.setup:
 
     import numpy as np
 
-    from experiments.seq2scal_models import (
+    from experiments.seq2scal_models_abs import (
         ModelConfig,
         TrainingConfig,
         Seq2ScalarSeq,
@@ -42,7 +42,7 @@ def _():
         save_bundle,
     )
     from experiments.seq2seq_data import AVAILABLE_DATASETS
-    from experiments import eval_seq2scal as ev
+    from experiments import eval_seq2scal_abs as ev
 
     device = get_device()
     hostname = get_username()
@@ -73,12 +73,14 @@ def _():
 @app.cell
 def _(mo):
     mo.md("""
-    # Seq2Scalar variant driver
+    # Seq2Scalar absolute-output driver
 
-    Single configurable encoder-decoder forecaster. The architecture
-    variant (Gaussian vs MDN head, continuous decoder, stim-gated init,
-    FiLM, per-step sigma bias) is selected by `ModelConfig` flags passed
-    on the CLI — one notebook covers handoff Tasks 1-4.
+    Same configurable encoder-decoder forecaster as `lstm_seq2scal_variant`,
+    but the head predicts the **absolute CNR value** at each future step
+    directly (per-step sigma is the band around that absolute value) instead
+    of per-step delta-CNR. Uses `seq2scal_models_abs` + `eval_seq2scal_abs`.
+    Architecture variant (Gaussian vs MDN head, continuous decoder, stim-gated
+    init, FiLM, per-step sigma bias) is still selected by `ModelConfig` flags.
     """)
     return
 
@@ -87,7 +89,7 @@ def _(mo):
 def _(mo, parse_bool):
     MODE = mo.cli_args().get("mode", "train")
     IS_HEADLESS = "name" in mo.cli_args()
-    EXPERIMENT_NAME = mo.cli_args().get("name", "lstm_seq2scal_variant")
+    EXPERIMENT_NAME = mo.cli_args().get("name", "lstm_seq2scal_abs")
     DRY_RUN = parse_bool(mo.cli_args().get("dry_run", True))
 
     if MODE not in ("train", "load"):
@@ -316,8 +318,6 @@ def _(history, pl, qplot):
 
 @app.cell
 def _(device, ev, mo, model, model_config_used, test_arrays, test_ood_arrays):
-    # Per-test-set evaluation. In "random" split-regime there's only "indist";
-    # under "condition_held_out" each OOD condition gets its own EvalResult.
     results_by_set = {
         "indist": ev.evaluate(
             model, test_arrays, model_config_used, device=device, test_stride=10
@@ -475,18 +475,15 @@ def _(
     summary,
 ):
     metrics = {
-        **eval_result.headline,  # indist headline kept at top for legacy readers
+        **eval_result.headline,
         "summary_table": summary,
         "per_step": eval_result.per_step,
         "full": eval_result.full,
         "step0_diagnostics": step0_diag,
-        # Full per-test-set report (interior/onset already inside .full per set).
         "by_test_set": {
             k: {"headline": v.headline, "per_step": v.per_step, "full": v.full}
             for k, v in results_by_set.items()
         },
-        # Persist the cell-index partition so cell_video can use it as the
-        # canonical held-out set (rather than reproducing a split).
         "splits": prep.splits,
     }
     save_status = save_bundle(

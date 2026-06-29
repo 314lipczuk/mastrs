@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.22.5"
+__generated_with = "0.23.6"
 app = marimo.App(width="full")
 
 
@@ -131,6 +131,12 @@ def _(dataset_picker, load_button, load_dataset, mo, np, pl, stim_col_names):
 
 
 @app.cell
+def _(per_track_df):
+    per_track_df
+    return
+
+
+@app.cell
 def _(ds_name, is_object, long_df, mo, n_items, per_track_df):
     n_conditions = per_track_df["condition"].n_unique()
     t_min, t_max = per_track_df["length"].min(), per_track_df["length"].max()
@@ -201,15 +207,29 @@ def _(per_track_df, pl):
 
 
 @app.cell
-def _(per_track_df, qplot):
-    qplot(
-        per_track_df,
-        x="condition",
-        y="cnr_mean",
-        color="condition",
-        mark="boxplot",
-        title="Per-track mean CNR by condition",
-        height=350,
+def _(alt, per_track_df, pl):
+    # Pre-compute boxplot stats per condition (16 rows instead of 56k).
+    _q = (
+        per_track_df.group_by("condition")
+        .agg(
+            pl.col("cnr_mean").quantile(0.05).alias("lo"),
+            pl.col("cnr_mean").quantile(0.25).alias("q1"),
+            pl.col("cnr_mean").median().alias("median"),
+            pl.col("cnr_mean").quantile(0.75).alias("q3"),
+            pl.col("cnr_mean").quantile(0.95).alias("hi"),
+        )
+    )
+
+    _base = alt.Chart(_q).encode(
+        y=alt.Y("condition:N", title="condition"),
+        color=alt.Color("condition:N", legend=None),
+    )
+    _rule = _base.mark_rule().encode(x="lo:Q", x2="hi:Q")
+    _bar = _base.mark_bar(size=14).encode(x="q1:Q", x2="q3:Q")
+    _tick = _base.mark_tick(color="white", size=14, thickness=2).encode(x="median:Q")
+
+    (_rule + _bar + _tick).properties(
+        title="Per-track mean CNR by condition", height=max(200, 22 * len(_q))
     )
     return
 
@@ -360,15 +380,29 @@ def _(mo):
 
 
 @app.cell
-def _(per_track_df, qplot):
-    qplot(
-        per_track_df,
-        x="length",
-        color="condition",
-        bins=40,
-        title="Track length distribution",
-        height=280,
+def _(alt, per_track_df, pl):
+    # Pre-bin track lengths in polars (40 bins × n_conditions rows).
+    _n_bins = 40
+    _vmin = per_track_df["length"].min()
+    _vmax = per_track_df["length"].max()
+    _width = (_vmax - _vmin) / _n_bins if _vmax > _vmin else 1.0
+    _len_hist = (
+        per_track_df.with_columns(
+            ((pl.col("length") - _vmin) / _width)
+            .floor()
+            .cast(pl.Int32)
+            .clip(0, _n_bins - 1)
+            .alias("_bin"),
+        )
+        .group_by(["condition", "_bin"])
+        .agg(pl.len().alias("count"))
+        .with_columns(((pl.col("_bin") + 0.5) * _width + _vmin).alias("length"))
     )
+    alt.Chart(_len_hist).mark_bar(opacity=0.6).encode(
+        x=alt.X("length:Q", title="length"),
+        y=alt.Y("count:Q", title="count"),
+        color=alt.Color("condition:N"),
+    ).properties(title="Track length distribution", height=280)
     return
 
 
@@ -456,6 +490,40 @@ def _(long_df, np, per_track_df, pl, plt):
 
 @app.cell
 def _():
+    return
+
+
+@app.cell(hide_code=True)
+def _(long_df, pl, plt):
+    # Three single-cell ERK responses to the same 3-2-1minIntervals stimulation,
+    # hand-picked to show contrasting behaviour.
+    pres_tracks = [
+        (12, "Non-responder"),
+        (124, "Strong responder"),
+        (405, "Variable response"),
+    ]
+
+    _fig, _axes = plt.subplots(3, 1, figsize=(8, 6), sharex=True, sharey=True)
+
+    for _ax, (_idx, _label) in zip(_axes, pres_tracks):
+        _tr = long_df.filter(pl.col("idx") == _idx).sort("t")
+        _t = _tr["t"].to_numpy()
+        _cnr = _tr["cnr"].to_numpy()
+        _u = _tr["u_t"].to_numpy()
+
+        # one vertical band per light pulse; spacing tightens (3 -> 2 -> 1 frame)
+        for _pt in _t[_u > 0]:
+            _ax.axvspan(_pt - 0.5, _pt + 0.5, color="#ffd166", alpha=0.55, linewidth=0)
+        _ax.plot(_t, _cnr, color="#1f77b4", linewidth=1.6, zorder=3)
+        _ax.set_ylabel("CNR")
+        _ax.set_title(f"{_label}  (cell #{_idx})", fontsize=10, loc="left")
+        _ax.margins(x=0)
+
+    _axes[-1].set_xlabel("time (frames)")
+    _fig.suptitle("Single-cell ERK responses to identical stimulation", fontsize=12)
+    _fig.tight_layout(rect=(0, 0, 1, 0.97))
+    plt.gca()
+
     return
 
 

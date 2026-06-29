@@ -432,7 +432,6 @@ class ExperimentBundle:
     def _load_legacy(d: Path, warnings: list[str]) -> dict:
         """Load from the legacy format: model_*.pt + metrics.npz + scalars.json."""
         import json
-
         # Find the .pt checkpoint (use the latest one)
         pt_files = sorted(d.glob("*.pt"))
         if not pt_files:

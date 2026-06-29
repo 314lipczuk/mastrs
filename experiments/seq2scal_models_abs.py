@@ -1,4 +1,12 @@
-"""Configurable seq2scalar LSTM forecaster for ERK-CNR experiments.
+"""Absolute-output seq2scalar LSTM forecaster for ERK-CNR experiments.
+
+Variant of ``seq2scal_models.py``: the model predicts the **absolute CNR
+value** at each future step directly (head output = CNR, per-step sigma is the
+band around that absolute value), rather than the per-step delta-CNR. Two spots
+differ from the delta module — the dataset target (:class:`Seq2SeqDataset`) and
+the decoder's autoregressive feedback (:meth:`Seq2ScalarSeq.forward`); both are
+flagged inline. Everything else (heads, configs, FiLM, stim-init, fit) is the
+same so :mod:`experiments.eval_seq2scal_abs` can reuse the same plumbing.
 
 A single model class, :class:`Seq2ScalarSeq`, with explicit architecture flags
 on :class:`ModelConfig` so the handoff variants compose:
@@ -24,7 +32,7 @@ apples-to-apples.
 
 Encoder feature layout (minfeats, no images), 5 channels:
     [cnr, fluence, baseline, ewma_slow(cnr), ewma_fast(cnr)]
-Decoder stim is fluence only (stim_dim=1). Targets are per-step delta-CNR.
+Decoder stim is fluence only (stim_dim=1). Targets are absolute CNR values.
 """
 from __future__ import annotations
 
@@ -177,10 +185,7 @@ class ModelConfig(BaseModel):
     # Prepend `history_len` block-bootstrapped baseline frames (zero light) to
     # each track so the stimulation onset becomes predictable (real data only).
     prepend_baseline: bool = False
-    # "random"             -> 70/10/20 across all cells (legacy default)
-    # "condition_held_out" -> bo_osc_* cells get 70/10/20; OOD conds (Sustained,
-    #                         ramp1, 3-2-1minIntervals) are reserved entirely for
-    #                         per-condition test sets (matches TCN's regime).
+    # "random" or "condition_held_out" — see seq2scal_models.prepare_data.
     split_regime: str = "random"
     # architecture flags
     head_type: str = "mdn"
@@ -284,16 +289,13 @@ OOD_CONDITIONS = ("Sustained", "ramp1", "3-2-1minIntervals")
 
 @dataclass
 class PreparedData:
-    """Per-cell minfeats arrays split into train/val/test.
+    """Per-cell minfeats arrays split into train/val/test (+ optional OOD).
 
     Each split is a 5-tuple of object arrays:
         (cnr, fluence, baseline, ewma_slow, ewma_fast)
 
-    With ``split_regime="condition_held_out"`` the ``test`` tuple holds the
-    bo_osc held-out 20% (``test_indist``) and ``test_ood`` carries one tuple
-    per held-out OOD condition. ``splits`` records the cell-index partition
-    (indices into ``load_dataset`` order) so videos / re-eval can restrict to
-    the same held-out cells.
+    See ``seq2scal_models.PreparedData`` — same shape; ``test_ood`` is populated
+    when ``split_regime="condition_held_out"``.
     """
 
     train: tuple
@@ -315,19 +317,11 @@ def prepare_data(
     baseline_prepend: int = 0,
     split_regime: str = "random",
 ) -> PreparedData:
-    """Load a dataset and derive the 5-channel minfeats encoder arrays.
+    """Same contract as :func:`seq2scal_models.prepare_data`.
 
-    ``split_regime``:
-      - ``"random"`` (legacy default): 70/10/20 across all cells (``test_size=0.2``
-        then ``0.125``) with ``random_state=seed`` so windows are stable.
-      - ``"condition_held_out"``: ``bo_osc_*`` cells get the 70/10/20 random
-        partition (train / val / test_indist); ``Sustained`` / ``ramp1`` /
-        ``3-2-1minIntervals`` cells are reserved entirely for the per-condition
-        ``test_ood`` sets (matches TCN's generalization-to-OOD regime).
-
-    ``baseline_prepend > 0`` prepends that many block-bootstrapped baseline
-    frames (zero light) to every track before windowing, so the stimulation
-    onset becomes a trainable target (real data only).
+    ``split_regime="condition_held_out"`` partitions ``bo_osc_*`` cells 70/10/20
+    and reserves Sustained / ramp1 / 3-2-1minIntervals entirely for per-condition
+    OOD test sets.
     """
     cnr_all, stim_all, conditions = load_dataset(
         data_source, baseline_prepend=baseline_prepend
@@ -435,7 +429,9 @@ class Seq2SeqDataset(Dataset):
                     axis=-1,
                 ).astype(np.float32)
                 full = ci[t : t + total]
-                dec_target = np.diff(full)[history_len - 1 : history_len - 1 + future_len]
+                # absolute-output variant: target is the future CNR itself, not
+                # the per-step delta. dec_target[i] = CNR at step H+i.
+                dec_target = full[history_len : history_len + future_len]
                 dec_stim = fi[t + history_len : t + total][:, None].astype(np.float32)
                 self.samples.append((enc_in, dec_stim, dec_target.astype(np.float32)))
                 self.resp_std.append(float(np.std(full)))
@@ -632,13 +628,13 @@ class Seq2ScalarSeq(nn.Module):
 
             if i < n_f - 1:
                 last_frame = dec_input[:, -1, :]
-                last_abs = last_frame[:, 0:1]
+                # absolute-output variant: the prediction IS the next CNR; no
+                # delta accumulation. Teacher forcing feeds the absolute target.
                 use_teacher = targets is not None and torch.rand(1).item() < tf_ratio
                 if use_teacher:
-                    delta = targets[:, i : i + 1]
+                    next_cnr = targets[:, i : i + 1]
                 else:
-                    delta = (pi * mu).sum(dim=-1, keepdim=True)
-                next_cnr = last_abs + delta
+                    next_cnr = (pi * mu).sum(dim=-1, keepdim=True)
                 a_s, a_f = cfg.ewma_slow_alpha, cfg.ewma_fast_alpha
                 next_es = a_s * next_cnr + (1.0 - a_s) * last_frame[:, 3:4]
                 next_ef = a_f * next_cnr + (1.0 - a_f) * last_frame[:, 4:5]
