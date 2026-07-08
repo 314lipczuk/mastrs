@@ -3,73 +3,207 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-def load_and_clean(
-    parquet_path: "str | pd.DataFrame",
-    cell_selection_csv: str | None = None,
-    tracking_threshold: float = 0.9,
-    norm_until_timepoint: int = 10,
-    baseline_cnr_max: float | None = 0.8,
-    cell_line: str | None = 'EGFR'
-) -> pd.DataFrame:
-    """Read a parquet experiment file and return a cleaned dataframe.
+# ===========================================================================
+# Canonical schema — the single source of truth
+# ===========================================================================
+# Every raw experiment parquet carries its own column names; an ADAPTER renames
+# and *projects* each family into CANONICAL_RAW_COLS (nothing legacy survives).
+# clean() + derive_features() then operate only on canonical columns. A "bundle"
+# is a row-wise concat of cleaned per-experiment canonical frames.
 
-    Parameters
-    ----------
-    parquet_path : str or pd.DataFrame
-        Path to the parquet file with raw tracking data, or a preloaded
-        dataframe (used by adapter loaders like ``load_and_clean_bo``).
-    cell_selection_csv : str or None
-        Path to a ``cell_selection.csv`` for manual filtering.  Rows whose
-        ``deleted`` column is ``True`` are removed.  Pass ``None`` to skip.
-    tracking_threshold : float
-        Fraction of the maximum frame count a cell must reach to be kept
-        (default 0.9 = 90 %).
-    norm_until_timepoint : int
-        Frames ``< norm_until_timepoint`` are used to compute the per-cell
-        baseline for normalisation (default 10).
-    baseline_cnr_max : float or None
-        If set, cells whose ``median_cnr_0_9`` exceeds this value are dropped.
+# The 9 stimulation feature channels (order is load-bearing — models index it).
+STIM_COLS = [
+    "u_t", "m_t", "recency", "ewma_fast", "ewma_slow",
+    "n_5", "slope_5", "burst_pos", "s_cum",
+]
+
+# Exactly what an adapter must emit (everything else is dropped by projection).
+CANONICAL_RAW_COLS = [
+    "original_experiment_name",   # registry key, e.g. "bo_v8", "freepattern_v1"
+    "stim_condition",             # canonical per-trajectory label (str)
+    "fov", "particle",            # particle retained: builds uid + regroups
+    "frame",                      # int per-cell frame index (1 frame = 1 min)
+    "time_min",                   # real acquisition time (minutes)
+    "x", "y",
+    "nuc_area",
+    "mean_intensity_C0_nuc", "mean_intensity_C1_nuc",
+    "mean_intensity_C0_ring", "mean_intensity_C1_ring",
+    "median_intensity_C0_nuc", "median_intensity_C1_nuc",
+    "median_intensity_C0_ring", "median_intensity_C1_ring",
+    "stim", "stim_power", "stim_exposure",
+    "cell_line",                  # the EGFR filter in clean() keys on it
+]
+
+# Added by _derive_identity + clean + derive_features (stored in the bundle).
+CANONICAL_DERIVED_COLS = [
+    "uid", "cnr", "cnr_median", "cnr_median_norm", "cnr_mean_norm",
+    "median_cnr_0_9", "energy_uJ", "fluence_mJ_cm2", "energy_per_cell",
+    *STIM_COLS,
+]
+
+# Raw names that must never survive a hard-cut adapter (validator guards these).
+_LEGACY_COLS = [
+    "ramp_pattern_name", "treatment_name", "area", "area_nuc",
+    "timestep", "time", "fov_name", "condition_idx",
+    "channels", "ref_channels", "img_shape",
+]
+
+# Nested/object columns dropped up front (unrenderable, not needed downstream).
+_OBJECT_COLS = [
+    "channels", "ref_channels", "img_shape", "optocheck_channels",
+    "stim_timestep", "stim_exposure_list", "stim_channel_name",
+    "stim_channel_group", "stim_channel_device_name",
+    "stim_channel_power_property_name",
+]
+
+
+# ---------------------------------------------------------------------------
+# Adapters — raw family -> canonical raw columns
+# ---------------------------------------------------------------------------
+
+def _canonicalize_common(df, experiment_name, cell_line_default="EGFR"):
+    """Mechanical raw->canonical renames shared by every adapter (not the label).
+
+    Maps the time axes (``timestep``->``frame``, ``time``->``time_min``), the
+    nuclear area (``area``/``area_nuc``->``nuc_area``), defaults ``cell_line``
+    when the raw file lacks it, and fills missing stim scalars with 0.
     """
-    if isinstance(parquet_path, pd.DataFrame):
-        df = parquet_path.copy()
-    else:
-        df = pd.read_parquet(parquet_path)
+    df = df.copy()
+    df["original_experiment_name"] = experiment_name
 
-    # --- derived columns ---------------------------------------------------
+    df["frame"] = df["timestep"]
+    if "time" in df.columns:
+        df["time_min"] = df["time"]
+    elif "time_min" not in df.columns:
+        df["time_min"] = df["timestep"].astype(float)  # 1 frame = 1 min fallback
+
+    if "area_nuc" in df.columns:
+        df["nuc_area"] = df["area_nuc"]
+    elif "area" in df.columns:
+        df["nuc_area"] = df["area"]
+
+    if "cell_line" not in df.columns:
+        df["cell_line"] = cell_line_default
+
+    if "stim_power" in df.columns:
+        df["stim_power"] = df["stim_power"].fillna(0)
+    df["stim_exposure"] = df["stim_exposure"].fillna(0)
+    return df
+
+
+def _project_canonical(df):
+    """Enforce the hard cut: keep exactly CANONICAL_RAW_COLS, drop everything else."""
+    missing = [c for c in CANONICAL_RAW_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"adapter output missing canonical columns: {missing}")
+    return df[CANONICAL_RAW_COLS].copy()
+
+
+def adapt_standard(df, experiment_name, cell_line="EGFR", **kw):
+    """Standard optoRTK experiments — ``ramp_pattern_name`` is the label."""
+    df = df.copy()
+    df["stim_condition"] = df["ramp_pattern_name"].astype(str)
+    df = _canonicalize_common(df, experiment_name, cell_line)
+    return _project_canonical(df)
+
+
+def adapt_bo(df, experiment_name, bo_tag="v8", cell_line="EGFR", **kw):
+    """BO oscillation experiments — synthesize the label from ``condition_idx``."""
+    df = df.drop(columns=[c for c in _OBJECT_COLS if c in df.columns])
+    if "condition_idx" in df.columns:
+        df["stim_condition"] = f"bo_osc_{bo_tag}_c" + df["condition_idx"].astype(str)
+    else:
+        df["stim_condition"] = f"bo_osc_{bo_tag}"
+    df = _canonicalize_common(df, experiment_name, cell_line)
+    return _project_canonical(df)
+
+
+def adapt_freepattern(df, experiment_name, cell_line="EGFR", **kw):
+    """FreePatternStim experiments — ``treatment_name`` is the label.
+
+    The raw integer ``uid`` is a *treatment* id (one FOV per treatment), NOT a
+    cell id; it is dropped so _derive_identity rebuilds a real per-cell uid.
+    """
+    df = df.drop(columns=[c for c in _OBJECT_COLS if c in df.columns])
+    df["stim_condition"] = df["treatment_name"].astype(str)
+    df = _canonicalize_common(df, experiment_name, cell_line)
+    return _project_canonical(df)
+
+
+ADAPTERS = {
+    "standard": adapt_standard,
+    "bo": adapt_bo,
+    "freepattern": adapt_freepattern,
+}
+
+
+def adapt(df, experiment, experiment_name, **kw):
+    """Dispatch to the adapter for ``experiment`` (unknown -> standard)."""
+    fn = ADAPTERS.get(experiment or "standard", adapt_standard)
+    return fn(df, experiment_name, **kw)
+
+
+# ---------------------------------------------------------------------------
+# Identity derivation / cleaning / feature derivation (all on canonical cols)
+# ---------------------------------------------------------------------------
+
+def _derive_identity(df):
+    """cnr / cnr_median / uid from canonical raw columns.
+
+    uid = ``{original_experiment_name}__{stim_condition}__{fov}__{particle}`` —
+    globally unique across a concatenated bundle.
+    """
+    df = df.copy()
     df["cnr"] = df["mean_intensity_C1_ring"] / df["mean_intensity_C1_nuc"]
     df["cnr_median"] = df["median_intensity_C1_ring"] / df["median_intensity_C1_nuc"]
-    df["uid"] = df['ramp_pattern_name'] + df["fov"].astype("string") + "_" + df["particle"].astype("string")
-    df["frame"] = df["timestep"]
+    df["uid"] = (
+        df["original_experiment_name"].astype(str) + "__"
+        + df["stim_condition"].astype(str) + "__"
+        + df["fov"].astype(str) + "__"
+        + df["particle"].astype(str)
+    )
+    return df
 
+
+def clean(
+    df,
+    *,
+    cell_selection_csv=None,
+    tracking_threshold=0.9,
+    norm_until_timepoint=10,
+    baseline_cnr_max=0.8,
+    cell_line="EGFR",
+):
+    """Drop short tracks, baseline-normalize CNR, apply selection/filters.
+
+    Operates on a canonical frame that already has ``uid``/``frame``/``cnr``.
+    """
     # --- drop short tracks --------------------------------------------------
     frame_counts = df["uid"].value_counts()
     threshold = tracking_threshold * frame_counts.max()
     valid_uids = frame_counts[frame_counts >= threshold].index
-    df = df[df["uid"].isin(valid_uids)]
+    df = df[df["uid"].isin(valid_uids)].copy()
 
     # --- normalise CNR (median) ---------------------------------------------
     baseline_median = (
-        df.loc[df["frame"] < norm_until_timepoint]
-        .groupby("uid")["cnr_median"]
-        .median()
+        df.loc[df["frame"] < norm_until_timepoint].groupby("uid")["cnr_median"].median()
     )
     df["cnr_median_norm"] = df["uid"].map(baseline_median)
     df["cnr_median_norm"] = df["cnr_median"] / df["cnr_median_norm"]
-    df.dropna(subset=["cnr_median_norm"], inplace=True)
+    df = df.dropna(subset=["cnr_median_norm"])
 
     # --- normalise CNR (mean) -----------------------------------------------
     baseline_mean = (
-        df.loc[df["frame"] < norm_until_timepoint]
-        .groupby("uid")["cnr"]
-        .median()
+        df.loc[df["frame"] < norm_until_timepoint].groupby("uid")["cnr"].median()
     )
     df["cnr_mean_norm"] = df["uid"].map(baseline_mean)
     df["cnr_mean_norm"] = df["cnr"] / df["cnr_mean_norm"]
-    df.dropna(subset=["cnr_mean_norm"], inplace=True)
+    df = df.dropna(subset=["cnr_mean_norm"])
 
     # --- manual cell selection ----------------------------------------------
+    # NOTE: cell_selection.csv `uid` must use the canonical uid format; legacy
+    # selection files (ramp_pattern_name+fov+particle) need regeneration.
     if cell_selection_csv is not None and os.path.isfile(cell_selection_csv):
-        print('cell line selection for ', parquet_path , ' running...')
         sel = pd.read_csv(cell_selection_csv)
         uids_to_delete = sel.loc[sel["deleted"] == True, "uid"]
         df = df[~df["uid"].isin(uids_to_delete)]
@@ -90,66 +224,50 @@ def load_and_clean(
     if baseline_cnr_max is not None:
         df = df[df["median_cnr_0_9"] <= baseline_cnr_max]
 
-
-    # --- Cell line filtering ----------------------------------------
-    df = df[df['cell_line'] == cell_line]
-
-    
-    # --- Power calculation -----------------------------------------
-
-    df['stim_exposure'] = df['stim_exposure'].fillna(0) # if you're not giving me exposure, it's probably zero 
-
-    df = calc_power(df)
-
-    df = add_stim_features(df)
-
-    df = df.reset_index(drop=True)
+    # --- cell line filtering ------------------------------------------------
+    df = df[df["cell_line"] == cell_line]
     return df
 
 
+def derive_features(df, calib=None):
+    """calc_power(calib) + the 9 stim features; returns a fresh-indexed frame."""
+    df = calc_power(df, calib=calib)
+    df = add_stim_features(df)
+    return df.reset_index(drop=True)
 
 
-def load_and_clean_bo(
-    parquet_path: str,
+def load_and_clean(
+    parquet_path: "str | pd.DataFrame",
+    *,
+    experiment: str = "standard",
+    experiment_name: str | None = None,
+    instrument: str | None = None,
     cell_selection_csv: str | None = None,
     tracking_threshold: float = 0.9,
     norm_until_timepoint: int = 10,
     baseline_cnr_max: float | None = 0.8,
-    cell_line: str | None = 'EGFR',
+    cell_line: str | None = "EGFR",
+    **adapter_kw,
 ) -> pd.DataFrame:
-    """Adapter loader for BO oscillation parquet files.
+    """Read one raw experiment parquet and return a cleaned canonical frame.
 
-    BO datasets carry ``phase_name`` / ``phase_id`` / ``condition_idx`` instead
-    of ``ramp_pattern_name``, ``area_nuc`` instead of ``area``, and no
-    ``cell_line`` column. This function reads the parquet in-memory, adds the
-    columns that ``load_and_clean`` expects, and then delegates to it. The
-    source parquet is not modified.
-
-    The synthesized ``ramp_pattern_name`` encodes ``condition_idx`` so that
-    different optimizer-chosen conditions remain distinguishable downstream.
+    Orchestrates: read -> adapt(experiment) -> _derive_identity -> clean ->
+    derive_features. ``experiment`` selects the adapter (``standard``/``bo``/
+    ``freepattern``); ``experiment_name`` is the canonical
+    ``original_experiment_name`` value (defaults to ``experiment``);
+    ``instrument`` selects the power-calibration curve from :data:`CALIBRATIONS`.
     """
-    df = pd.read_parquet(parquet_path)
-
-    drop_object_cols = [c for c in ('channels', 'ref_channels', 'img_shape')
-                        if c in df.columns]
-    if drop_object_cols:
-        df = df.drop(columns=drop_object_cols)
-
-    if 'condition_idx' in df.columns:
-        df['ramp_pattern_name'] = 'bo_osc_c' + df['condition_idx'].astype('string')
+    if isinstance(parquet_path, pd.DataFrame):
+        df = parquet_path.copy()
     else:
-        df['ramp_pattern_name'] = 'bo_osc'
+        df = pd.read_parquet(parquet_path)
 
-    if 'area' not in df.columns and 'area_nuc' in df.columns:
-        df['area'] = df['area_nuc']
+    if experiment_name is None:
+        experiment_name = experiment
 
-    if 'cell_line' not in df.columns:
-        df['cell_line'] = cell_line if cell_line is not None else 'EGFR'
-
-    if 'stim_power' in df.columns:
-        df['stim_power'] = df['stim_power'].fillna(0)
-
-    return load_and_clean(
+    df = adapt(df, experiment, experiment_name, cell_line=cell_line, **adapter_kw)
+    df = _derive_identity(df)
+    df = clean(
         df,
         cell_selection_csv=cell_selection_csv,
         tracking_threshold=tracking_threshold,
@@ -157,15 +275,34 @@ def load_and_clean_bo(
         baseline_cnr_max=baseline_cnr_max,
         cell_line=cell_line,
     )
+    df = derive_features(df, calib=CALIBRATIONS[instrument or DEFAULT_INSTRUMENT])
+    return df
 
 
-cal_power_pct = [0,1,2,4,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100]
-cal_uW        = [8,11,17,26.2,29.5,49.9,71.3,90.5,111,132,153,172,192,212,231,249,268,287,305,321,339,356,374,389]
-cal_mW_cm2    = [1.26,1.73,2.67,4.12,4.64,7.84,11.21,14.23,17.45,20.75,24.05,27.04,30.18,33.32,36.31,39.14,42.13,45.11,47.94,50.46,53.29,55.96,58.79,61.15]
+# Power calibration curves, one per microscope. `stim_power` (0..100 %) maps to
+# optical power (uW) and irradiance (mW/cm2) by piecewise-linear interpolation.
+# Keyed by instrument name; add a new entry when a second scope comes online.
+# No time dimension — curves are assumed stable per scope.
+CALIBRATIONS = {
+    "jungfrau": dict(
+        pct=[0,1,2,4,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100],
+        uW=[8,11,17,26.2,29.5,49.9,71.3,90.5,111,132,153,172,192,212,231,249,268,287,305,321,339,356,374,389],
+        mW_cm2=[1.26,1.73,2.67,4.12,4.64,7.84,11.21,14.23,17.45,20.75,24.05,27.04,30.18,33.32,36.31,39.14,42.13,45.11,47.94,50.46,53.29,55.96,58.79,61.15],
+    ),
+}
+DEFAULT_INSTRUMENT = "jungfrau"
 
-def calc_power(df):
-    P_uW = np.interp(df["stim_power"], cal_power_pct, cal_uW)           # microwatts
-    irradiance = np.interp(df["stim_power"], cal_power_pct, cal_mW_cm2) # mW/cm2
+
+def calc_power(df, calib=None):
+    """Add energy/fluence columns from ``stim_power`` via an instrument curve.
+
+    ``calib`` is one entry of :data:`CALIBRATIONS` (keys ``pct``/``uW``/
+    ``mW_cm2``); defaults to the :data:`DEFAULT_INSTRUMENT` curve.
+    """
+    if calib is None:
+        calib = CALIBRATIONS[DEFAULT_INSTRUMENT]
+    P_uW = np.interp(df["stim_power"], calib["pct"], calib["uW"])           # microwatts
+    irradiance = np.interp(df["stim_power"], calib["pct"], calib["mW_cm2"]) # mW/cm2
 
     # Energy per pulse
     # More precisely: energy (uJ) = P (uW) * t (ms) * 1e-3
@@ -174,7 +311,7 @@ def calc_power(df):
     # Fluence (energy dose per unit area) per pulse
     df["fluence_mJ_cm2"] = irradiance * df["stim_exposure"] * 1e-3  # mW/cm2 * ms * 1e-3 = mJ/cm2
 
-    df['energy_per_cell'] = df['fluence_mJ_cm2'] * df['area'] # not in any units, since area is just pixels.
+    df['energy_per_cell'] = df['fluence_mJ_cm2'] * df['nuc_area'] # not in any units, since area is just pixels.
     # warning - never use this - the area is the things we stain for (ERK in nucl - so size actually changes from our pertrbation)
 
     return df
@@ -341,9 +478,6 @@ def augment(df, baseline_frames=10, responder_sigma=2.0):
     return df
 
 
-DEFAULT_STIM_COLS = ["u_t", "m_t", "recency", "ewma_fast", "ewma_slow",
-                     "n_5", "slope_5", "burst_pos", "s_cum"]
-
 def make_windows(df, window_size=None, stride=None, value_col="cnr_median_norm",
                  stim_cols=None):
     """Slice per-cell trajectories into fixed-length windows.
@@ -359,7 +493,7 @@ def make_windows(df, window_size=None, stride=None, value_col="cnr_median_norm",
     value_col : str
         Column name for the target signal (e.g. ERK readout).
     stim_cols : list of str or None
-        Stimulus feature columns to extract.  ``None`` → ``DEFAULT_STIM_COLS``.
+        Stimulus feature columns to extract.  ``None`` → ``STIM_COLS``.
 
     Returns
     -------
@@ -368,9 +502,9 @@ def make_windows(df, window_size=None, stride=None, value_col="cnr_median_norm",
     meta : pd.DataFrame  — one row per window with uid, window_start, and first-row metadata.
     """
     if stim_cols is None:
-        stim_cols = DEFAULT_STIM_COLS
+        stim_cols = STIM_COLS
     if window_size is None:
-        window_size = int(df.groupby("ramp_pattern_name")["frame"].nunique().min())
+        window_size = int(df.groupby("stim_condition")["frame"].nunique().min())
     if stride is None:
         stride = window_size
 
@@ -396,7 +530,8 @@ def make_windows(df, window_size=None, stride=None, value_col="cnr_median_norm",
                 "uid": uid,
                 "window_start": int(frames[start]),
                 "cell_line": first_row.get("cell_line", None),
-                "ramp_pattern_name": first_row.get("ramp_pattern_name", None),
+                "stim_condition": first_row.get("stim_condition", None),
+                "original_experiment_name": first_row.get("original_experiment_name", None),
                 "fov": first_row.get("fov", None),
             })
 
@@ -419,7 +554,7 @@ def make_tracks(df, value_col="cnr_median_norm", stim_cols=None,
     df : pd.DataFrame
         Long-format dataset with ``uid``, ``frame``, *value_col*, and *stim_cols*.
     value_col, stim_cols
-        See ``make_windows``. ``stim_cols`` defaults to ``DEFAULT_STIM_COLS``.
+        See ``make_windows``. ``stim_cols`` defaults to ``STIM_COLS``.
     drop_nan_cells : bool
         Skip cells whose trajectory contains any NaN in value or stim columns.
 
@@ -433,7 +568,7 @@ def make_tracks(df, value_col="cnr_median_norm", stim_cols=None,
         One row per kept cell with uid + first-frame metadata + ``T``.
     """
     if stim_cols is None:
-        stim_cols = DEFAULT_STIM_COLS
+        stim_cols = STIM_COLS
 
     cnr_list, stim_list, meta_rows = [], [], []
     for uid, g in df.groupby("uid"):
@@ -448,7 +583,8 @@ def make_tracks(df, value_col="cnr_median_norm", stim_cols=None,
         meta_rows.append({
             "uid": uid,
             "cell_line": first.get("cell_line", None),
-            "ramp_pattern_name": first.get("ramp_pattern_name", None),
+            "stim_condition": first.get("stim_condition", None),
+            "original_experiment_name": first.get("original_experiment_name", None),
             "fov": first.get("fov", None),
             "T": int(len(vals)),
         })
@@ -461,6 +597,42 @@ def make_tracks(df, value_col="cnr_median_norm", stim_cols=None,
         stim[i] = s
     meta = pd.DataFrame(meta_rows)
     return cnr, stim, meta
+
+
+def add_crowding_features(
+    df,
+    radius: float = 200.0,
+    group_cols=("original_experiment_name", "fov", "frame"),
+):
+    """Add per-row spatial-crowding features from ``x``/``y`` positions.
+
+    Adds two columns:
+      ``fov_density``   — number of detected cells in the same field at the same
+                          frame.
+      ``n_cells_200px`` — number of *other* cells within ``radius`` pixels (same
+                          field + frame).
+
+    Call on the **raw** dataframe, BEFORE dropping short tracks, so neighbour
+    counts include every detected cell. ``group_cols`` is the physical
+    (experiment, fov, frame) key matching ``uid`` construction in
+    ``load_and_clean``.
+    """
+    from scipy.spatial import cKDTree
+
+    xy = df[["x", "y"]].to_numpy(dtype=float)
+    n = len(df)
+    fov_density = np.ones(n, dtype=np.float32)
+    n_in_radius = np.zeros(n, dtype=np.float32)
+    for _, idx in df.groupby(list(group_cols)).indices.items():
+        m = len(idx)
+        fov_density[idx] = m
+        if m > 1:
+            cnts = cKDTree(xy[idx]).query_ball_point(xy[idx], r=radius, return_length=True)
+            n_in_radius[idx] = cnts - 1  # exclude self
+    out = df.copy()
+    out["fov_density"] = fov_density
+    out["n_cells_200px"] = n_in_radius
+    return out
 
 
 def make_windows_sample(df, window_size=None, value_col="cnr_median_norm",
@@ -476,7 +648,7 @@ def make_windows_sample(df, window_size=None, value_col="cnr_median_norm",
     value_col : str
         Column name for the target signal.
     stim_cols : list of str or None
-        Stimulus feature columns.  ``None`` → ``DEFAULT_STIM_COLS``.
+        Stimulus feature columns.  ``None`` → ``STIM_COLS``.
     rng : np.random.Generator or int or None
         Random generator or seed for reproducibility.
 
@@ -487,9 +659,9 @@ def make_windows_sample(df, window_size=None, value_col="cnr_median_norm",
     meta : pd.DataFrame  — one row per cell with uid, window_start, and first-row metadata.
     """
     if stim_cols is None:
-        stim_cols = DEFAULT_STIM_COLS
+        stim_cols = STIM_COLS
     if window_size is None:
-        window_size = int(df.groupby("ramp_pattern_name")["frame"].nunique().min())
+        window_size = int(df.groupby("stim_condition")["frame"].nunique().min())
     if not isinstance(rng, np.random.Generator):
         rng = np.random.default_rng(rng)
 
@@ -517,7 +689,8 @@ def make_windows_sample(df, window_size=None, value_col="cnr_median_norm",
             "uid": uid,
             "window_start": int(frames[start]),
             "cell_line": g.iloc[0].get("cell_line", None),
-            "ramp_pattern_name": g.iloc[0].get("ramp_pattern_name", None),
+            "stim_condition": g.iloc[0].get("stim_condition", None),
+            "original_experiment_name": g.iloc[0].get("original_experiment_name", None),
             "fov": g.iloc[0].get("fov", None),
         })
 
@@ -533,14 +706,15 @@ def plot_nan_audit(df):
     Parameters
     ----------
     df : pd.DataFrame
-        The combined dataset (must contain a ``ramp_pattern_name`` and ``uid`` column).
+        The combined dataset (must contain ``original_experiment_name`` and
+        ``uid`` columns).
     """
     import matplotlib.pyplot as plt
 
     # Per-column NaN count per experiment
     nan_by_exp = pd.DataFrame({
-        pat: df[df['ramp_pattern_name'] == pat].isna().sum()
-        for pat in df['ramp_pattern_name'].unique()
+        pat: df[df['original_experiment_name'] == pat].isna().sum()
+        for pat in df['original_experiment_name'].unique()
     })
     nan_by_exp = nan_by_exp[nan_by_exp.sum(axis=1) > 0]
 
@@ -575,40 +749,121 @@ def plot_nan_audit(df):
     return cell_nan_frac
 
 
-def check_df(df):
-    # TODO: make this better.
-    for c in 'u_t m_t recency burst_pos	n_5	slope_5	ewma_fast ewma_slow	s_cum '.split():
-      assert df[c].notna().all(), f'{c} failed notNA check'
+def validate_canonical(df, *, derived=True):
+    """Assert a frame conforms to the canonical schema (the hard-cut contract).
+
+    Checks the canonical raw columns are present, no legacy column leaked, and
+    (when ``derived``) the derived columns exist and the 9 stim features are
+    non-NaN.
+    """
+    for c in CANONICAL_RAW_COLS:
+        assert c in df.columns, f"missing canonical column {c!r}"
+    for legacy in _LEGACY_COLS:
+        assert legacy not in df.columns, f"legacy column {legacy!r} leaked"
+    if derived:
+        for c in STIM_COLS:
+            assert df[c].notna().all(), f"{c} has NaN"
+        for c in CANONICAL_DERIVED_COLS:
+            assert c in df.columns, f"missing derived column {c!r}"
+
+
+# ===========================================================================
+# Experiment registry + bundles
+# ===========================================================================
+# One declarative entry per raw experiment (name -> dir + adapter + kwargs).
+# A BUNDLE is a named list of experiments concatenated into one canonical frame.
+
+_OPTORTK = "/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data"
+_BO = "/Volumes/imaging.data/PertzLab/Alex/Oscillation_BO"
+_FPS = "/Volumes/imaging.data/PertzLab/Alex/FreePatternStimulation"
+
+# `instrument` selects the power-calibration curve from CALIBRATIONS. All
+# experiments so far ran on "jungfrau"; a second scope adds its own curve there
+# and sets instrument= on its entries here (nothing else changes).
+EXPERIMENTS = {
+    "3-2-1minIntervals": dict(dir=f"{_OPTORTK}/2025-11-03_3-2-1minIntervals", adapter="standard", instrument="jungfrau", kwargs={}),
+    "DoseResponse":      dict(dir=f"{_OPTORTK}/2025-10-12_DoseResponse",       adapter="standard", instrument="jungfrau", kwargs={}),
+    "Sustained_1min":    dict(dir=f"{_OPTORTK}/2025-11-02_Sustained_1min",     adapter="standard", instrument="jungfrau", kwargs={}),
+    "RampReverse":       dict(dir=f"{_OPTORTK}/2025-09-04_RampReverse",        adapter="standard", instrument="jungfrau", kwargs={}),
+    "bo_v8":     dict(dir=f"{_BO}/2026-05-01_bo_erk_oscillation_v8_freq_range_wider",             adapter="bo", instrument="jungfrau", kwargs={"bo_tag": "v8"}),
+    "bo_v10":    dict(dir=f"{_BO}/2026-05-07_bo_erk_oscillation_v10_led_power",                   adapter="bo", instrument="jungfrau", kwargs={"bo_tag": "v10"}),
+    "bo_v11_10s": dict(dir=f"{_BO}/2026-05-08_bo_erk_oscillation_v11_light_budget_fixed10s_pi10", adapter="bo", instrument="jungfrau", kwargs={"bo_tag": "v11_10s"}),
+    "bo_v11_20s": dict(dir=f"{_BO}/2026-05-08_bo_erk_oscillation_v11_light_budget_fixed20s_pi10", adapter="bo", instrument="jungfrau", kwargs={"bo_tag": "v11_20s"}),
+    "freepattern_v1":       dict(dir=f"{_FPS}/2026-06-23_FreePatternStim_Jungfrau_v1",        adapter="freepattern", instrument="jungfrau", kwargs={}),
+    "freepattern_v2":       dict(dir=f"{_FPS}/2026-06-26_FreePatternStim_Jungfrau_v2",        adapter="freepattern", instrument="jungfrau", kwargs={}),
+    "freepattern_TrKA1_v1": dict(dir=f"{_FPS}/2026-06-30_FreePatternStim_Jungfrau_TrKA1_v1",  adapter="freepattern", instrument="jungfrau", kwargs={}),
+    "freepattern_TrKA1_v2": dict(dir=f"{_FPS}/2026-07-03_FreePatternStim_Jungfrau_TrKA1_v2",  adapter="freepattern", instrument="jungfrau", kwargs={}),
+}
+
+# Instrument recoverable per row from original_experiment_name (no stored column).
+EXPERIMENT_INSTRUMENT = {name: spec["instrument"] for name, spec in EXPERIMENTS.items()}
+
+# Named bundles -> output parquet paths. `real` is the pre-BO snapshot;
+# `real_plus_bo` is the post-BO union kept at the canonical `dataset.parquet`.
+BUNDLES = {
+    #"real": ["3-2-1minIntervals", "DoseResponse", "Sustained_1min", "RampReverse",
+    #                 "bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s"], # legacy reasons, same as cedric_and_bo
+    "cedric":         ["3-2-1minIntervals", "DoseResponse", "Sustained_1min", "RampReverse"],
+
+    "bo": ["bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s"],
+    "cedric_and_bo": ["3-2-1minIntervals", "DoseResponse", "Sustained_1min", "RampReverse",
+                     "bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s"],
+    "freepattern":  ["freepattern_v1", "freepattern_v2",],
+    "all": ["3-2-1minIntervals", "DoseResponse", "Sustained_1min", "RampReverse",
+                     "bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s", "freepattern_v1", "freepattern_v2"],
+}
+
+OUT_PATHS = {
+    "real": "dataset.parquet.v0",
+    "real_plus_bo": "dataset.parquet",
+    "freepattern": "dataset_freepattern.parquet",
+}
+
+
+def build_experiment(name, **clean_kwargs):
+    """Load + clean one registered experiment into a canonical frame."""
+    spec = EXPERIMENTS[name]
+    exp_dir = Path(spec["dir"])
+    p = exp_dir / "exp_data.parquet"
+    if not p.exists():
+        raise FileNotFoundError(f"Data file not found: {p}")
+    cell_sel = exp_dir / "cell_selection.csv"
+    return load_and_clean(
+        p,
+        experiment=spec["adapter"],
+        experiment_name=name,
+        instrument=spec["instrument"],
+        cell_selection_csv=str(cell_sel) if cell_sel.exists() else None,
+        **spec["kwargs"],
+        **clean_kwargs,
+    )
+
+
+def build_bundle(names, **clean_kwargs):
+    """Concatenate cleaned canonical frames for a list of experiment names."""
+    dfs = [build_experiment(n, **clean_kwargs) for n in names]
+    df = pd.concat(dfs, ignore_index=True).reset_index(drop=True)
+    validate_canonical(df, derived=True)
+    return df
+
 
 if __name__ == '__main__':
-    exp_paths = [
-    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-11-03_3-2-1minIntervals/', load_and_clean), # 660 cells, # 180 min
-    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-10-12_DoseResponse', load_and_clean), # 800 cells, 40min
-    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-11-02_Sustained_1min', load_and_clean), # 1350 cells, 120 min
-    ('/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data/2025-09-04_RampReverse', load_and_clean),
-    ('/Volumes/imaging.data/PertzLab/Alex/Oscillation_BO/2026-05-01_bo_erk_oscillation_v8_freq_range_wider', load_and_clean_bo),
-    ]
-    # load these and process according to the above-defined pipeline, then save as dataset.parquet
-    dfs = []
-    for ep, loader in exp_paths:
-        print('starting ', ep, flush=True)
-        exp = Path(ep)
-        p = exp / 'exp_data.parquet'
-        if not p.exists():
-            raise FileNotFoundError(f"Data file not found: {p}")
-
-        cell_sel_path = exp / 'cell_selection.csv'
-        if cell_sel_path.exists():
-            df_i = loader(p, cell_selection_csv=cell_sel_path)
-        else:
-            df_i = loader(p)
-        dfs.append(df_i.copy())
-
-    df = pd.concat(dfs, ignore_index=True)
-    df.reset_index(drop=True, inplace=True)
-    check_df(df)
-    df.to_parquet('dataset.parquet')
-    print('saved dataset...')
+    import sys as _sys
+    # Usage: python preprocessing.py [bundle_name ...] [--out PATH]
+    # Default rebuilds `real` and `real_plus_bo` to their canonical OUT_PATHS.
+    args = _sys.argv[1:]
+    out_override = None
+    if "--out" in args:
+        i = args.index("--out")
+        out_override = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    targets = args or BUNDLES.keys()
+    for bundle_name in targets:
+        print(f"building bundle {bundle_name!r} ...", flush=True)
+        df = build_bundle(BUNDLES[bundle_name])
+        out = out_override or OUT_PATHS[bundle_name]
+        df.to_parquet(out)
+        print(f"  -> {out}  ({len(df):,} rows, {df['uid'].nunique():,} cells)")
 
 def filter_dead_cells(df,
                       intensity_col="mean_intensity_C0_nuc",
@@ -637,14 +892,13 @@ def filter_dead_cells(df,
         ``"entire"`` removes the whole cell track.
     """
     df = df.copy()
-    area_col = "area_nuc" if "area_nuc" in df.columns else "area"
 
     # per-cell baseline median intensity as reference (first 10 frames)
     baseline = df.loc[df["frame"] < 10]
     med_int = baseline.groupby("uid")[intensity_col].median()
     df["_int_threshold"] = df["uid"].map(med_int) * drop_ratio
 
-    dead_mask = (df[intensity_col] < df["_int_threshold"]) | (df[area_col] < min_area)
+    dead_mask = (df[intensity_col] < df["_int_threshold"]) | (df["nuc_area"] < min_area)
 
     if remove_from == "entire":
         dead_uids = df.loc[dead_mask, "uid"].unique()

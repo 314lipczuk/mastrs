@@ -353,7 +353,7 @@ def _(
     torch,
 ):
     from experiments.seq2seq_data import STIM_COLS
-    from experiments.seq2scal_models import _ewma_1d as ewma1d
+    from experiments.seq2scal_models_abs import _ewma_1d as ewma1d
     from cell_video import _gmm_pred_std as gmm_std
 
     mo.stop(predict_fn is None, mo.md("Load a bundle first."))

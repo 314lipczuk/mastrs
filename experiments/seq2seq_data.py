@@ -14,15 +14,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from baseline_prepend import prepend_channels  # noqa: E402
-
-STIM_COLS = [
-    "u_t", "m_t", "recency", "ewma_fast", "ewma_slow",
-    "n_5", "slope_5", "burst_pos", "s_cum",
-]
+from notebooks.experiment.preprocessing import STIM_COLS  # noqa: E402 (single source of truth)
 
 
 def _ewma(x: np.ndarray, alpha: float) -> np.ndarray:
@@ -39,6 +37,11 @@ def _stim_features(light: np.ndarray, tau: float = 5.0, window: int = 5) -> np.n
 
     Returns stim array of shape (N, 9, T) with channels matching STIM_COLS:
         u_t, m_t, recency, ewma_fast, ewma_slow, n_5, slope_5, burst_pos, s_cum
+
+    This is the synthetic/baseline-prepend re-derivation, independent of
+    ``preprocessing.add_stim_features`` (the real long-format path). Both MUST
+    stay aligned to ``STIM_COLS`` order — the shared Seq2SeqDataset channel
+    contract depends on it.
     """
     N, T = light.shape
     m = (light > 0).astype(np.float32)
@@ -176,21 +179,22 @@ def load_real(
     -------
     cnr : (N_windows, window_size) baseline-normalized CNR
     stim : (N_windows, 9, window_size) stimulus features matching STIM_COLS
-    conditions : (N_windows,) ramp pattern labels
+    conditions : (N_windows,) stim_condition labels
     """
-    from notebooks.experiment.preprocessing import load_and_clean, make_windows, DEFAULT_STIM_COLS
+    from notebooks.experiment.preprocessing import make_windows, STIM_COLS
 
-    df = load_and_clean(path, baseline_cnr_max=None)
+    # dataset.parquet.v0 is already a cleaned canonical bundle — window directly.
+    df = pd.read_parquet(path)
 
     cnr, stim_all, meta = make_windows(
         df,
         window_size=window_size,
         stride=stride,
         value_col="cnr_median_norm",
-        stim_cols=DEFAULT_STIM_COLS,
+        stim_cols=STIM_COLS,
     )
 
-    conditions = meta["ramp_pattern_name"].values
+    conditions = meta["stim_condition"].values
 
     return cnr, stim_all, conditions
 
@@ -206,7 +210,7 @@ def load_real_uncertain(
     Rows are already preprocessed (load_and_clean output schema); skip re-cleaning
     and window directly.
     """
-    from notebooks.experiment.preprocessing import make_windows, DEFAULT_STIM_COLS
+    from notebooks.experiment.preprocessing import make_windows, STIM_COLS
 
     df = pd.read_parquet(path)
 
@@ -215,10 +219,10 @@ def load_real_uncertain(
         window_size=window_size,
         stride=stride,
         value_col="cnr_median_norm",
-        stim_cols=DEFAULT_STIM_COLS,
+        stim_cols=STIM_COLS,
     )
 
-    conditions = meta["ramp_pattern_name"].values
+    conditions = meta["stim_condition"].values
 
     return cnr, stim_all, conditions
 
@@ -240,19 +244,16 @@ def load_real_tracks(
     stim : np.ndarray(dtype=object), shape (n_cells,)
         Each element is a 2D float32 array of shape ``(9, T_cell)``.
     conditions : np.ndarray, shape (n_cells,)
-        ramp_pattern_name per cell.
+        stim_condition per cell.
     """
-    from notebooks.experiment.preprocessing import (
-        DEFAULT_STIM_COLS,
-        load_and_clean,
-        make_tracks,
-    )
+    from notebooks.experiment.preprocessing import STIM_COLS, make_tracks
 
-    df = load_and_clean(path, baseline_cnr_max=None)
+    # dataset.parquet.v0 is already a cleaned canonical bundle — track directly.
+    df = pd.read_parquet(path)
     cnr, stim, meta = make_tracks(
-        df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
+        df, value_col="cnr_median_norm", stim_cols=STIM_COLS
     )
-    conditions = meta["ramp_pattern_name"].to_numpy()
+    conditions = meta["stim_condition"].to_numpy()
     cnr, stim = _prepend_baseline_tracks(cnr, stim, baseline_prepend)
     return cnr, stim, conditions
 
@@ -261,13 +262,13 @@ def load_real_uncertain_tracks(
     path: str = "dataset_real_uncertain.parquet",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Same contract as :func:`load_real_tracks` for the combined dataset."""
-    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS, make_tracks
+    from notebooks.experiment.preprocessing import STIM_COLS, make_tracks
 
     df = pd.read_parquet(path)
     cnr, stim, meta = make_tracks(
-        df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
+        df, value_col="cnr_median_norm", stim_cols=STIM_COLS
     )
-    conditions = meta["ramp_pattern_name"].to_numpy()
+    conditions = meta["stim_condition"].to_numpy()
     return cnr, stim, conditions
 
 
@@ -276,13 +277,13 @@ def load_real_plus_bo_tracks(
     baseline_prepend: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Post-BO real dataset (`dataset.parquet`); pre-BO snapshot is `real`."""
-    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS, make_tracks
+    from notebooks.experiment.preprocessing import STIM_COLS, make_tracks
 
     df = pd.read_parquet(path)
     cnr, stim, meta = make_tracks(
-        df, value_col="cnr_median_norm", stim_cols=DEFAULT_STIM_COLS
+        df, value_col="cnr_median_norm", stim_cols=STIM_COLS
     )
-    conditions = meta["ramp_pattern_name"].to_numpy()
+    conditions = meta["stim_condition"].to_numpy()
     cnr, stim = _prepend_baseline_tracks(cnr, stim, baseline_prepend)
     return cnr, stim, conditions
 
@@ -293,7 +294,7 @@ def load_real_plus_bo(
     stride: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Windowed post-BO real dataset — counterpart to :func:`load_real`."""
-    from notebooks.experiment.preprocessing import DEFAULT_STIM_COLS, make_windows
+    from notebooks.experiment.preprocessing import STIM_COLS, make_windows
 
     df = pd.read_parquet(path)
     cnr, stim_all, meta = make_windows(
@@ -301,9 +302,9 @@ def load_real_plus_bo(
         window_size=window_size,
         stride=stride,
         value_col="cnr_median_norm",
-        stim_cols=DEFAULT_STIM_COLS,
+        stim_cols=STIM_COLS,
     )
-    conditions = meta["ramp_pattern_name"].values
+    conditions = meta["stim_condition"].values
     return cnr, stim_all, conditions
 
 
@@ -314,7 +315,7 @@ AVAILABLE_DATASETS = (
 
 # `real` is the pre-BO snapshot (preserves the semantics of past experiments
 # that recorded data_source="real"). `real_plus_bo` is the post-BO file
-# (includes BO oscillation v8, v10, v11_10s, v11_20s; ramp_pattern_name carries
+# (includes BO oscillation v8, v10, v11_10s, v11_20s; stim_condition carries
 # the per-experiment tag, e.g. `bo_osc_v10_c<idx>`).
 REAL_DATASET_PATHS = {
     "real": "dataset.parquet.v0",
@@ -334,10 +335,9 @@ def load(
     return **per-cell full trajectories** as object arrays — suitable for
     frame-by-frame navigation and in-notebook `Seq2SeqDataset` windowing.
 
-    **Legacy contract (back-compat)**: passing ``window_size=`` (and/or
-    ``stride=``) routes to the pre-windowed real loaders used by
-    ``ensemble_seq2scal.py`` / ``compare_seq2seq.py`` — these return
-    ``(N_windows, window_size)`` 2D arrays as before.
+    **Windowed contract**: passing ``window_size=`` (and/or ``stride=``) routes
+    to the pre-windowed real loaders — these return ``(N_windows, window_size)``
+    2D arrays.
 
     Synthetic loaders are unchanged (already return full tracks as uniform
     2D arrays).
@@ -375,3 +375,56 @@ def load(
     raise ValueError(
         f"Unknown dataset {ds_name!r}. Available: {list(AVAILABLE_DATASETS)}"
     )
+
+
+class Seq2SeqDataset(Dataset):
+    """Sliding ``(history_len + future_len)`` windows over each track.
+
+    The single shared dataset for the 9-channel seq2seq/seq2scalar models
+    (consolidates the ~15 inline copies). Duck-typed on length, so it accepts
+    BOTH uniform 2D arrays (windowed loaders, ``cnr[i]`` is a row) and object
+    arrays of variable-length per-cell tracks (``cnr[i]`` is a 1D array).
+
+    Each sample is ``(enc_in, dec_stim, dec_target)``:
+      * ``enc_in``  : ``(history_len, 1 + n_stim)`` — channel 0 is CNR, channels
+        ``1..`` are ``STIM_COLS`` in order.
+      * ``dec_stim``: ``(future_len, n_stim)`` — future stim block.
+      * ``dec_target``: ``(future_len,)`` — future CNR **first-differences**
+        (``np.diff`` of the full window), NOT absolute CNR.
+
+    ``conditions`` may be ``None``; otherwise ``sample_conditions`` holds the
+    per-sample label (used for stratified/OOD reporting).
+    """
+
+    def __init__(self, cnr, stim, conditions, history_len, future_len, stride=5):
+        self.samples: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        self.sample_conditions: list = []
+        total = history_len + future_len
+        for i in range(len(cnr)):
+            cnr_i = cnr[i]
+            stim_i = stim[i]
+            T = len(cnr_i)
+            t = 0
+            while t + total <= T:
+                enc_cnr = np.asarray(cnr_i[t : t + history_len])
+                enc_stim = np.asarray(stim_i[:, t : t + history_len])
+                dec_stim = np.asarray(stim_i[:, t + history_len : t + total])
+                full_window = np.asarray(cnr_i[t : t + total])
+                dec_target = np.diff(full_window)[history_len - 1 : history_len - 1 + future_len]
+                enc_in = np.concatenate([enc_cnr[:, np.newaxis], enc_stim.T], axis=-1)
+                self.samples.append((enc_in, dec_stim.T, dec_target))
+                self.sample_conditions.append(
+                    str(conditions[i]) if conditions is not None else None
+                )
+                t += stride
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        enc_in, dec_stim, dec_target = self.samples[idx]
+        return (
+            torch.tensor(enc_in, dtype=torch.float32),
+            torch.tensor(dec_stim, dtype=torch.float32),
+            torch.tensor(dec_target, dtype=torch.float32),
+        )

@@ -12,39 +12,9 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from experiments.seq2seq_data import AVAILABLE_DATASETS, load
+from experiments.seq2seq_data import AVAILABLE_DATASETS, Seq2SeqDataset, load
 
-
-class Seq2SeqDataset(Dataset):
-    """Sliding (H + F) windows over each track. Targets are future deltas."""
-
-    def __init__(self, cnr, stim, conditions, history_len: int, future_len: int, stride: int = 5):
-        self.samples: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        self.sample_conditions: list[str] = []
-        total = history_len + future_len
-        for i in range(len(cnr)):
-            t = 0
-            while t + total <= cnr.shape[1]:
-                enc_cnr = cnr[i, t : t + history_len]
-                enc_stim = stim[i, :, t : t + history_len]
-                dec_stim = stim[i, :, t + history_len : t + total]
-                full_window = cnr[i, t : t + total]
-                dec_target = np.diff(full_window)[history_len - 1 : history_len - 1 + future_len]
-                enc_in = np.concatenate([enc_cnr[:, np.newaxis], enc_stim.T], axis=-1)
-                self.samples.append((enc_in, dec_stim.T, dec_target))
-                self.sample_conditions.append(str(conditions[i]))
-                t += stride
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int):
-        enc_in, dec_stim, dec_target = self.samples[idx]
-        return (
-            torch.tensor(enc_in, dtype=torch.float32),
-            torch.tensor(dec_stim, dtype=torch.float32),
-            torch.tensor(dec_target, dtype=torch.float32),
-        )
+__all__ = ["Seq2SeqDataset", "build_loaders"]
 
 
 def build_loaders(config: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:

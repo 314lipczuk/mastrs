@@ -8,7 +8,7 @@ showed those are unused. See ``memory_characterization_plan.md``.
 Returns per-cell object arrays (variable T preserved):
     cnr        : (n_cells,)  each (T,) float32  — baseline-normalized CNR
     feats      : (n_cells,)  each (K, T) float32 — rows = HISTORY_FEATURES
-    conditions : (n_cells,)  str — ramp_pattern_name (protocol) per cell
+    conditions : (n_cells,)  str — stim_condition (protocol) per cell
     meta       : pd.DataFrame — one row per cell (uid, condition, fov, T)
 """
 from __future__ import annotations
@@ -47,5 +47,5 @@ def load_history_tracks(
     cnr, feats, meta = make_tracks(
         df, value_col="cnr_median_norm", stim_cols=HISTORY_FEATURES
     )
-    conditions = meta["ramp_pattern_name"].to_numpy()
+    conditions = meta["stim_condition"].to_numpy()
     return cnr, feats, conditions, meta

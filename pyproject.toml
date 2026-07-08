@@ -43,6 +43,7 @@ hastyplot = { git = "https://github.com/314lipczuk/hastyplot" }
 dev = [
     "ipykernel>=7.2.0",
     "nbclient>=0.10.4",
+    "pytest>=9.1.1",
     "python-lsp-ruff>=2.3.1",
     "python-lsp-server>=1.14.0",
     "vegafusion>=2.0.3",

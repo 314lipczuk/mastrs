@@ -9,8 +9,8 @@ different cell pick. Each frame shows the true trajectory plus the model's
 (no MC dropout — matches notebook eval semantics).
 
 Both prediction and per-frame plotting are pluggable. ``predict_fn`` is
-required (model contracts differ); reference impls for the MDN minfeats family
-live in this module (``predict_mdn_minfeats``, ``predict_mdn_minfeats_ewma``).
+required; the full-history model's impl is ``predict_history_cell`` (from
+``experiments.history_predict``), wired in ``PREDICT_FN_BY_MODULE``.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from tqdm.auto import tqdm
 
 from experiment import ExperimentBundle, load_experiment
 from experiments import seq2seq_data
+from experiments.history_predict import predict_history_cell
 from experiments.seq2seq_data import STIM_COLS
 from utils import get_device
 
@@ -91,8 +92,8 @@ def _resolve_main_model(
 
     Bundles trained inside a marimo notebook record ``model_type='__main__.<Cls>'``.
     Caller must specify ``experiment_module`` (e.g.
-    ``"experiments.lstm_seq2scal_mdn_minfeats_image_ewma"``) so the right class
-    is registered under ``__main__`` before :meth:`reconstruct_model` runs.
+    ``"experiments.lstm_seq2scal_history"``) so the right class is registered
+    under ``__main__`` before :meth:`reconstruct_model` runs.
     """
     mt = bundle.model_type or ""
     if not mt.startswith("__main__."):
@@ -174,240 +175,12 @@ def _safe_filename(s: str) -> str:
     return s or "unlabeled"
 
 
-# ---------------------------------------------------- reference predict_fn
 
-def _gmm_pred_std(pi: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Per-step marginal std of a Gaussian mixture: sqrt((π·(σ² + (μ - μ̄)²)).sum(-1))."""
-    mean = (pi * mu).sum(dim=-1, keepdim=True)
-    var = (pi * (sigma**2 + (mu - mean) ** 2)).sum(dim=-1)
-    return torch.sqrt(var.clamp(min=1e-12))
-
-
-def predict_mdn_minfeats_ewma(
-    model: "torch.nn.Module",
-    cell: CellData,
-    t: int,
-    future_len: int,
-    history_len: int,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Single deterministic forward (no dropout) for ``Seq2ScalarMDN`` (minfeats + EWMA).
-
-    Encoder window features (5): ``[cnr, fluence, baseline, ewma_slow, ewma_fast]``
-    with ``baseline = median(cnr[:9])``; EWMA channels read from ``stim``.
-    Predicts at most ``future_len`` steps ahead (clipped at trajectory end).
-
-    Mean trajectory: ``last_val + cumsum(E[delta_k])``.
-    Sigma: cumulative ``sqrt(cumsum(pred_std_k²))`` — uncertainty about the absolute
-    CNR at step k under the (approx.) independence assumption used by the eval
-    notebooks for ``pred_std``.
-    """
-    H = history_len
-    T = cell.cnr.shape[0]
-    if t < H or t >= T:
-        raise ValueError(f"t={t} out of bounds for history_len={H}, T={T}")
-    F = min(future_len, T - t)
-
-    u_idx = STIM_COLS.index("u_t")
-    s_idx = STIM_COLS.index("ewma_slow")
-    f_idx = STIM_COLS.index("ewma_fast")
-
-    cnr = cell.cnr.astype(np.float32)
-    flu = cell.stim[u_idx].astype(np.float32)
-    ewma_s = cell.stim[s_idx].astype(np.float32)
-    ewma_f = cell.stim[f_idx].astype(np.float32)
-    baseline = float(np.median(cnr[:9]))
-
-    enc_in = np.stack(
-        [
-            cnr[t - H:t],
-            flu[t - H:t],
-            np.full(H, baseline, dtype=np.float32),
-            ewma_s[t - H:t],
-            ewma_f[t - H:t],
-        ],
-        axis=-1,
-    )                                                       # (H, 5)
-    dec_stim = flu[t:t + F, None]                           # (F, 1)
-
-    enc_t = torch.from_numpy(enc_in).float().unsqueeze(0).to(device)
-    dec_t = torch.from_numpy(dec_stim).float().unsqueeze(0).to(device)
-    last_val = float(cnr[t - 1])
-
-    model.eval()
-    with torch.no_grad():
-        pi, mu, sigma = model(enc_t, dec_t)                 # each (1, F, K)
-        mean_delta = (pi * mu).sum(dim=-1).cpu().numpy()[0]
-        sigma_step = _gmm_pred_std(pi, mu, sigma).cpu().numpy()[0]
-
-    abs_mean = last_val + np.cumsum(mean_delta)
-    abs_sigma = np.sqrt(np.cumsum(sigma_step ** 2))
-    return abs_mean.astype(np.float32), abs_sigma.astype(np.float32)
-
-
-def predict_mdn_minfeats(
-    model: "torch.nn.Module",
-    cell: CellData,
-    t: int,
-    future_len: int,
-    history_len: int,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Deterministic forward for the no-EWMA minfeats variant (encoder: 3 features)."""
-    H = history_len
-    T = cell.cnr.shape[0]
-    if t < H or t >= T:
-        raise ValueError(f"t={t} out of bounds for history_len={H}, T={T}")
-    F = min(future_len, T - t)
-
-    u_idx = STIM_COLS.index("u_t")
-    cnr = cell.cnr.astype(np.float32)
-    flu = cell.stim[u_idx].astype(np.float32)
-    baseline = float(np.median(cnr[:9]))
-
-    enc_in = np.stack(
-        [
-            cnr[t - H:t],
-            flu[t - H:t],
-            np.full(H, baseline, dtype=np.float32),
-        ],
-        axis=-1,
-    )                                                       # (H, 3)
-    dec_stim = flu[t:t + F, None]                           # (F, 1)
-
-    enc_t = torch.from_numpy(enc_in).float().unsqueeze(0).to(device)
-    dec_t = torch.from_numpy(dec_stim).float().unsqueeze(0).to(device)
-    last_val = float(cnr[t - 1])
-
-    model.eval()
-    with torch.no_grad():
-        pi, mu, sigma = model(enc_t, dec_t)
-        mean_delta = (pi * mu).sum(dim=-1).cpu().numpy()[0]
-        sigma_step = _gmm_pred_std(pi, mu, sigma).cpu().numpy()[0]
-
-    abs_mean = last_val + np.cumsum(mean_delta)
-    abs_sigma = np.sqrt(np.cumsum(sigma_step ** 2))
-    return abs_mean.astype(np.float32), abs_sigma.astype(np.float32)
-
-
-def predict_seq2seq_deltas(
-    model: "torch.nn.Module",
-    cell: CellData,
-    t: int,
-    future_len: int,
-    history_len: int,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Deterministic delta predictor for the vanilla seq2seq / seq2scal notebooks.
-
-    Encoder input: ``[cnr, *STIM_COLS]`` over the H-step history; decoder consumes
-    the full stim-feature vector over the F-step future. Model returns ``(B, F)``
-    per-step CNR deltas. No aleatoric output, so ``sigma`` comes back as zeros —
-    the video bands collapse to the mean line, matching what those models give us.
-    """
-    H = history_len
-    T = cell.cnr.shape[0]
-    if t < H or t >= T:
-        raise ValueError(f"t={t} out of bounds for history_len={H}, T={T}")
-    F = min(future_len, T - t)
-
-    cnr = cell.cnr.astype(np.float32)
-    stim = cell.stim.astype(np.float32)  # (n_stim, T)
-
-    enc_in = np.concatenate(
-        [cnr[t - H:t, None], stim[:, t - H:t].T], axis=-1,
-    )                                                       # (H, 1 + n_stim)
-    dec_stim = stim[:, t:t + F].T                           # (F, n_stim)
-
-    enc_t = torch.from_numpy(enc_in).float().unsqueeze(0).to(device)
-    dec_t = torch.from_numpy(dec_stim).float().unsqueeze(0).to(device)
-    last_val = float(cnr[t - 1])
-
-    model.eval()
-    with torch.no_grad():
-        delta = model(enc_t, dec_t).cpu().numpy()[0]        # (F,)
-
-    abs_mean = last_val + np.cumsum(delta)
-    abs_sigma = np.zeros_like(abs_mean, dtype=np.float32)
-    return abs_mean.astype(np.float32), abs_sigma
-
-
-def _predict_seq2scal_minfeats(
-    model, cell, t, future_len, history_len, device, *, absolute
-):
-    """Correct predictor for the seq2scal_models(_abs) + FiLM family.
-
-    These models train on the 5 minfeats ``[cnr, fluence, baseline,
-    ewma_slow(cnr), ewma_fast(cnr)]`` where the EWMA channels are EWMAs of the
-    *CNR* (not the light) — so we recompute them here from ``cell.cnr`` using the
-    model's own ``cfg`` alphas, rather than reading the light-EWMA stim channels.
-    ``absolute``: the abs model emits the future CNR directly (no delta cumsum).
-    """
-    from experiments.seq2scal_models import _ewma_1d
-
-    H = history_len
-    cnr = cell.cnr.astype(np.float32)
-    T = cnr.shape[0]
-    if t < H or t >= T:
-        raise ValueError(f"t={t} out of bounds for history_len={H}, T={T}")
-    F = min(future_len, T - t)
-
-    flu = cell.stim[STIM_COLS.index("u_t")].astype(np.float32)
-    cfg = getattr(model, "cfg", None)
-    a_slow = float(getattr(cfg, "ewma_slow_alpha", 0.05))
-    a_fast = float(getattr(cfg, "ewma_fast_alpha", 0.30))
-    ewma_s = _ewma_1d(cnr, a_slow)
-    ewma_f = _ewma_1d(cnr, a_fast)
-    baseline = float(np.median(cnr[: min(10, T)]))
-
-    enc_in = np.stack(
-        [
-            cnr[t - H:t],
-            flu[t - H:t],
-            np.full(H, baseline, dtype=np.float32),
-            ewma_s[t - H:t],
-            ewma_f[t - H:t],
-        ],
-        axis=-1,
-    )
-    dec_stim = flu[t:t + F, None]
-    enc_t = torch.from_numpy(enc_in).float().unsqueeze(0).to(device)
-    dec_t = torch.from_numpy(dec_stim).float().unsqueeze(0).to(device)
-
-    model.eval()
-    with torch.no_grad():
-        pi, mu, sigma = model(enc_t, dec_t)
-        mean = (pi * mu).sum(dim=-1).cpu().numpy()[0]              # (F,)
-        step_std = _gmm_pred_std(pi, mu, sigma).cpu().numpy()[0]   # (F,)
-
-    if absolute:
-        abs_mean = mean
-        abs_sigma = step_std
-    else:
-        last_val = float(cnr[t - 1])
-        abs_mean = last_val + np.cumsum(mean)
-        abs_sigma = np.sqrt(np.cumsum(step_std ** 2))
-    return abs_mean.astype(np.float32), abs_sigma.astype(np.float32)
-
-
-def predict_seq2scal_minfeats_delta(model, cell, t, future_len, history_len, device):
-    return _predict_seq2scal_minfeats(model, cell, t, future_len, history_len, device, absolute=False)
-
-
-def predict_seq2scal_minfeats_abs(model, cell, t, future_len, history_len, device):
-    return _predict_seq2scal_minfeats(model, cell, t, future_len, history_len, device, absolute=True)
-
-
+# Only the full-history model is trained going forward, so it is the only family
+# we render. Retired families (mdn/minfeats/seq2seq/seq2scal variants) and their
+# per-family predictors were removed with the archived notebooks.
 PREDICT_FN_BY_MODULE: dict[str, PredictFn] = {
-    "experiments.lstm_seq2scal_mdn_minfeats": predict_mdn_minfeats,
-    "experiments.lstm_seq2scal_mdn_minfeats_image_ewma": predict_mdn_minfeats_ewma,
-    # seq2scal_variant / _abs train on EWMA-of-CNR minfeats (recomputed in the
-    # predictor from the model's cfg alphas). variant = delta output, abs = absolute.
-    "experiments.lstm_seq2scal_variant": predict_seq2scal_minfeats_delta,
-    "experiments.lstm_seq2scal_abs": predict_seq2scal_minfeats_abs,
-    # Deterministic notebooks: forward returns (B, F) future deltas directly.
-    "experiments.lstm_seq2seq": predict_seq2seq_deltas,
-    "experiments.lstm_seq2scal": predict_seq2seq_deltas,
+    "experiments.lstm_seq2scal_history": predict_history_cell,
 }
 
 
@@ -622,9 +395,12 @@ def make_cell_video(
             or "real"
         )
     if history_len is None:
+        # The full-history model has no fixed history_len; this value only sets
+        # the video's start frame + the context shading, so fall back to 30.
         history_len = int(
             bundle.model_config.get("history_len")
-            or bundle.training_config["history_len"]
+            or bundle.training_config.get("history_len")
+            or 30
         )
     if future_len is None:
         future_len = int(
@@ -640,27 +416,43 @@ def make_cell_video(
     device = get_device()
     model = _resolve_main_model(bundle, experiment_module).to(device)
 
-    # Match the training-time baseline prepend so the video shows the same
-    # onset-inclusive trajectories the model was trained/evaluated on.
-    if baseline_prepend is None:
-        baseline_prepend = history_len if bundle.model_config.get("prepend_baseline") else 0
-    if baseline_prepend:
-        print(f"[cell_video] baseline_prepend={baseline_prepend} (prepended baseline frames)")
-    cnr_arr, stim_arr, conditions = seq2seq_data.load(
-        dataset_name, baseline_prepend=baseline_prepend
-    )
-    cnr_list = [np.asarray(c, dtype=np.float32) for c in cnr_arr]
-    if isinstance(stim_arr, np.ndarray) and stim_arr.dtype != object:
-        stim_list = [stim_arr[i].astype(np.float32) for i in range(len(stim_arr))]
+    # The full-history model uses minimal raw features incl. crowding, which the
+    # standard STIM_COLS loader doesn't carry — load its own per-cell tracks.
+    is_history = "Seq2ScalarHistory" in (bundle.model_type or "")
+    if is_history:
+        from experiments.history_data import load_history_tracks
+
+        cnr_arr, feats_arr, conditions, _hist_meta = load_history_tracks("dataset.parquet")
+        cnr_list = [np.asarray(c, dtype=np.float32) for c in cnr_arr]
+        # stim rows = [u_t, fov_density, n_cells_200px]; predict_fn reads them.
+        stim_list = [np.asarray(f, dtype=np.float32) for f in feats_arr]
     else:
-        stim_list = [np.asarray(s, dtype=np.float32) for s in stim_arr]
+        # Match the training-time baseline prepend so the video shows the same
+        # onset-inclusive trajectories the model was trained/evaluated on.
+        if baseline_prepend is None:
+            baseline_prepend = history_len if bundle.model_config.get("prepend_baseline") else 0
+        if baseline_prepend:
+            print(f"[cell_video] baseline_prepend={baseline_prepend} (prepended baseline frames)")
+        cnr_arr, stim_arr, conditions = seq2seq_data.load(
+            dataset_name, baseline_prepend=baseline_prepend
+        )
+        cnr_list = [np.asarray(c, dtype=np.float32) for c in cnr_arr]
+        if isinstance(stim_arr, np.ndarray) and stim_arr.dtype != object:
+            stim_list = [stim_arr[i].astype(np.float32) for i in range(len(stim_arr))]
+        else:
+            stim_list = [np.asarray(s, dtype=np.float32) for s in stim_arr]
 
     keep = [i for i, c in enumerate(cnr_list) if len(c) > history_len + 1]
     if holdout_only:
         # Prefer the bundle's persisted split (correct for any regime, incl.
         # condition_held_out); fall back to reproducing the random 70/10/20.
         _persisted = bundle.metrics.get("splits") if isinstance(bundle.metrics, dict) else None
-        if _persisted and "test_indist" in _persisted:
+        if is_history:
+            from experiments.history_dataset import make_split
+
+            _test_set = {int(i) for i in make_split(np.asarray(conditions), seed=0)["test"]}
+            _source = "history make_split(seed=0) test"
+        elif _persisted and "test_indist" in _persisted:
             _test_set = {int(i) for i in _persisted.get("test_indist", [])}
             for _cids in (_persisted.get("test_ood") or {}).values():
                 _test_set |= {int(i) for i in _cids}
