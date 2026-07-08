@@ -776,6 +776,7 @@ def validate_canonical(df, *, derived=True):
 _OPTORTK = "/Volumes/imaging.data/PertzLab/optoRTK_CedricZ/experimental_data"
 _BO = "/Volumes/imaging.data/PertzLab/Alex/Oscillation_BO"
 _FPS = "/Volumes/imaging.data/PertzLab/Alex/FreePatternStimulation"
+_BSC ="/Volumes/imaging.data/PertzLab/optoRTK_BA/experimental_data"
 
 # `instrument` selects the power-calibration curve from CALIBRATIONS. All
 # experiments so far ran on "jungfrau"; a second scope adds its own curve there
@@ -793,6 +794,7 @@ EXPERIMENTS = {
     "freepattern_v2":       dict(dir=f"{_FPS}/2026-06-26_FreePatternStim_Jungfrau_v2",        adapter="freepattern", instrument="jungfrau", kwargs={}),
     "freepattern_TrKA1_v1": dict(dir=f"{_FPS}/2026-06-30_FreePatternStim_Jungfrau_TrKA1_v1",  adapter="freepattern", instrument="jungfrau", kwargs={}),
     "freepattern_TrKA1_v2": dict(dir=f"{_FPS}/2026-07-03_FreePatternStim_Jungfrau_TrKA1_v2",  adapter="freepattern", instrument="jungfrau", kwargs={}),
+    "long": dict(dir=f"{_BSC}/LongTermExperiments/2026-03-21_RampLongTerm_Drug",  adapter="freepattern", instrument="jungfrau", kwargs={}),
 }
 
 # Instrument recoverable per row from original_experiment_name (no stored column).
