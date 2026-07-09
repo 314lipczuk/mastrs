@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from experiments.seq2seq_data import Seq2SeqDataset, load
+from optoerk.data.seq2seq_data import Seq2SeqDataset, load
 
 _ROOT = Path(__file__).resolve().parent.parent
 pytestmark = pytest.mark.skipif(

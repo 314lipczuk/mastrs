@@ -4,15 +4,9 @@ Provides ``make_raw`` — a factory that builds tiny in-memory raw-schema
 DataFrames for each experiment family (standard / bo / freepattern), so the
 adapter + clean/derive tests need no cluster mounts.
 """
-import sys
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
-
-# Make repo-root modules (notebooks/, experiments/) importable from tests/.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _build_raw(kind, cells=None, n_frames=15, seed=0):

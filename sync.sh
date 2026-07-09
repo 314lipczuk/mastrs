@@ -21,6 +21,7 @@ EXCLUDES=(
     ".git/"
     cluster_results/
     results/
+    logs/
 )
 
 # ── Build exclude flags ──────────────────────────────────────────────────────

@@ -11,13 +11,13 @@ with app.setup:
 
     import numpy as np
 
-    from experiments.seq2scal_models_history import (
+    from optoerk.models.seq2scal_history import (
         HistoryConfig,
         HistoryTrainingConfig,
         Seq2ScalarHistory,
     )
-    from experiments.history_data import load_history_tracks
-    from experiments.history_dataset import CHANNELS, NormStats, make_split
+    from optoerk.data.history_data import load_history_tracks
+    from optoerk.data.history_dataset import CHANNELS, NormStats, make_split
 
 
 @app.cell
@@ -26,7 +26,7 @@ def _():
     import polars as pl
     from hastyplot import qplot
 
-    from utils import (
+    from optoerk.core.utils import (
         get_device,
         get_username,
         running_on_cluster,
@@ -35,7 +35,7 @@ def _():
         parse_bool,
         scan_experiment_dirs,
     )
-    from experiments.scaffold import (
+    from optoerk.scaffold import (
         form_from_configs,
         resolve_configs,
         run_experiment,

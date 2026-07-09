@@ -2209,99 +2209,6 @@ wheels = [
 ]
 
 [[package]]
-name = "masters"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "altair" },
-    { name = "gymnasium" },
-    { name = "h5py" },
-    { name = "hastyplot" },
-    { name = "ipykernel" },
-    { name = "ipywidgets" },
-    { name = "marimo", extra = ["lsp"] },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "panel" },
-    { name = "papermill" },
-    { name = "plotly" },
-    { name = "polars" },
-    { name = "pyarrow" },
-    { name = "pydantic" },
-    { name = "pydantic-ai" },
-    { name = "pytorch-lightning" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
-    { name = "seaborn" },
-    { name = "stable-baselines3" },
-    { name = "sympy" },
-    { name = "tabulate" },
-    { name = "tensorboard" },
-    { name = "torch" },
-    { name = "tqdm" },
-    { name = "umap-learn" },
-    { name = "wigglystuff" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "ipykernel" },
-    { name = "nbclient" },
-    { name = "pytest" },
-    { name = "python-lsp-ruff" },
-    { name = "python-lsp-server" },
-    { name = "vegafusion" },
-    { name = "vl-convert-python" },
-    { name = "websockets" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "altair", specifier = ">=6.0.0" },
-    { name = "gymnasium", specifier = ">=1.2.3" },
-    { name = "h5py", specifier = ">=3.16.0" },
-    { name = "hastyplot", git = "https://github.com/314lipczuk/hastyplot" },
-    { name = "ipykernel", specifier = ">=6.29.0" },
-    { name = "ipywidgets", specifier = ">=8.1.8" },
-    { name = "marimo", extras = ["lsp"], specifier = ">=0.23.3" },
-    { name = "matplotlib", specifier = ">=3.10.1" },
-    { name = "numpy", specifier = ">=2.2.4" },
-    { name = "pandas", specifier = ">=2.2.2" },
-    { name = "panel", specifier = ">=1.8.10" },
-    { name = "papermill", specifier = ">=2.6.0" },
-    { name = "plotly", specifier = ">=6.6.0" },
-    { name = "polars", specifier = ">=1.39.2" },
-    { name = "pyarrow", specifier = ">=18.0.0" },
-    { name = "pydantic", specifier = ">=2.12.5" },
-    { name = "pydantic-ai", specifier = ">=1.70.0" },
-    { name = "pytorch-lightning", specifier = ">=2.6.1" },
-    { name = "scikit-learn", specifier = ">=1.4.2" },
-    { name = "scipy", specifier = ">=1.12.0" },
-    { name = "seaborn", specifier = ">=0.13.2" },
-    { name = "stable-baselines3", specifier = ">=2.7.1" },
-    { name = "sympy", specifier = ">=1.13.0" },
-    { name = "tabulate", specifier = ">=0.10.0" },
-    { name = "tensorboard", specifier = ">=2.20.0" },
-    { name = "torch", specifier = ">=2.10.0" },
-    { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "umap-learn", specifier = ">=0.5.11" },
-    { name = "wigglystuff", specifier = ">=0.2.39" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "ipykernel", specifier = ">=7.2.0" },
-    { name = "nbclient", specifier = ">=0.10.4" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "python-lsp-ruff", specifier = ">=2.3.1" },
-    { name = "python-lsp-server", specifier = ">=1.14.0" },
-    { name = "vegafusion", specifier = ">=2.0.3" },
-    { name = "vl-convert-python", specifier = ">=1.9.0.post1" },
-    { name = "websockets", specifier = ">=16.0" },
-]
-
-[[package]]
 name = "matplotlib"
 version = "3.10.8"
 source = { registry = "https://pypi.org/simple" }
@@ -3036,6 +2943,99 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/50/fc/c47bb04a1d8a941a4061307e1eddfa331ed4d0ab13d8a9781e6db256940a/opentelemetry_util_http-0.60b1.tar.gz", hash = "sha256:0d97152ca8c8a41ced7172d29d3622a219317f74ae6bb3027cfbdcf22c3cc0d6", size = 11053, upload-time = "2025-12-11T13:37:25.115Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/16/5c/d3f1733665f7cd582ef0842fb1d2ed0bc1fba10875160593342d22bba375/opentelemetry_util_http-0.60b1-py3-none-any.whl", hash = "sha256:66381ba28550c91bee14dcba8979ace443444af1ed609226634596b4b0faf199", size = 8947, upload-time = "2025-12-11T13:36:37.151Z" },
+]
+
+[[package]]
+name = "optoerk"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "altair" },
+    { name = "gymnasium" },
+    { name = "h5py" },
+    { name = "hastyplot" },
+    { name = "ipykernel" },
+    { name = "ipywidgets" },
+    { name = "marimo", extra = ["lsp"] },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "panel" },
+    { name = "papermill" },
+    { name = "plotly" },
+    { name = "polars" },
+    { name = "pyarrow" },
+    { name = "pydantic" },
+    { name = "pydantic-ai" },
+    { name = "pytorch-lightning" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "seaborn" },
+    { name = "stable-baselines3" },
+    { name = "sympy" },
+    { name = "tabulate" },
+    { name = "tensorboard" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "umap-learn" },
+    { name = "wigglystuff" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "ipykernel" },
+    { name = "nbclient" },
+    { name = "pytest" },
+    { name = "python-lsp-ruff" },
+    { name = "python-lsp-server" },
+    { name = "vegafusion" },
+    { name = "vl-convert-python" },
+    { name = "websockets" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "altair", specifier = ">=6.0.0" },
+    { name = "gymnasium", specifier = ">=1.2.3" },
+    { name = "h5py", specifier = ">=3.16.0" },
+    { name = "hastyplot", git = "https://github.com/314lipczuk/hastyplot" },
+    { name = "ipykernel", specifier = ">=6.29.0" },
+    { name = "ipywidgets", specifier = ">=8.1.8" },
+    { name = "marimo", extras = ["lsp"], specifier = ">=0.23.3" },
+    { name = "matplotlib", specifier = ">=3.10.1" },
+    { name = "numpy", specifier = ">=2.2.4" },
+    { name = "pandas", specifier = ">=2.2.2" },
+    { name = "panel", specifier = ">=1.8.10" },
+    { name = "papermill", specifier = ">=2.6.0" },
+    { name = "plotly", specifier = ">=6.6.0" },
+    { name = "polars", specifier = ">=1.39.2" },
+    { name = "pyarrow", specifier = ">=18.0.0" },
+    { name = "pydantic", specifier = ">=2.12.5" },
+    { name = "pydantic-ai", specifier = ">=1.70.0" },
+    { name = "pytorch-lightning", specifier = ">=2.6.1" },
+    { name = "scikit-learn", specifier = ">=1.4.2" },
+    { name = "scipy", specifier = ">=1.12.0" },
+    { name = "seaborn", specifier = ">=0.13.2" },
+    { name = "stable-baselines3", specifier = ">=2.7.1" },
+    { name = "sympy", specifier = ">=1.13.0" },
+    { name = "tabulate", specifier = ">=0.10.0" },
+    { name = "tensorboard", specifier = ">=2.20.0" },
+    { name = "torch", specifier = ">=2.10.0" },
+    { name = "tqdm", specifier = ">=4.67.1" },
+    { name = "umap-learn", specifier = ">=0.5.11" },
+    { name = "wigglystuff", specifier = ">=0.2.39" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "ipykernel", specifier = ">=7.2.0" },
+    { name = "nbclient", specifier = ">=0.10.4" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "python-lsp-ruff", specifier = ">=2.3.1" },
+    { name = "python-lsp-server", specifier = ">=1.14.0" },
+    { name = "vegafusion", specifier = ">=2.0.3" },
+    { name = "vl-convert-python", specifier = ">=1.9.0.post1" },
+    { name = "websockets", specifier = ">=16.0" },
 ]
 
 [[package]]

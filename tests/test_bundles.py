@@ -1,6 +1,6 @@
 """build_bundle concatenates cleaned canonical frames; uid is globally unique."""
-import notebooks.experiment.preprocessing as pp
-import experiments.seq2seq_data as s2s
+import optoerk.data.preprocessing as pp
+import optoerk.data.seq2seq_data as s2s
 
 
 def test_stim_cols_single_source():

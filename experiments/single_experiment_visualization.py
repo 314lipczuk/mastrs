@@ -22,7 +22,7 @@ def _():
 
     alt.data_transformers.disable_max_rows()
 
-    from notebooks.experiment.preprocessing import augment, load_and_clean
+    from optoerk.data.preprocessing import augment, load_and_clean
 
     return alt, augment, load_and_clean, mo, np, os, pd, pl, plt, qplot
 

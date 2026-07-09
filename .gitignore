@@ -7,6 +7,7 @@ __pycache__
 extra
 .ipynb_checkpoints
 *.parquet
+*.parquet.*
 *.zip
 *.gif
 .DS_Store
@@ -16,5 +17,6 @@ DS_Store
 ./notebooks/.DS_Store
 docs
 *.md
+!README.md
 launcher.py
 **/__marimo__/**

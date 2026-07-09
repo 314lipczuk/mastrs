@@ -22,13 +22,13 @@ def _():
     # Disable Altair's 20k row cap; we either send small frames or pre-aggregate.
     alt.data_transformers.disable_max_rows()
 
-    from experiments.seq2seq_data import (
+    from optoerk.data.seq2seq_data import (
         load as load_dataset,
         AVAILABLE_DATASETS,
         REAL_DATASET_PATHS,
         STIM_COLS,
     )
-    from notebooks.experiment.preprocessing import augment
+    from optoerk.data.preprocessing import augment
 
     stim_col_names = list(STIM_COLS)
     return (

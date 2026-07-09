@@ -1,7 +1,7 @@
 """Adapters project each raw family onto the canonical schema (hard cut)."""
 import pytest
 
-from notebooks.experiment.preprocessing import (
+from optoerk.data.preprocessing import (
     CANONICAL_RAW_COLS,
     _LEGACY_COLS,
     adapt,

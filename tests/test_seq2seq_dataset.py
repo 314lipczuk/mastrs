@@ -1,7 +1,7 @@
 """Consolidated Seq2SeqDataset == the old inline impl (2D and object arrays)."""
 import numpy as np
 
-from experiments.seq2seq_data import Seq2SeqDataset
+from optoerk.data.seq2seq_data import Seq2SeqDataset
 
 
 class _OldSeq2SeqDataset:

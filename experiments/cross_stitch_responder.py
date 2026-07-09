@@ -20,14 +20,14 @@ def _():
 
     alt.data_transformers.disable_max_rows()
 
-    from experiment import load_experiment
-    from utils import (
+    from optoerk.core.experiment import load_experiment
+    from optoerk.core.utils import (
         get_device,
         results_read_sources,
         scan_experiment_dirs,
     )
-    from experiments.seq2seq_data import load as load_dataset, AVAILABLE_DATASETS
-    from cell_video import (
+    from optoerk.data.seq2seq_data import load as load_dataset, AVAILABLE_DATASETS
+    from optoerk.eval.cell_video import (
         CellData,
         PREDICT_FN_BY_MODULE,
         _infer_experiment_module,
@@ -352,9 +352,9 @@ def _(
     predict_fn,
     torch,
 ):
-    from experiments.seq2seq_data import STIM_COLS
-    from experiments.seq2scal_models_abs import _ewma_1d as ewma1d
-    from cell_video import _gmm_pred_std as gmm_std
+    from optoerk.data.seq2seq_data import STIM_COLS
+    from optoerk.models.seq2scal_abs import _ewma_1d as ewma1d
+    from optoerk.eval.cell_video import _gmm_pred_std as gmm_std
 
     mo.stop(predict_fn is None, mo.md("Load a bundle first."))
 

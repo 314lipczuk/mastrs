@@ -11,7 +11,7 @@ def _():
     from pathlib import Path
     import os
 
-    from utils import get_username, running_on_cluster, results_read_sources
+    from optoerk.core.utils import get_username, running_on_cluster, results_read_sources
 
     return Path, get_username, mo, results_read_sources, running_on_cluster
 
@@ -69,7 +69,7 @@ def _(Path, mo, results_sources, source_selector):
 
 @app.cell(hide_code=True)
 def _(experiment_dropdown, load_button, mo, results_path):
-    from experiment import ExperimentBundle
+    from optoerk.core.experiment import ExperimentBundle
 
     mo.stop(not load_button.value, mo.md("Select an experiment and click **Load experiment**."))
 
@@ -211,7 +211,7 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _():
-    import model.mechanistic.egfr_simplified as es
+    import optoerk.models.mechanistic.egfr_simplified as es
     eq_desc = es.model_eqs(es.PARAM_NAMES, es.STATE_NAMES)
     eq_desc
     return

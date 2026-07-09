@@ -2,8 +2,8 @@
 import numpy as np
 import pytest
 
-import notebooks.experiment.preprocessing as pp
-from notebooks.experiment.preprocessing import (
+import optoerk.data.preprocessing as pp
+from optoerk.data.preprocessing import (
     STIM_COLS,
     _derive_identity,
     adapt_standard,
