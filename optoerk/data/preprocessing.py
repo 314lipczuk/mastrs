@@ -863,7 +863,7 @@ if __name__ == '__main__':
     for bundle_name in targets:
         print(f"building bundle {bundle_name!r} ...", flush=True)
         df = build_bundle(BUNDLES[bundle_name])
-        out = out_override or OUT_PATHS[bundle_name]
+        out = out_override or OUT_PATHS.get(bundle_name) or materials_path(f"{bundle_name}.parquet")
         df.to_parquet(out)
         print(f"  -> {out}  ({len(df):,} rows, {df['uid'].nunique():,} cells)")
 
