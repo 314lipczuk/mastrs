@@ -37,4 +37,4 @@ uv run python launcher.py                # dispatch SLURM jobs (--local to run h
 - Results go to `optoerk.core.utils.results_write_path()`, never a hardcoded `results/`.
 - Training runs persist via `ExperimentTracker`, checkpointing each epoch so jobs resume after a crash.
 - New notebooks are marimo (`.py` with `@app.cell`), not Jupyter. Run `marimo check --fix` after editing.
-- Never change the parquet path (`dataset.parquet.v0`) in notebooks.
+- Data lives in `materials/`; address it via `optoerk.core.utils.materials_path(...)`, never a bare relative filename.

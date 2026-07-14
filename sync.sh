@@ -13,7 +13,6 @@ EXCLUDES=(
     .DS_Store
     .python-version
     .vscode/
-    materials/
     docs/
     extra/
     "*.pyc"
@@ -22,6 +21,10 @@ EXCLUDES=(
     cluster_results/
     results/
     logs/
+    # materials/ holds the datasets the cluster needs, so it is NOT excluded
+    # wholesale. Skip only the heavy, cluster-irrelevant parts of it.
+    materials/archive/
+    "*.pdf"
 )
 
 # ── Build exclude flags ──────────────────────────────────────────────────────
