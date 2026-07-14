@@ -9,8 +9,6 @@ def _():
     import sys
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
     import marimo as mo
     import numpy as np
     import pandas as pd

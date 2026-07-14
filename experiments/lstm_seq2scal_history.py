@@ -7,8 +7,6 @@ with app.setup:
     import sys
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
     import numpy as np
 
     from optoerk.models.seq2scal_history import (
@@ -16,8 +14,14 @@ with app.setup:
         HistoryTrainingConfig,
         Seq2ScalarHistory,
     )
+    from optoerk.core.utils import materials_path
     from optoerk.data.history_data import load_history_tracks
-    from optoerk.data.history_dataset import CHANNELS, NormStats, make_split
+    from optoerk.data.history_dataset import (
+        CHANNELS,
+        NormStats,
+        compute_norm_stats,
+        make_split,
+    )
 
 
 @app.cell
@@ -83,9 +87,29 @@ def _(mo):
 
 
 @app.cell
-def _():
-    # Frozen train-population standardization (computed once, see history_dataset).
-    norm_stats = NormStats.load()
+def _(MODE, mo):
+    # Training bundle to load (parquet in materials/). Default = the full `all`
+    # bundle; jobs override via --dataset (e.g. dataset_niesen.parquet).
+    DATASET = mo.cli_args().get("dataset", "dataset_all.parquet")
+    if MODE == "train":
+        hist_cnr, hist_feats, hist_cond, _hist_meta = load_history_tracks(
+            materials_path(DATASET)
+        )
+        hist_split = make_split(hist_cond, seed=0)
+    else:
+        hist_cnr = hist_feats = hist_split = None
+    return DATASET, hist_cnr, hist_feats, hist_split
+
+
+@app.cell
+def _(MODE, hist_cnr, hist_feats, hist_split):
+    # Standardization computed from THIS bundle's train split (not a frozen file),
+    # so stats always match the loaded data/features. Stamped onto the model
+    # config for eval/serving. Load mode: values unused (config comes from bundle).
+    if MODE == "train":
+        norm_stats = compute_norm_stats(hist_cnr, hist_feats, hist_split["train"])
+    else:
+        norm_stats = NormStats.load()
     return (norm_stats,)
 
 
@@ -214,20 +238,27 @@ def _(
 
 
 @app.cell
-def _(DRY_RUN, MODE, mo, norm_stats):
+def _(
+    DATASET,
+    DRY_RUN,
+    MODE,
+    hist_cnr,
+    hist_feats,
+    hist_split,
+    mo,
+    norm_stats,
+):
     if MODE == "train":
-        _cnr, _feats, _cond, _meta = load_history_tracks("dataset.parquet")
-        _split = make_split(_cond, seed=0)
-        _tr, _va = _split["train"], _split["val"]
+        _tr, _va = hist_split["train"], hist_split["val"]
         if DRY_RUN:
             _tr, _va = _tr[:800], _va[:200]
         dataset_dict = {
-            "train": (_cnr[_tr], _feats[_tr]),
-            "val": (_cnr[_va], _feats[_va]),
+            "train": (hist_cnr[_tr], hist_feats[_tr]),
+            "val": (hist_cnr[_va], hist_feats[_va]),
             "stats": norm_stats,
         }
         n_train, n_val = len(_tr), len(_va)
-        _msg = mo.md(f"**Data:** `{n_train}` train · `{n_val}` val cells · dry_run={DRY_RUN}")
+        _msg = mo.md(f"**Data:** `{DATASET}` · `{n_train}` train · `{n_val}` val cells · dry_run={DRY_RUN}")
     else:
         dataset_dict, n_train, n_val = None, 0, 0
         _msg = mo.md("**Load mode** — data not loaded.")

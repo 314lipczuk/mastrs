@@ -10,6 +10,7 @@ def _():
     import numpy as np
     import matplotlib.pyplot as plt
     import pandas as pd
+    from optoerk.core.utils import materials_path
     from optoerk.data.preprocessing import augment
 
     return augment, mo, np, pd, plt
@@ -26,7 +27,7 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(augment, pd):
-    df = augment(pd.read_parquet('dataset.parquet'))
+    df = augment(pd.read_parquet(materials_path('dataset.parquet')))
     df.info()
     return (df,)
 
@@ -1219,7 +1220,7 @@ def _(
     _N_TOTAL = 30_000
     _N_TP    = 100
     _T_MAX   = 100.0
-    _OUTPUT  = "stochastic_sim_v2_output.parquet"
+    _OUTPUT  = str(materials_path("stochastic_sim_v2_output.parquet"))
 
     def _egfr_cli(t, y, params, K, light_fn):
         RAS, RAF, MEK, NFB, ERK = y
@@ -1369,7 +1370,7 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    inspect_path = mo.ui.text(value="stochastic_sim_output.parquet", label="Parquet path")
+    inspect_path = mo.ui.text(value=str(materials_path("stochastic_sim_output.parquet")), label="Parquet path")
     inspect_load_btn = mo.ui.run_button(label="Load")
     inspect_n = mo.ui.slider(1, 20, value=6, step=1, label="Samples to show")
     inspect_generator = mo.ui.dropdown(
