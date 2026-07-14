@@ -2,15 +2,13 @@
 
 Skipped when the real dataset files are absent (e.g. CI without the mount).
 """
-from pathlib import Path
-
 import pytest
 
+from optoerk.core.utils import materials_path
 from optoerk.data.seq2seq_data import Seq2SeqDataset, load
 
-_ROOT = Path(__file__).resolve().parent.parent
 pytestmark = pytest.mark.skipif(
-    not (_ROOT / "dataset.parquet.v0").exists(),
+    not materials_path("dataset.parquet.v0").exists(),
     reason="dataset.parquet.v0 not present",
 )
 

@@ -1,9 +1,11 @@
 """Per-cell full-trajectory loader for the full-history (long-gap) model.
 
 Minimal, non-hand-engineered features only: the model input per frame is
-``[cnr, fluence, fov_density, n_cells_200px]`` (cnr is both target and an input
-channel). No EWMA / recency / baseline minfeats — Step 2 of the memory ladder
-showed those are unused. See ``memory_characterization_plan.md``.
+``[cnr, fluence, fov_density, n_cells_200px, optortk_expr]`` (cnr is both target
+and an input channel). No EWMA / recency / baseline minfeats — Step 2 of the
+memory ladder showed those are unused. See ``memory_characterization_plan.md``.
+``optortk_expr`` is the per-cell optoRTK expression level (session-relative C0
+rank; a static per-cell covariate for response gain).
 
 Returns per-cell object arrays (variable T preserved):
     cnr        : (n_cells,)  each (T,) float32  — baseline-normalized CNR
@@ -13,21 +15,20 @@ Returns per-cell object arrays (variable T preserved):
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from optoerk.core.utils import materials_path
 
 # Feature channels supplied alongside cnr (which is the value/target column).
 # Full model input = [cnr] + HISTORY_FEATURES.
-HISTORY_FEATURES = ["u_t", "fov_density", "n_cells_200px"]
+HISTORY_FEATURES = ["u_t", "fov_density", "n_cells_200px", "optortk_expr"]
 
 
 def load_history_tracks(
-    path: str = "dataset.parquet",
+    path: str | Path = materials_path("dataset_all.parquet"),
     *,
     radius: float = 200.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
@@ -40,10 +41,15 @@ def load_history_tracks(
     protocol (e.g. the 90-frame bo_osc runs). Crowding features are computed on
     all detected rows, then carried through ``make_tracks``.
     """
-    from optoerk.data.preprocessing import add_crowding_features, make_tracks
+    from optoerk.data.preprocessing import (
+        add_crowding_features,
+        add_optortk_expression,
+        make_tracks,
+    )
 
     df = pd.read_parquet(path)
     df = add_crowding_features(df, radius=radius)
+    df = add_optortk_expression(df)
     cnr, feats, meta = make_tracks(
         df, value_col="cnr_median_norm", stim_cols=HISTORY_FEATURES
     )

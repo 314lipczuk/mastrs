@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 from optoerk.data.baseline_prepend import bootstrap_baseline_indices
 from optoerk.data.history_data import HISTORY_FEATURES
 
-CHANNELS = ["cnr", *HISTORY_FEATURES]  # ["cnr", "u_t", "fov_density", "n_cells_200px"]
+CHANNELS = ["cnr", *HISTORY_FEATURES]  # ["cnr", "u_t", "fov_density", "n_cells_200px", "optortk_expr"]
 
 _STATS_PATH = Path(__file__).resolve().parent / "history_norm_stats.json"
 
@@ -158,6 +158,14 @@ class HistoryDataset(Dataset):
         m, s = stats.as_arrays()
         self.mean = m  # (C,)
         self.std = s
+        # Fail loudly if the stats don't match the data's channel count (the
+        # classic stale-frozen-stats mismatch) instead of a cryptic broadcast error.
+        _ndata = 1 + int(np.asarray(feats[0]).shape[0]) if len(feats) else len(m)
+        if len(m) != _ndata:
+            raise ValueError(
+                f"norm stats have {len(m)} channels but data has {_ndata} "
+                f"(CHANNELS={CHANNELS}); the stats are stale for the current feature set"
+            )
 
     def reseed(self, seed: int) -> None:
         self.rng = np.random.default_rng(seed)
@@ -254,3 +262,23 @@ def make_history_collate(f_min: int, f_max: int, seed: int = 0):
         return out
 
     return _collate
+
+
+if __name__ == "__main__":
+    # Regenerate the frozen normalization stats (history_norm_stats.json) from the
+    # canonical training bundle over the seed-0 train split — the exact split the
+    # training notebook uses. Run this whenever HISTORY_FEATURES or the training
+    # bundle changes; the notebook and serving both load the saved file via
+    # NormStats.load(), so a stale file silently mismatches the channel count.
+    from optoerk.data.history_data import load_history_tracks
+
+    _cnr, _feats, _cond, _ = load_history_tracks()
+    _split = make_split(_cond, seed=0)
+    _stats = compute_norm_stats(_cnr, _feats, _split["train"])
+    _stats.save()
+    print(
+        f"saved {len(_stats.channels)}-channel norm stats -> {_STATS_PATH}\n"
+        f"  channels: {_stats.channels}\n"
+        f"  mean:     {[round(m, 4) for m in _stats.mean]}\n"
+        f"  std:      {[round(s, 4) for s in _stats.std]}"
+    )

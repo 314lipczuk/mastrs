@@ -3,6 +3,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
+from optoerk.core.utils import materials_path
+
 # ===========================================================================
 # Canonical schema — the single source of truth
 # ===========================================================================
@@ -283,11 +285,24 @@ def load_and_clean(
 # optical power (uW) and irradiance (mW/cm2) by piecewise-linear interpolation.
 # Keyed by instrument name; add a new entry when a second scope comes online.
 # No time dimension — curves are assumed stable per scope.
+# Both curves convert uW -> mW/cm2 with the SAME illuminated-area constant:
+# irradiance = uW * 1e-3 / A, A = 0.006362 cm2 (a 900 um-diameter field). This is
+# the lab convention from `Lichtintensität Mönch.xlsx`; the "jungfrau" numbers are
+# that sheet's **ND5** column (uW + mW/cm2) verbatim. Niesen was measured with no
+# ND filter (dichroics only), so its uW is ~70x higher at the same %; applying the
+# same area keeps its dose on the identical mJ/cm2 axis as every other experiment.
 CALIBRATIONS = {
     "jungfrau": dict(
         pct=[0,1,2,4,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100],
         uW=[8,11,17,26.2,29.5,49.9,71.3,90.5,111,132,153,172,192,212,231,249,268,287,305,321,339,356,374,389],
         mW_cm2=[1.26,1.73,2.67,4.12,4.64,7.84,11.21,14.23,17.45,20.75,24.05,27.04,30.18,33.32,36.31,39.14,42.13,45.11,47.94,50.46,53.29,55.96,58.79,61.15],
+    ),
+    # Niesen DMD (470/40), "1st run on Niesen", no ND filter. mW_cm2 = uW * 0.15719
+    # (same 0.006362 cm2 area as jungfrau/Mönch). Experiment ran at a fixed 10%.
+    "niesen": dict(
+        pct=[0, 2, 3, 5, 10, 30, 99],
+        uW=[0, 321, 936, 1630, 3499, 9888, 23800],
+        mW_cm2=[0.0, 50.46, 147.13, 256.22, 550.01, 1554.29, 3741.12],
     ),
 }
 DEFAULT_INSTRUMENT = "jungfrau"
@@ -635,6 +650,46 @@ def add_crowding_features(
     return out
 
 
+def add_optortk_expression(
+    df,
+    *,
+    baseline_frames: int = 10,
+    cohort_col: str = "original_experiment_name",
+):
+    """Add per-cell optoRTK expression as a session-relative percentile rank.
+
+    Expression proxy = whole-cell C0 intensity (mean of nuclear + ring C0),
+    summarized per cell by its **median over the baseline frames**
+    (``frame < baseline_frames``, i.e. pre-stimulation), then **rank-normalized
+    to (0, 1] within each cohort** (default: ``original_experiment_name`` = one
+    imaging session). Broadcast to every frame of the cell — expression is static
+    (within-cell temporal CV ~1%). Column added: ``optortk_expr``.
+
+    Ranking within the session is invariant to the per-session imaging gain (raw
+    C0 differs ~2x across sessions), so the feature is comparable across
+    experiments and reproducible **live** from the current session's co-imaged
+    cells — no frozen dataset statistics required (the population analog of the
+    per-cell baseline normalization already used for CNR).
+
+    Cells with no baseline frames get NaN (dropped downstream by
+    ``make_tracks(drop_nan_cells=True)``).
+    """
+    df = df.copy()
+    bl = df.loc[
+        df["frame"] < baseline_frames,
+        ["uid", cohort_col, "mean_intensity_C0_nuc", "mean_intensity_C0_ring"],
+    ].copy()
+    bl["_c0"] = 0.5 * (bl["mean_intensity_C0_nuc"] + bl["mean_intensity_C0_ring"])
+    per_cell = bl.groupby("uid").agg(
+        _expr=("_c0", "median"), _cohort=(cohort_col, "first")
+    )
+    per_cell["optortk_expr"] = (
+        per_cell.groupby("_cohort")["_expr"].rank(pct=True).astype(np.float32)
+    )
+    df["optortk_expr"] = df["uid"].map(per_cell["optortk_expr"]).astype(np.float32)
+    return df
+
+
 def make_windows_sample(df, window_size=None, value_col="cnr_median_norm",
                         stim_cols=None, rng=None):
     """Sample one random window per cell track.
@@ -794,6 +849,7 @@ EXPERIMENTS = {
     "freepattern_v2":       dict(dir=f"{_FPS}/2026-06-26_FreePatternStim_Jungfrau_v2",        adapter="freepattern", instrument="jungfrau", kwargs={}),
     "freepattern_TrKA1_v1": dict(dir=f"{_FPS}/2026-06-30_FreePatternStim_Jungfrau_TrKA1_v1",  adapter="freepattern", instrument="jungfrau", kwargs={}),
     "freepattern_TrKA1_v2": dict(dir=f"{_FPS}/2026-07-03_FreePatternStim_Jungfrau_TrKA1_v2",  adapter="freepattern", instrument="jungfrau", kwargs={}),
+    "freepattern_Niesen_EGFR_v1": dict(dir=f"{_FPS}/2026-07-03_FreePatternStim_Niesen_EGFR_v1", adapter="freepattern", instrument="niesen", kwargs={}),
     "long": dict(dir=f"{_BSC}/LongTermExperiments/2026-03-21_RampLongTerm_Drug",  adapter="freepattern", instrument="jungfrau", kwargs={}),
 }
 
@@ -812,13 +868,20 @@ BUNDLES = {
                      "bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s"],
     "freepattern":  ["freepattern_v1", "freepattern_v2",],
     "all": ["3-2-1minIntervals", "DoseResponse", "Sustained_1min", "RampReverse",
-                     "bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s", "freepattern_v1", "freepattern_v2"],
+                     "bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s", "freepattern_v1", "freepattern_v2",
+                     "freepattern_Niesen_EGFR_v1"],
+    "niesen": ["freepattern_Niesen_EGFR_v1"],
 }
 
 OUT_PATHS = {
-    "real": "dataset.parquet.v0",
-    "real_plus_bo": "dataset.parquet",
-    "freepattern": "dataset_freepattern.parquet",
+    "real": materials_path("dataset.parquet.v0"),
+    "real_plus_bo": materials_path("dataset.parquet"),
+    "freepattern": materials_path("dataset_freepattern.parquet"),
+    # `all` = every training experiment incl. the high-dose Niesen run (see
+    # NIESEN_TOCHECK.md). This is the bundle the full-history model now trains on.
+    "all": materials_path("dataset_all.parquet"),
+    # `niesen` = the high-dose Niesen run alone (isolated training probe).
+    "niesen": materials_path("dataset_niesen.parquet"),
 }
 
 

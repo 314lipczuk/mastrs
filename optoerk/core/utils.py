@@ -1,9 +1,30 @@
 import getpass
+import os
 from pathlib import Path
 # --- Path constants ---
 
 CLUSTER_RESULTS_PATH = "/mnt/imaging.data/ppilip/results/models"
 KINGSTON_RESULTS_PATH = "/Volumes/imaging.data/ppilip/results/models"
+
+# Repo root, derived from this file: optoerk/core/utils.py -> optoerk/core -> optoerk -> root.
+# Valid because the project is installed editable (`uv sync`), so sources stay in place.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+# --- Data files ---
+
+def materials_dir() -> Path:
+    """Directory holding datasets, light patterns, and reference material.
+
+    Set ``OPTOERK_MATERIALS`` to point at data living outside the repo.
+    """
+    override = os.environ.get("OPTOERK_MATERIALS")
+    return Path(override) if override else REPO_ROOT / "materials"
+
+
+def materials_path(name: str | Path) -> Path:
+    """Absolute path to a file under :func:`materials_dir`."""
+    return materials_dir() / name
 
 
 # --- Execution context ---

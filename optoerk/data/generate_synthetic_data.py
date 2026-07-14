@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from tqdm import tqdm
 
+from optoerk.core.utils import materials_path
+
 from optoerk.models.mechanistic.mechanistic_model import Model
 from optoerk.models.mechanistic.egfr_simplified import (
     model_eqs, PARAM_NAMES, STATE_NAMES, NODE_NAMES,
@@ -30,8 +32,8 @@ N_PER_GENERATOR = N_TOTAL // 4
 T_MAX = 100.0
 N_TIMEPOINTS = 100 # output resolution for trajectories
 SEED = 42
-PARAMS_PATH = "egfr_params.json"
-OUTPUT_PATH = "synthetic_EGFR_data.parquet"
+PARAMS_PATH = materials_path("egfr_params.json")
+OUTPUT_PATH = materials_path("synthetic_EGFR_data.parquet")
 
 GENERATORS = [
     ("stochastic", generate_stochastic_pulses),
@@ -222,7 +224,7 @@ if __name__ == "__main__":
     df = build_dataframe(patterns, system, params_vec)
     print(f"DataFrame: {df.shape[0]} rows, {df.shape[1]} columns")
 
-    out = OUTPUT_PATH if not DRY_RUN else "synthetic_EGFR_data_dry.parquet"
+    out = OUTPUT_PATH if not DRY_RUN else materials_path("synthetic_EGFR_data_dry.parquet")
     df.to_parquet(out, index=False)
     print(f"Saved to {out}")
 

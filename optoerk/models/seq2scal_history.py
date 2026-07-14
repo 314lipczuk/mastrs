@@ -47,7 +47,7 @@ CNR_CHANNEL = 0
 
 class HistoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    input_dim: int = Field(4, ge=1)          # [cnr, u_t, fov_density, n_cells_200px]
+    input_dim: int = Field(5, ge=1)          # [cnr, u_t, fov_density, n_cells_200px, optortk_expr]
     stim_dim: int = Field(1, ge=1)           # decoder future input = fluence
     hidden_dim: int = Field(64, ge=1)
     num_layers: int = Field(2, ge=1)

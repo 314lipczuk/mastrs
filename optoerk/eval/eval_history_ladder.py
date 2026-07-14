@@ -21,9 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from optoerk.core.experiment import load_experiment
+from optoerk.core.utils import materials_path
 from optoerk.data.history_data import load_history_tracks
 from optoerk.eval.history_predict import predict_many
 
@@ -125,7 +124,7 @@ def main(bundle_dir):
     F = model.cfg.future_len
     print(f"=== {Path(bundle_dir).name} (F={F}, sigma_bias={model.cfg.sigma_step_bias}) ===")
 
-    cnr_o, feats_o, cond, _ = load_history_tracks("dataset.parquet")
+    cnr_o, feats_o, cond, _ = load_history_tracks(materials_path("dataset_all.parquet"))
     cells = [(np.asarray(cnr_o[i], np.float32), np.asarray(feats_o[i])[0],
               np.asarray(feats_o[i])[1], np.asarray(feats_o[i])[2]) for i in range(len(cnr_o))]
     B0 = float(np.median([np.median(c[0][:10]) for c in cells[:300]]))

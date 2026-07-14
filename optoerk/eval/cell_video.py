@@ -29,6 +29,7 @@ from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
 from tqdm.auto import tqdm
 
 from optoerk.core.experiment import ExperimentBundle, load_experiment
+from optoerk.core.utils import materials_path
 from optoerk.data import seq2seq_data
 from optoerk.eval.history_predict import predict_history_cell
 from optoerk.data.seq2seq_data import STIM_COLS
@@ -422,7 +423,7 @@ def make_cell_video(
     if is_history:
         from optoerk.data.history_data import load_history_tracks
 
-        cnr_arr, feats_arr, conditions, _hist_meta = load_history_tracks("dataset.parquet")
+        cnr_arr, feats_arr, conditions, _hist_meta = load_history_tracks(materials_path("dataset_all.parquet"))
         cnr_list = [np.asarray(c, dtype=np.float32) for c in cnr_arr]
         # stim rows = [u_t, fov_density, n_cells_200px]; predict_fn reads them.
         stim_list = [np.asarray(f, dtype=np.float32) for f in feats_arr]

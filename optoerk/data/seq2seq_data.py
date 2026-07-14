@@ -9,7 +9,6 @@ and real (microscopy parquet) data. Both loaders return the same format:
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +16,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+from optoerk.core.utils import materials_path  # noqa: E402
 from optoerk.data.baseline_prepend import prepend_channels  # noqa: E402
 from optoerk.data.preprocessing import STIM_COLS  # noqa: E402 (single source of truth)
 
@@ -124,7 +122,7 @@ def _prepend_baseline_tracks(
 
 
 def load_synthetic(
-    path: str = "stochastic_sim_output.parquet",
+    path: str | Path = materials_path("stochastic_sim_output.parquet"),
     baseline_frames: int = 10,
     cnr_max: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -156,7 +154,7 @@ def load_synthetic(
 
 
 def load_synthetic_v2(
-    path: str = "stochastic_sim_v2_output.parquet",
+    path: str | Path = materials_path("stochastic_sim_v2_output.parquet"),
     baseline_frames: int = 10,
     cnr_max: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -169,7 +167,7 @@ def load_synthetic_v2(
 
 
 def load_real(
-    path: str = "dataset.parquet.v0",
+    path: str | Path = materials_path("dataset.parquet.v0"),
     window_size: int = 20,
     stride: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -200,7 +198,7 @@ def load_real(
 
 
 def load_real_uncertain(
-    path: str = "dataset_real_uncertain.parquet",
+    path: str | Path = materials_path("dataset_real_uncertain.parquet"),
     window_size: int = 20,
     stride: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -228,7 +226,7 @@ def load_real_uncertain(
 
 
 def load_real_tracks(
-    path: str = "dataset.parquet.v0",
+    path: str | Path = materials_path("dataset.parquet.v0"),
     baseline_prepend: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load real microscopy data as per-cell full trajectories (no windowing).
@@ -259,7 +257,7 @@ def load_real_tracks(
 
 
 def load_real_uncertain_tracks(
-    path: str = "dataset_real_uncertain.parquet",
+    path: str | Path = materials_path("dataset_real_uncertain.parquet"),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Same contract as :func:`load_real_tracks` for the combined dataset."""
     from optoerk.data.preprocessing import STIM_COLS, make_tracks
@@ -273,7 +271,7 @@ def load_real_uncertain_tracks(
 
 
 def load_real_plus_bo_tracks(
-    path: str = "dataset.parquet",
+    path: str | Path = materials_path("dataset.parquet"),
     baseline_prepend: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Post-BO real dataset (`dataset.parquet`); pre-BO snapshot is `real`."""
@@ -289,7 +287,7 @@ def load_real_plus_bo_tracks(
 
 
 def load_real_plus_bo(
-    path: str = "dataset.parquet",
+    path: str | Path = materials_path("dataset.parquet"),
     window_size: int = 20,
     stride: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -318,8 +316,8 @@ AVAILABLE_DATASETS = (
 # (includes BO oscillation v8, v10, v11_10s, v11_20s; stim_condition carries
 # the per-experiment tag, e.g. `bo_osc_v10_c<idx>`).
 REAL_DATASET_PATHS = {
-    "real": "dataset.parquet.v0",
-    "real_plus_bo": "dataset.parquet",
+    "real": materials_path("dataset.parquet.v0"),
+    "real_plus_bo": materials_path("dataset.parquet"),
 }
 
 
