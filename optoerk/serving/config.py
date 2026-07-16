@@ -95,6 +95,13 @@ class ServerConfig:
     override_optortk_expr: bool = False
     optortk_expr_value: float | None = None
 
+    # --- prediction logging -----------------------------------------------
+    # When set, the server appends a structured JSONL record per prediction
+    # (startup + per-cell decisions) to this path, matching the schema the
+    # analysis notebooks parse. Off by default. Highly recommended for real
+    # runs — it is the only record of raw_cnr / baseline / exposure per cell.
+    predict_log_path: str | None = None
+
     # --- crowding features -------------------------------------------------
     crowd_radius_px: float = 200.0   # n_cells_200px neighbourhood radius
 
@@ -121,7 +128,7 @@ class ServerConfig:
             if raw is None:
                 continue
             default = getattr(defaults, f.name)
-            if f.name == "checkpoint_dir":
+            if f.name in ("checkpoint_dir", "predict_log_path"):
                 kwargs[f.name] = None if raw.strip().lower() in ("", "none") else raw
             elif f.name == "optortk_expr_value":
                 # float | None: empty / "none" clears the override to the default.

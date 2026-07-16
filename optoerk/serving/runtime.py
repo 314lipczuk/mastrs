@@ -123,6 +123,17 @@ class RealModelEngine:
             idx = self.channels.index(self._optortk_channel)
             val = cfg.optortk_expr_value
             self._optortk_override = float(self.mean_np[idx] if val is None else val)
+        # Value actually fed on the optoRTK channel (override, else the channel
+        # population mean); exposed for the prediction log. None if unused.
+        if self._optortk_channel in self.channels:
+            _idx = self.channels.index(self._optortk_channel)
+            self.optortk_fed: float | None = (
+                self._optortk_override
+                if self._optortk_override is not None
+                else float(self.mean_np[_idx])
+            )
+        else:
+            self.optortk_fed = None
         self.num_layers = model.cfg.num_layers
         self.hidden = model.cfg.hidden_dim
         self.horizon = min(cfg.control_horizon, int(model.cfg.future_len))
@@ -248,6 +259,7 @@ class StubEngine:
     def __init__(self, calib: FluenceCalibration, cfg: ServerConfig):
         self.calib = calib
         self.cfg = cfg
+        self.optortk_fed: float | None = None  # stub ignores the optoRTK channel
 
     def decide(self, frames: list[CellFrame]) -> list[float]:
         cfg = self.cfg

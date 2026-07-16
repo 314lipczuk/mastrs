@@ -10,10 +10,12 @@ concurrent.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 from optoerk.serving.config import ServerConfig
 from optoerk.serving.features import compute_crowding, extract_raw_cnr
+from optoerk.serving.predict_log import PredictLogger
 from optoerk.serving.runtime import CellFrame, load_engine
 from optoerk.serving.state import StateStore
 
@@ -26,6 +28,21 @@ class InferenceService:
         self.store = StateStore(evict_after_frames=self.cfg.evict_after_frames)
         self.model_loaded = bool(self.info.get("model_loaded", False))
         self._n_predict = 0
+
+        # Optional structured prediction log (see optoerk.serving.predict_log).
+        self._logger: PredictLogger | None = None
+        if self.cfg.predict_log_path:
+            self._logger = PredictLogger(self.cfg.predict_log_path)
+            self._logger.write(
+                {
+                    "t": time.time(),
+                    "n_predict": 0,
+                    "event": "startup",
+                    "engine": type(self.engine).__name__,
+                    "model_loaded": self.model_loaded,
+                    "info": self.info,
+                }
+            )
 
     # -- health / info -----------------------------------------------------
     def health(self) -> dict:
@@ -95,6 +112,11 @@ class InferenceService:
         particles: list[int] = []
         dark_flags: list[bool] = []
         exposures: dict[str, float] = {}
+        # Per-cell log records (partial; exposure filled in after decide) + the
+        # particles skipped this frame. Only assembled when logging is enabled.
+        log_on = self._logger is not None
+        log_cells: list[dict] = []
+        skipped: list[int] = []
 
         for i, cell in enumerate(cells):
             if "particle" not in cell:
@@ -103,6 +125,7 @@ class InferenceService:
             raw_cnr = extract_raw_cnr(cell)
             if raw_cnr is None:
                 exposures[str(particle)] = 0.0  # can't score without CNR
+                skipped.append(particle)
                 continue
 
             parent = cell.get("parent_particle") if cfg.use_parent_seed else None
@@ -114,6 +137,7 @@ class InferenceService:
             if timestep <= st.last_timestep:
                 exposures[str(particle)] = 0.0
                 st.last_seen_timestep = max(st.last_seen_timestep, timestep)
+                skipped.append(particle)
                 continue
 
             # Resolve cnr_norm and whether this cell is held dark this frame so its
@@ -150,6 +174,24 @@ class InferenceService:
             particles.append(particle)
             dark_flags.append(dark)
 
+            if log_on:
+                # Snapshot the inputs BEFORE decide(): u_t_in is the fluence carried
+                # into this encoder step, which decide() overwrites with the new dose.
+                log_cells.append(
+                    {
+                        "particle": particle,
+                        "raw_cnr": float(raw_cnr),
+                        "cnr_norm": float(cnr_norm),
+                        "baseline": None if st.baseline is None else float(st.baseline),
+                        "fov_density": float(fov_density[i]),
+                        "n_cells_200px": float(n200[i]),
+                        "u_t_in": float(st.last_fluence),
+                        "n_frames_seen": int(st.n_frames),
+                        "first_seen": st.n_frames == 0,
+                        "dark": bool(dark),
+                    }
+                )
+
         ms_list = self.engine.decide(frames)
 
         for particle, f, ms, dark in zip(particles, frames, ms_list, dark_flags):
@@ -163,4 +205,25 @@ class InferenceService:
             f.state.last_seen_timestep = timestep
             f.state.n_frames += 1
             exposures[str(particle)] = float(ms)
+
+        if log_on:
+            optortk = getattr(self.engine, "optortk_fed", None)
+            for rec, f, ms in zip(log_cells, frames, ms_list):
+                rec["exposure_ms"] = float(0.0 if rec["dark"] else ms)
+                rec["fluence_out"] = float(f.state.last_fluence)
+                rec["optortk_expr"] = None if optortk is None else float(optortk)
+            self._logger.write(
+                {
+                    "t": time.time(),
+                    "n_predict": self._n_predict,
+                    "event": "predict",
+                    "fov": fov,
+                    "timestep": timestep,
+                    "n_cells_in": len(cells),
+                    "n_scored": len(frames),
+                    "engine": type(self.engine).__name__,
+                    "cells": log_cells,
+                    "skipped": skipped,
+                }
+            )
         return exposures
