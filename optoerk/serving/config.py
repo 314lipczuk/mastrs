@@ -58,7 +58,7 @@ class ServerConfig:
 
     # --- exposure output bounds (faro contract) ---------------------------
     min_exposure_ms: float = 0.0
-    max_exposure_ms: float = 3000.0
+    max_exposure_ms: float = 800.0
     dmd_quantum_ms: float = 25.0     # faro's DMD switch granularity (for logging)
 
     # --- online CNR baseline normalization --------------------------------
@@ -68,6 +68,32 @@ class ServerConfig:
     # online. Before ``baseline_frames`` frames are seen the baseline is a
     # provisional running median.
     baseline_frames: int = 10
+
+    # --- dark baseline (do NOT poison the baseline with immediate stimulation) --
+    # The baseline must be a *resting* CNR. If stimulation starts on frame 0 the
+    # baseline window is captured under light and comes out inflated, which biases
+    # cnr_norm downward and makes the controller over-drive. When ``dark_baseline``
+    # is on the server withholds stimulation until a resting baseline is measured.
+    #   * "per_cell": every cell is held dark for its own first ``baseline_frames``
+    #     frames, whenever it first appears. Most accurate per cell; pauses control
+    #     on each newborn and re-baselines cleanly after track fragmentation.
+    #   * "field": the FOV is held dark for its first ``baseline_frames`` frames to
+    #     measure per-cell resting baselines AND a FOV-median field baseline. Cells
+    #     born after the window are seeded with the field baseline and stimulated
+    #     immediately — keeps control continuous and fixes fragmentation re-births.
+    dark_baseline: bool = True
+    baseline_mode: str = "field"  # "per_cell" | "field"
+
+    # --- optoRTK expression feature override ------------------------------
+    # optocheck / faro does not send a reliable per-cell optoRTK-expression rank.
+    # When ``override_optortk_expr`` is on the server IGNORES any payload value and
+    # feeds a fixed raw ``optortk_expr_value`` on the optoRTK channel for every cell
+    # and every prediction. When the value is None it defaults to the training
+    # population mean for that channel (history_norm_stats.json → ~0.5, the neutral
+    # median rank), i.e. the value implicitly used today. Only the real model uses
+    # this channel; the stub ignores it.
+    override_optortk_expr: bool = False
+    optortk_expr_value: float | None = None
 
     # --- crowding features -------------------------------------------------
     crowd_radius_px: float = 200.0   # n_cells_200px neighbourhood radius
@@ -97,6 +123,9 @@ class ServerConfig:
             default = getattr(defaults, f.name)
             if f.name == "checkpoint_dir":
                 kwargs[f.name] = None if raw.strip().lower() in ("", "none") else raw
+            elif f.name == "optortk_expr_value":
+                # float | None: empty / "none" clears the override to the default.
+                kwargs[f.name] = None if raw.strip().lower() in ("", "none") else float(raw)
             elif isinstance(default, bool):
                 kwargs[f.name] = raw.strip().lower() in ("1", "true", "yes", "on")
             elif isinstance(default, int):

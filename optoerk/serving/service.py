@@ -17,7 +17,6 @@ from optoerk.serving.features import compute_crowding, extract_raw_cnr
 from optoerk.serving.runtime import CellFrame, load_engine
 from optoerk.serving.state import StateStore
 
-from pprint import pp as pprint
 
 class InferenceService:
     def __init__(self, cfg: ServerConfig | None = None):
@@ -64,9 +63,6 @@ class InferenceService:
         fov = int(payload["fov"])
         timestep = int(payload["timestep"])
         cells = payload.get("cells", []) or []
-        print(f'fov {fov}, ts:{timestep}')
-        pprint(type(cells))
-        pprint(cells[0:2])
 
         with self.lock:
             self._n_predict += 1
@@ -79,17 +75,25 @@ class InferenceService:
             exposures = self._predict_locked(fov, timestep, cells)
             self.store.store_response(fov, timestep, exposures)
             self.store.evict(fov, timestep)
-        print('exposures')
-        pprint(exposures)
-        print(f'---'*20)
         return {"fov": fov, "timestep": timestep, "exposures": exposures}
 
     def _predict_locked(self, fov: int, timestep: int, cells: list[dict]) -> dict[str, float]:
+        cfg = self.cfg
         # Crowding features from all cells' positions in this frame.
-        fov_density, n200 = compute_crowding(cells, radius=self.cfg.crowd_radius_px)
+        fov_density, n200 = compute_crowding(cells, radius=cfg.crowd_radius_px)
+
+        # Field-mode dark window: the FOV's first ``baseline_frames`` frames are
+        # held dark to measure resting baselines (per-cell + a FOV field baseline).
+        window_start = self.store.fov_window_start(fov, timestep)
+        in_field_window = (
+            cfg.dark_baseline
+            and cfg.baseline_mode == "field"
+            and timestep < window_start + cfg.baseline_frames
+        )
 
         frames: list[CellFrame] = []
         particles: list[int] = []
+        dark_flags: list[bool] = []
         exposures: dict[str, float] = {}
 
         for i, cell in enumerate(cells):
@@ -101,7 +105,7 @@ class InferenceService:
                 exposures[str(particle)] = 0.0  # can't score without CNR
                 continue
 
-            parent = cell.get("parent_particle") if self.cfg.use_parent_seed else None
+            parent = cell.get("parent_particle") if cfg.use_parent_seed else None
             st = self.store.get_or_create(
                 fov, particle, parent=int(parent) if parent is not None else None
             )
@@ -112,7 +116,29 @@ class InferenceService:
                 st.last_seen_timestep = max(st.last_seen_timestep, timestep)
                 continue
 
-            cnr_norm = st.update_baseline(raw_cnr, self.cfg.baseline_frames)
+            # Resolve cnr_norm and whether this cell is held dark this frame so its
+            # baseline is measured at rest rather than under stimulation.
+            dark = False
+            if not cfg.dark_baseline:
+                cnr_norm = st.update_baseline(raw_cnr, cfg.baseline_frames)
+            elif cfg.baseline_mode == "per_cell":
+                # Hold each cell dark until it has measured its own resting baseline.
+                dark = not st.baseline_ready(cfg.baseline_frames)
+                cnr_norm = st.update_baseline(raw_cnr, cfg.baseline_frames)
+            else:  # "field"
+                if in_field_window:
+                    dark = True
+                    cnr_norm = st.update_baseline(raw_cnr, cfg.baseline_frames)
+                    self.store.add_field_sample(fov, raw_cnr)
+                else:
+                    # Window over: a birth without its own dark baseline inherits the
+                    # FOV field baseline instead of normalizing by a stimulated frame.
+                    if not st.baseline_ready(cfg.baseline_frames):
+                        fb = self.store.field_baseline(fov)
+                        if fb is not None:
+                            st.seed_baseline(fb, cfg.baseline_frames)
+                    cnr_norm = st.normalize(raw_cnr)
+
             frames.append(
                 CellFrame(
                     state=st,
@@ -122,11 +148,17 @@ class InferenceService:
                 )
             )
             particles.append(particle)
-        print('pre-engine')
-        ms_list = self.engine.decide(frames)
-        print('post-engine')
+            dark_flags.append(dark)
 
-        for particle, f, ms in zip(particles, frames, ms_list):
+        ms_list = self.engine.decide(frames)
+
+        for particle, f, ms, dark in zip(particles, frames, ms_list, dark_flags):
+            if dark:
+                # No stimulation while the resting baseline is being measured. Zero
+                # last_fluence too, so the next encoder step sees the true (zero)
+                # applied dose as its u_t input.
+                ms = 0.0
+                f.state.last_fluence = 0.0
             f.state.last_timestep = timestep
             f.state.last_seen_timestep = timestep
             f.state.n_frames += 1

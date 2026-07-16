@@ -41,23 +41,45 @@ class CellState:
     last_seen_timestep: int = -1
     n_frames: int = 0
 
-    def update_baseline(self, raw_cnr: float, baseline_frames: int) -> float:
-        """Fold a new raw CNR into the baseline estimate; return cnr_median_norm.
+    def baseline_ready(self, baseline_frames: int) -> bool:
+        """True once a full baseline window has been accumulated (or seeded)."""
+        return len(self.baseline_samples) >= baseline_frames
 
-        The baseline is the median of the cell's first ``baseline_frames`` raw
-        CNR values (matching ``preprocessing.clean``). Before that many frames
-        exist it is a provisional running median so early frames still get a
-        sane normalization (~1.0 at rest).
+    def normalize(self, raw_cnr: float) -> float:
+        """cnr_median_norm = raw / baseline, WITHOUT folding raw into the baseline.
+
+        Used once the baseline is fixed (a completed window or a seeded field
+        baseline), so stimulated frames never contaminate the reference.
         """
-        if len(self.baseline_samples) < baseline_frames:
-            self.baseline_samples.append(float(raw_cnr))
-            self.baseline = float(np.median(self.baseline_samples))
         base = self.baseline if self.baseline else float(raw_cnr)
         if base == 0:
             base = 1.0
         norm = float(raw_cnr) / base
         self.last_cnr_norm = norm
         return norm
+
+    def seed_baseline(self, value: float, baseline_frames: int) -> None:
+        """Fix the baseline to an externally-measured resting value (the FOV field
+        baseline) so a mid-experiment birth is never normalized by its own
+        stimulated frames. Fills the sample window so it counts as complete.
+        """
+        self.baseline = float(value)
+        self.baseline_samples = [float(value)] * baseline_frames
+
+    def update_baseline(self, raw_cnr: float, baseline_frames: int) -> float:
+        """Fold a new raw CNR into the baseline estimate; return cnr_median_norm.
+
+        The baseline is the median of the cell's first ``baseline_frames`` raw
+        CNR values (matching ``preprocessing.clean``). Before that many frames
+        exist it is a provisional running median so early frames still get a
+        sane normalization (~1.0 at rest). NOTE: for the baseline to be a
+        *resting* reference, the caller must ensure these frames are unstimulated
+        (see ``dark_baseline`` in the config / service).
+        """
+        if len(self.baseline_samples) < baseline_frames:
+            self.baseline_samples.append(float(raw_cnr))
+            self.baseline = float(np.median(self.baseline_samples))
+        return self.normalize(raw_cnr)
 
 
 class StateStore:
@@ -72,6 +94,12 @@ class StateStore:
         self._cells: dict[tuple[int, int], CellState] = {}
         # per-fov idempotency cache: fov -> (timestep, response_exposures).
         self._last_response: dict[int, tuple[int, dict[str, float]]] = {}
+        # per-fov dark-baseline bookkeeping (field mode): the first timestep seen
+        # (window start), the resting CNRs collected during the window, and the
+        # resulting FOV field baseline (cached once the window closes).
+        self._fov_start: dict[int, int] = {}
+        self._field_samples: dict[int, list[float]] = {}
+        self._field_baseline: dict[int, float] = {}
 
     # -- cells -------------------------------------------------------------
     def get(self, fov: int, particle: int) -> CellState | None:
@@ -96,6 +124,27 @@ class StateStore:
                     st.last_cnr_norm = pst.last_cnr_norm
             self._cells[key] = st
         return st
+
+    # -- field / dark baseline (per-fov) -----------------------------------
+    def fov_window_start(self, fov: int, timestep: int) -> int:
+        """First timestep seen for this FOV — the start of its dark-baseline window."""
+        return self._fov_start.setdefault(fov, timestep)
+
+    def add_field_sample(self, fov: int, raw_cnr: float) -> None:
+        """Collect a resting-CNR sample during the FOV's dark window."""
+        self._field_samples.setdefault(fov, []).append(float(raw_cnr))
+
+    def field_baseline(self, fov: int) -> float | None:
+        """FOV-median resting baseline from the dark window (cached), or None if
+        no dark samples were collected."""
+        if fov in self._field_baseline:
+            return self._field_baseline[fov]
+        samples = self._field_samples.get(fov)
+        if not samples:
+            return None
+        base = float(np.median(samples))
+        self._field_baseline[fov] = base
+        return base
 
     # -- idempotency -------------------------------------------------------
     def cached_response(self, fov: int, timestep: int) -> dict[str, float] | None:
@@ -124,10 +173,16 @@ class StateStore:
         if fov is None:
             self._cells.clear()
             self._last_response.clear()
+            self._fov_start.clear()
+            self._field_samples.clear()
+            self._field_baseline.clear()
         else:
             for key in [k for k in self._cells if k[0] == fov]:
                 del self._cells[key]
             self._last_response.pop(fov, None)
+            self._fov_start.pop(fov, None)
+            self._field_samples.pop(fov, None)
+            self._field_baseline.pop(fov, None)
 
     def n_cells(self) -> int:
         return len(self._cells)

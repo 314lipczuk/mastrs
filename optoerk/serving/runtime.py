@@ -114,6 +114,15 @@ class RealModelEngine:
         # Model's channel order; unsupplied channels default to the pop. mean.
         self.channels = list(getattr(model.cfg, "norm_channels", []) or
                              ["cnr", "u_t", "fov_density", "n_cells_200px"])
+        # Optional server-side override of the optoRTK-expression channel: feed a
+        # fixed raw value for every cell (ignoring the payload). Defaults to the
+        # channel's population mean (history_norm_stats.json), i.e. neutral.
+        self._optortk_channel = "optortk_expr"
+        self._optortk_override: float | None = None
+        if cfg.override_optortk_expr and self._optortk_channel in self.channels:
+            idx = self.channels.index(self._optortk_channel)
+            val = cfg.optortk_expr_value
+            self._optortk_override = float(self.mean_np[idx] if val is None else val)
         self.num_layers = model.cfg.num_layers
         self.hidden = model.cfg.hidden_dim
         self.horizon = min(cfg.control_horizon, int(model.cfg.future_len))
@@ -149,6 +158,9 @@ class RealModelEngine:
             "fov_density": lambda f: f.fov_density,
             "n_cells_200px": lambda f: f.n_cells_200px,
         }
+        # Server-side hardcode of the optoRTK-expression channel, if enabled.
+        if self._optortk_override is not None:
+            _supplied[self._optortk_channel] = lambda f, v=self._optortk_override: v
         raw = torch.tensor(
             [[_supplied[name](f) if name in _supplied else float(self.mean_np[i])
               for i, name in enumerate(self.channels)] for f in frames],
