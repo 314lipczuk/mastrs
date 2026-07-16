@@ -97,6 +97,17 @@ def build_service(args) -> InferenceService:
         cfg.stim_power_pct = args.stim_power
     if args.target_cnr is not None:
         cfg.target_cnr = args.target_cnr
+    if args.dark_baseline is not None:
+        cfg.dark_baseline = args.dark_baseline
+    if args.baseline_mode:
+        cfg.baseline_mode = args.baseline_mode
+    if args.override_optortk_expr is not None:
+        cfg.override_optortk_expr = args.override_optortk_expr
+    if args.optortk_expr_value is not None:
+        cfg.optortk_expr_value = args.optortk_expr_value
+        cfg.override_optortk_expr = True  # a value implies the override is on
+    if args.predict_log is not None:
+        cfg.predict_log_path = args.predict_log or None
     return InferenceService(cfg)
 
 
@@ -110,6 +121,16 @@ def main():
     p.add_argument("--stim-power", dest="stim_power", type=float, default=None,
                    help="LED power %% for fluence<->ms conversion")
     p.add_argument("--target-cnr", dest="target_cnr", type=float, default=None)
+    p.add_argument("--dark-baseline", action=argparse.BooleanOptionalAction, default=None,
+                   help="measure the baseline in the dark before stimulating (default: on)")
+    p.add_argument("--baseline-mode", default=None, choices=["per_cell", "field"],
+                   help="dark-baseline strategy (default: field)")
+    p.add_argument("--override-optortk-expr", action=argparse.BooleanOptionalAction,
+                   default=None, help="feed a fixed optoRTK-expr value for every cell")
+    p.add_argument("--optortk-expr-value", dest="optortk_expr_value", type=float, default=None,
+                   help="raw optoRTK-expr value to feed (implies --override-optortk-expr)")
+    p.add_argument("--predict-log", dest="predict_log", default=None,
+                   help="path to append a per-prediction JSONL log (off by default)")
     args = p.parse_args()
 
     service = build_service(args)
