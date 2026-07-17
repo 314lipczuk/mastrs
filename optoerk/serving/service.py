@@ -16,6 +16,7 @@ from typing import Any
 
 from optoerk.serving.config import ServerConfig
 from optoerk.serving.features import compute_crowding, extract_raw_cnr
+from optoerk.serving.gpu import GpuSampler, cuda_mem_mb
 from optoerk.serving.predict_log import PredictLogger
 from optoerk.serving.runtime import CellFrame, load_engine
 from optoerk.serving.state import StateStore
@@ -32,6 +33,7 @@ class InferenceService:
 
         # Optional structured prediction log (see optoerk.serving.predict_log).
         self._logger: PredictLogger | None = None
+        self._gpu_sampler: GpuSampler | None = None
         if self.cfg.predict_log_path:
             self._logger = PredictLogger(self.cfg.predict_log_path)
             self._logger.write(
@@ -44,6 +46,14 @@ class InferenceService:
                     "info": self.info,
                 }
             )
+            # Background GPU telemetry (CUDA only) — runs off the prediction path
+            # so it keeps sampling through a stall. See optoerk.serving.gpu.
+            dev = getattr(self.engine, "device", None)
+            if self.cfg.gpu_sample_interval_s > 0 and getattr(dev, "type", None) == "cuda":
+                self._gpu_sampler = GpuSampler(
+                    self._logger.write, dev.index or 0, self.cfg.gpu_sample_interval_s
+                )
+                self._gpu_sampler.start()
 
     # -- health / info -----------------------------------------------------
     def health(self) -> dict:
@@ -69,6 +79,17 @@ class InferenceService:
                 "n_tracked_cells": self.store.n_cells(),
                 "n_predict_calls": self._n_predict,
             }
+
+    # -- lifecycle ---------------------------------------------------------
+    def close(self) -> None:
+        """Stop the GPU sampler and close the predict log. Idempotent."""
+        if self._gpu_sampler is not None:
+            self._gpu_sampler.stop()
+            self._gpu_sampler.join(timeout=2.0)
+            self._gpu_sampler = None
+        if self._logger is not None:
+            self._logger.close()
+            self._logger = None
 
     # -- reset -------------------------------------------------------------
     def reset(self, fov: int | None = None) -> dict:
@@ -259,6 +280,7 @@ class InferenceService:
                         "lock_wait_s": round(lock_wait_s, 4),
                         "infer_s": round(infer_s, 4),
                         "handler_s": round(handler_s, 4),
+                        **cuda_mem_mb(getattr(self.engine, "device", None)),
                     },
                     "cells": log_cells,
                     "skipped": skipped,

@@ -21,6 +21,7 @@ state tensors are not thread-safe).
 from __future__ import annotations
 from pprint import pprint
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -91,11 +92,35 @@ def load_engine(cfg: ServerConfig):
                 "norm_channels": list(getattr(model.cfg, "norm_channels", []))
                 or ["cnr", "u_t", "fov_density", "n_cells_200px"],
             }
+            if cfg.warmup and device.type == "cuda":
+                warmup_engine(engine)
             return engine, info
         except Exception as e:  # noqa: BLE001 - degrade gracefully to the stub
             print(f"[serving] checkpoint load failed ({e!r}); using STUB policy")
     engine = StubEngine(calib, cfg)
     return engine, {"model_loaded": False, "policy": "stub", "checkpoint_dir": cfg.checkpoint_dir}
+
+
+def warmup_engine(engine, batch_sizes: tuple[int, ...] = (1, 8, 32, 64)) -> None:
+    """Prime the GPU before the first real frame by running throwaway ``decide``
+    calls across a few batch sizes. Triggers CUDA context creation, cuDNN
+    autotune and allocator-pool growth up front — the cold-start work that
+    otherwise lands on the first predictions. Best-effort; never raises."""
+    try:
+        t0 = time.perf_counter()
+        for n in batch_sizes:
+            frames = [
+                CellFrame(state=CellState(), cnr_norm=1.0, fov_density=float(n),
+                          n_cells_200px=1.0)
+                for _ in range(n)
+            ]
+            engine.decide(frames)
+        dev = getattr(engine, "device", None)
+        if dev is not None and dev.type == "cuda":
+            torch.cuda.synchronize(dev)
+        print(f"[serving] warmup: {len(batch_sizes)} batches in {time.perf_counter() - t0:.2f}s")
+    except Exception as e:  # noqa: BLE001 - warmup is optional, never fatal
+        print(f"[serving] warmup skipped: {e!r}")
 
 
 # ---------------------------------------------------------------------------

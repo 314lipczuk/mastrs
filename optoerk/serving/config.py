@@ -119,6 +119,22 @@ class ServerConfig:
     # surfaced before faro gives up on the frame.
     slow_predict_warn_s: float = 30.0
 
+    # --- startup warmup ---------------------------------------------------
+    # Run a few throwaway inferences right after the model loads, priming the
+    # CUDA context, cuDNN autotune and allocator pools so the FIRST real frame
+    # hits a warm GPU instead of paying cold-start latency (a prime suspect for
+    # the observed startup jam). No effect off CUDA.
+    warmup: bool = True
+
+    # --- GPU telemetry sampler --------------------------------------------
+    # When the predict log is enabled and the engine is on CUDA, a background
+    # thread samples NVML GPU telemetry every this many seconds and appends
+    # ``{"event": "gpu", ...}`` records (util, memory, temperature, power,
+    # clock-throttle reasons, and the processes on the device). It runs off the
+    # prediction path, so it keeps recording through a stall. Requires
+    # ``nvidia-ml-py``. 0 disables it.
+    gpu_sample_interval_s: float = 5.0
+
     # --- crowding features -------------------------------------------------
     crowd_radius_px: float = 200.0   # n_cells_200px neighbourhood radius
 

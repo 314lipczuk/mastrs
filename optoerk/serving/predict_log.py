@@ -14,10 +14,19 @@ already parse (``experiments/inference_cnrhold_tracks.py``):
 that point was spent: ``recv_epoch`` (wall-clock the request entered the
 service), ``lock_wait_s`` (blocked on the service lock behind another FOV's
 inference), ``infer_s`` (engine ``decide`` time), ``handler_s`` (total
-recv→done). Per-FOV gaps in ``recv_epoch`` are the true upstream acquisition
-cadence, distinct from gaps in ``t``; this is what tells an upstream stall apart
-from a serialization backlog apart from a slow model when diagnosing faro
-``stim_mask`` timeouts.
+recv→done), plus ``cuda_alloc_mb`` / ``cuda_reserved_mb`` (our process's CUDA
+allocator footprint) when on GPU. Per-FOV gaps in ``recv_epoch`` are the true
+upstream acquisition cadence, distinct from gaps in ``t``; this is what tells an
+upstream stall apart from a serialization backlog apart from a slow model when
+diagnosing faro ``stim_mask`` timeouts.
+
+A third event type is written on GPU runs when a ``gpu_sample_interval_s`` is
+set (see :mod:`optoerk.serving.gpu`):
+
+  * ``gpu`` — ``{t, event, gpu_util_pct, mem_util_pct, mem_used_mb,
+    mem_total_mb, temp_c, power_w, throttle, n_procs, procs:[{pid, mem_mb}]}``,
+    sampled by a background thread so it keeps recording through a stall (when
+    ``predict`` records stop). Fields are best-effort and may be absent.
 
 Enabled by setting ``predict_log_path`` on the config. The file is opened in
 append mode and line-buffered, so records survive a crash without an explicit
@@ -26,6 +35,7 @@ close. Writing is best-effort: a logging failure must never break serving.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -36,10 +46,15 @@ class PredictLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # line-buffered text append: each record is flushed as it is written.
         self._fh = open(self.path, "a", buffering=1, encoding="utf-8")
+        # write() is called from both the request threads and the GPU sampler
+        # thread; serialize so records never interleave mid-line.
+        self._lock = threading.Lock()
 
     def write(self, record: dict[str, Any]) -> None:
         try:
-            self._fh.write(json.dumps(record, default=str) + "\n")
+            line = json.dumps(record, default=str) + "\n"
+            with self._lock:
+                self._fh.write(line)
         except Exception as e:  # noqa: BLE001 - logging must never break serving
             print(f"[serving] predict-log write failed: {e!r}")
 

@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from optoerk.data.baseline_prepend import bootstrap_baseline_indices
+from optoerk.data.baseline_prepend import bootstrap_baseline_indices, prepend_channels
 from optoerk.data.history_data import HISTORY_FEATURES
 
 CHANNELS = ["cnr", *HISTORY_FEATURES]  # ["cnr", "u_t", "fov_density", "n_cells_200px", "optortk_expr"]
@@ -138,6 +138,8 @@ class HistoryDataset(Dataset):
         break_max: int = 60,
         break_block_len: int = 5,
         n_baseline: int = 10,
+        prepend_baseline: bool = False,
+        prepend_len: int = 30,
         seed: int = 0,
     ):
         self.cnr = cnr
@@ -150,6 +152,8 @@ class HistoryDataset(Dataset):
         self.break_max = break_max
         self.break_block_len = break_block_len
         self.n_baseline = n_baseline
+        self.prepend_baseline = prepend_baseline
+        self.prepend_len = prepend_len
         self.seed = seed
         # Persistent generator: advances across epochs so the same item yields
         # different (t, concat, break) draws each pass. Re-seed per DataLoader
@@ -174,10 +178,27 @@ class HistoryDataset(Dataset):
         return len(self.idx)
 
     def _channels(self, cell: int) -> np.ndarray:
-        """Raw per-frame channel matrix (T, C) = [cnr, u_t, fov_density, n_cells_200px]."""
+        """Raw per-frame channel matrix (T, C) = [cnr, u_t, fov_density, n_cells_200px].
+
+        When ``prepend_baseline`` is set, ``prepend_len`` block-bootstrapped
+        baseline-like frames are prepended (light channel ``FLU_IDX`` zeroed, all
+        others gathered from the same baseline indices), so the stimulation onset
+        becomes predictable from a synthesised resting history.
+        """
         c = np.asarray(self.cnr[cell], np.float32)
         f = np.asarray(self.feats[cell], np.float32)  # (K, T)
-        return np.concatenate([c[None, :], f], axis=0).T  # (T, C)
+        X = np.concatenate([c[None, :], f], axis=0).T  # (T, C)
+        if self.prepend_baseline and self.prepend_len > 0:
+            cols = prepend_channels(
+                [X[:, j] for j in range(X.shape[1])],
+                self.prepend_len,
+                zero_channels={FLU_IDX},
+                n_baseline=self.n_baseline,
+                block_len=self.break_block_len,
+                rng=self.rng,
+            )
+            X = np.stack(cols, axis=1)  # (T + prepend_len, C)
+        return X
 
     def __getitem__(self, i: int) -> dict:
         cell = int(self.idx[i])

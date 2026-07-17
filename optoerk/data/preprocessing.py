@@ -871,6 +871,10 @@ BUNDLES = {
                      "bo_v8", "bo_v10", "bo_v11_10s", "bo_v11_20s", "freepattern_v1", "freepattern_v2",
                      "freepattern_Niesen_EGFR_v1"],
     "niesen": ["freepattern_Niesen_EGFR_v1"],
+    # `long` = the 48h long-term run (sparse stims, genuinely long inter-stim gaps).
+    # Eval-only generalization probe — NOT in `all`; the full-history models never
+    # trained on it or on trajectories this long (~2845 frames vs <=200).
+    "long": ["long"],
 }
 
 OUT_PATHS = {
@@ -882,6 +886,8 @@ OUT_PATHS = {
     "all": materials_path("dataset_all.parquet"),
     # `niesen` = the high-dose Niesen run alone (isolated training probe).
     "niesen": materials_path("dataset_niesen.parquet"),
+    # `long` = the 48h long-gap run (eval-only long-gap generalization probe).
+    "long": materials_path("dataset_long.parquet"),
 }
 
 

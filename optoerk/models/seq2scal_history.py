@@ -99,6 +99,11 @@ class HistoryTrainingConfig(BaseModel):
     p_concat: float = 0.5
     break_min: int = 0
     break_max: int = 60
+    # baseline-prepend: block-bootstrap `prepend_len` baseline-like frames (light
+    # zeroed) before every track so the stimulation onset becomes a predictable
+    # target instead of being eaten by the min-context. Applied to train + val.
+    prepend_baseline: bool = False
+    prepend_len: int = 30
     # multi-length training: sample horizon F ~ U[future_len_min, model.future_len]
     # per batch. None → fixed horizon = model.future_len.
     future_len_min: int | None = None
@@ -293,11 +298,15 @@ class Seq2ScalarHistory(nn.Module):
         train_ds = HistoryDataset(
             cnr_tr, feats_tr, np.arange(len(cnr_tr)), stats,
             F=mcfg.future_len, p_concat=tcfg.p_concat,
-            break_min=tcfg.break_min, break_max=tcfg.break_max, seed=tcfg.seed,
+            break_min=tcfg.break_min, break_max=tcfg.break_max,
+            prepend_baseline=tcfg.prepend_baseline, prepend_len=tcfg.prepend_len,
+            seed=tcfg.seed,
         )
-        val_ds = HistoryDataset(  # clean val: no concat augmentation
+        val_ds = HistoryDataset(  # clean val: no concat augmentation, but same prepend
             cnr_va, feats_va, np.arange(len(cnr_va)), stats,
-            F=mcfg.future_len, p_concat=0.0, seed=tcfg.seed + 1,
+            F=mcfg.future_len, p_concat=0.0,
+            prepend_baseline=tcfg.prepend_baseline, prepend_len=tcfg.prepend_len,
+            seed=tcfg.seed + 1,
         )
 
         def _winit(wid):

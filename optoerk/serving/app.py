@@ -145,6 +145,8 @@ def main():
     except KeyboardInterrupt:
         print("\n[serving] shutting down")
         server.shutdown()
+    finally:
+        service.close()
 
 
 if __name__ == "__main__":
