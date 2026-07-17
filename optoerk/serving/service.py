@@ -9,6 +9,7 @@ concurrent.
 """
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from typing import Any
@@ -77,11 +78,16 @@ class InferenceService:
 
     # -- predict -----------------------------------------------------------
     def predict(self, payload: dict[str, Any]) -> dict:
+        # Latency clock starts the moment the request enters the service, BEFORE
+        # contending for the lock — lock_wait then captures serialization backlog.
+        t_recv = time.perf_counter()
+        recv_epoch = time.time()
         fov = int(payload["fov"])
         timestep = int(payload["timestep"])
         cells = payload.get("cells", []) or []
 
         with self.lock:
+            lock_wait_s = time.perf_counter() - t_recv
             self._n_predict += 1
             # Idempotency: a retried (fov, timestep) returns the cached response
             # WITHOUT advancing any recurrent state.
@@ -89,12 +95,24 @@ class InferenceService:
             if cached is not None:
                 return {"fov": fov, "timestep": timestep, "exposures": dict(cached)}
 
-            exposures = self._predict_locked(fov, timestep, cells)
+            exposures = self._predict_locked(
+                fov, timestep, cells,
+                t_recv=t_recv, recv_epoch=recv_epoch, lock_wait_s=lock_wait_s,
+            )
             self.store.store_response(fov, timestep, exposures)
             self.store.evict(fov, timestep)
         return {"fov": fov, "timestep": timestep, "exposures": exposures}
 
-    def _predict_locked(self, fov: int, timestep: int, cells: list[dict]) -> dict[str, float]:
+    def _predict_locked(
+        self,
+        fov: int,
+        timestep: int,
+        cells: list[dict],
+        *,
+        t_recv: float,
+        recv_epoch: float,
+        lock_wait_s: float,
+    ) -> dict[str, float]:
         cfg = self.cfg
         # Crowding features from all cells' positions in this frame.
         fov_density, n200 = compute_crowding(cells, radius=cfg.crowd_radius_px)
@@ -192,7 +210,9 @@ class InferenceService:
                     }
                 )
 
+        t_infer = time.perf_counter()
         ms_list = self.engine.decide(frames)
+        infer_s = time.perf_counter() - t_infer
 
         for particle, f, ms, dark in zip(particles, frames, ms_list, dark_flags):
             if dark:
@@ -205,6 +225,18 @@ class InferenceService:
             f.state.last_seen_timestep = timestep
             f.state.n_frames += 1
             exposures[str(particle)] = float(ms)
+
+        # Latency decomposition: recv -> (lock_wait) -> ... -> (infer) -> done.
+        handler_s = time.perf_counter() - t_recv
+        warn_s = self.cfg.slow_predict_warn_s
+        if warn_s and handler_s > warn_s:
+            print(
+                f"[serving] SLOW predict fov={fov} timestep={timestep}: "
+                f"handler={handler_s:.1f}s (lock_wait={lock_wait_s:.1f}s "
+                f"infer={infer_s:.1f}s n_scored={len(frames)})",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if log_on:
             optortk = getattr(self.engine, "optortk_fed", None)
@@ -222,6 +254,12 @@ class InferenceService:
                     "n_cells_in": len(cells),
                     "n_scored": len(frames),
                     "engine": type(self.engine).__name__,
+                    "timing": {
+                        "recv_epoch": recv_epoch,
+                        "lock_wait_s": round(lock_wait_s, 4),
+                        "infer_s": round(infer_s, 4),
+                        "handler_s": round(handler_s, 4),
+                    },
                     "cells": log_cells,
                     "skipped": skipped,
                 }

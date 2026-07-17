@@ -5,10 +5,19 @@ already parse (``experiments/inference_cnrhold_tracks.py``):
 
   * ``startup`` — ``{t, n_predict, event, engine, model_loaded, info}``
   * ``predict`` — ``{t, n_predict, event, fov, timestep, n_cells_in, n_scored,
-    engine, cells:[...], skipped:[...]}`` where each cell carries
+    engine, timing:{...}, cells:[...], skipped:[...]}`` where each cell carries
     ``{particle, raw_cnr, cnr_norm, baseline, fov_density, n_cells_200px,
     u_t_in, n_frames_seen, first_seen, exposure_ms, fluence_out, dark,
     optortk_expr}``.
+
+``t`` is the *completion* timestamp; ``timing`` decomposes how the latency to
+that point was spent: ``recv_epoch`` (wall-clock the request entered the
+service), ``lock_wait_s`` (blocked on the service lock behind another FOV's
+inference), ``infer_s`` (engine ``decide`` time), ``handler_s`` (total
+recv→done). Per-FOV gaps in ``recv_epoch`` are the true upstream acquisition
+cadence, distinct from gaps in ``t``; this is what tells an upstream stall apart
+from a serialization backlog apart from a slow model when diagnosing faro
+``stim_mask`` timeouts.
 
 Enabled by setting ``predict_log_path`` on the config. The file is opened in
 append mode and line-buffered, so records survive a crash without an explicit

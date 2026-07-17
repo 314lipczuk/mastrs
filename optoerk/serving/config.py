@@ -102,6 +102,23 @@ class ServerConfig:
     # runs — it is the only record of raw_cnr / baseline / exposure per cell.
     predict_log_path: str | None = None
 
+    # --- latency instrumentation ------------------------------------------
+    # Every predict-log record carries a ``timing`` block decomposing server
+    # latency: ``recv_epoch`` (wall-clock the request entered the service),
+    # ``lock_wait_s`` (time blocked on the single service lock — i.e. another
+    # FOV's inference serializing ahead of this one), ``infer_s`` (engine
+    # ``decide`` wall time), and ``handler_s`` (total recv→done). Together they
+    # separate an upstream stall (recv cadence drift) from a serialization
+    # backlog (lock_wait) from the model itself being slow (infer). This is the
+    # decomposition needed to diagnose faro ``stim_mask`` timeouts.
+    #
+    # Independently of the JSONL log, when a prediction's total ``handler_s``
+    # exceeds this many seconds a one-line warning is printed to the server's
+    # stderr, so slow frames are visible even with logging off. 0 disables the
+    # warning. Keep it well under faro's stim-mask timeout (80 s) so a jam is
+    # surfaced before faro gives up on the frame.
+    slow_predict_warn_s: float = 30.0
+
     # --- crowding features -------------------------------------------------
     crowd_radius_px: float = 200.0   # n_cells_200px neighbourhood radius
 
