@@ -3,11 +3,13 @@
 The model input per frame is the standardized 4-vector
 ``[cnr, u_t, fov_density, n_cells_200px]`` (``history_dataset.CHANNELS``):
 
-  * ``cnr``            — the model was trained on ``cnr_median_norm`` = per-cell
-                        baseline-normalized *median* CNR. faro sends raw ``cnr``
-                        (and usually ``cnr_median``); the server normalizes online
-                        (see :mod:`optoerk.serving.state`). This module only
-                        extracts the raw CNR-like scalar.
+  * ``cnr``            — a norm-mode model was trained on ``cnr_median_norm`` =
+                        per-cell baseline-normalized *median* CNR, so the server
+                        normalizes online (see :mod:`optoerk.serving.state`); a
+                        raw-mode model was trained on absolute ``cnr_median`` and
+                        the raw scalar is fed directly. faro sends raw ``cnr``
+                        (and usually ``cnr_median``); this module only extracts
+                        the raw CNR-like scalar either way.
   * ``u_t``            — commanded fluence (mJ/cm2); supplied by per-cell state
                         (the last commanded dose), not by the payload.
   * ``fov_density``    — number of cells detected in this FOV at this frame.

@@ -423,7 +423,16 @@ def make_cell_video(
     if is_history:
         from optoerk.data.history_data import load_history_tracks
 
-        cnr_arr, feats_arr, conditions, _hist_meta = load_history_tracks(materials_path("dataset_all.parquet"))
+        # Match the bundle's cnr convention: a raw-CNR model was trained on
+        # absolute cnr_median, so both the model input (via predict_fn) and the
+        # plotted true track must be raw too — otherwise the model is fed the
+        # wrong-scale cnr and true-vs-pred are in different units. Old bundles
+        # predate the field and default to "norm".
+        cnr_mode = bundle.model_config.get("cnr_mode", "norm")
+        print(f"[cell_video] cnr_mode={cnr_mode!r} (from bundle config)")
+        cnr_arr, feats_arr, conditions, _hist_meta = load_history_tracks(
+            materials_path("dataset_all.parquet"), cnr_mode=cnr_mode
+        )
         cnr_list = [np.asarray(c, dtype=np.float32) for c in cnr_arr]
         # stim rows = [u_t, fov_density, n_cells_200px]; predict_fn reads them.
         stim_list = [np.asarray(f, dtype=np.float32) for f in feats_arr]

@@ -57,16 +57,21 @@ def _resolve_device(device: str) -> torch.device:
 
 
 def _load_norm_stats(model) -> tuple[np.ndarray, np.ndarray]:
-    """Frozen standardization stats, preferring those carried on the config."""
+    """Frozen standardization stats, preferring those carried on the config.
+
+    The fallback file is keyed to the model's ``cnr_mode`` (baseline-normalized vs
+    raw CNR have different cnr-channel mean/std), so a raw-CNR model never falls
+    back onto the norm-CNR stats.
+    """
     cfg = model.cfg
     mean = np.asarray(getattr(cfg, "norm_mean", []) or [], np.float32)
     std = np.asarray(getattr(cfg, "norm_std", []) or [], np.float32)
     if mean.size and mean.size == std.size:
         return mean, std
-    # Fall back to the checked-in train-population stats file.
+    # Fall back to the checked-in train-population stats file for this cnr_mode.
     from optoerk.data.history_dataset import NormStats
 
-    stats = NormStats.load()
+    stats = NormStats.load(cnr_mode=getattr(cfg, "cnr_mode", "norm"))
     return np.asarray(stats.mean, np.float32), np.asarray(stats.std, np.float32)
 
 
@@ -83,15 +88,34 @@ def load_engine(cfg: ServerConfig):
             model.to(device).eval()
             mean, std = _load_norm_stats(model)
             engine = RealModelEngine(model, mean, std, calib, cfg, device)
+            cnr_mode = getattr(model.cfg, "cnr_mode", "norm")
             info = {
                 "model_loaded": True,
                 "model_type": bundle.model_type,
                 "checkpoint_dir": cfg.checkpoint_dir,
                 "device": str(device),
                 "future_len": int(model.cfg.future_len),
+                "cnr_mode": cnr_mode,
                 "norm_channels": list(getattr(model.cfg, "norm_channels", []))
                 or ["cnr", "u_t", "fov_density", "n_cells_200px"],
             }
+            # Load-bearing banner: which cnr convention this checkpoint expects, so
+            # a raw-CNR model served with online normalization (or vice versa) is
+            # obvious at a glance. cnr_mean is the frozen z-score center for the cnr
+            # channel — sanity-check target_cnr sits in the same units.
+            _cnr_norm = ("ONLINE baseline-normalization ON (faro raw cnr -> cnr_median_norm)"
+                         if cnr_mode == "norm"
+                         else "ONLINE normalization OFF (feeding raw cnr_median directly)")
+            print(
+                f"[serving] cnr_mode={cnr_mode!r} | {_cnr_norm} | "
+                f"cnr z-score mean={float(mean[CNR]):.4f} std={float(std[CNR]):.4f} | "
+                f"target_cnr={cfg.target_cnr} (must be in the same cnr units)"
+            )
+            if cnr_mode == "raw" and cfg.dark_baseline:
+                print(
+                    "[serving] NOTE: cnr_mode='raw' ignores dark_baseline/baseline_frames "
+                    "(no online baseline to measure); cells are stimulated from frame 0."
+                )
             if cfg.warmup and device.type == "cuda":
                 warmup_engine(engine)
             return engine, info

@@ -8,8 +8,10 @@ Pieces, in order of construction:
     augmentation and the T-F context cap.
 
 Input channels per frame = ``CHANNELS`` = [cnr] + HISTORY_FEATURES. cnr is also
-the MDN target, kept in its baseline-normalized (`cnr_median_norm`) units; the
-encoder-input cnr is standardized like the other channels.
+the MDN target, kept in its native cnr units (baseline-normalized
+`cnr_median_norm` or raw `cnr_median`, per the training ``cnr_mode``); the
+encoder-input cnr is standardized like the other channels. The frozen z-score
+stats are per-mode (`stats_path_for_mode`), since the cnr mean/std differ.
 """
 from __future__ import annotations
 
@@ -22,11 +24,24 @@ import torch
 from torch.utils.data import Dataset
 
 from optoerk.data.baseline_prepend import bootstrap_baseline_indices, prepend_channels
-from optoerk.data.history_data import HISTORY_FEATURES
+from optoerk.data.history_data import CNR_MODES, HISTORY_FEATURES
 
 CHANNELS = ["cnr", *HISTORY_FEATURES]  # ["cnr", "u_t", "fov_density", "n_cells_200px", "optortk_expr"]
 
-_STATS_PATH = Path(__file__).resolve().parent / "history_norm_stats.json"
+
+def stats_path_for_mode(cnr_mode: str = "norm") -> Path:
+    """Frozen-stats file for a given cnr_mode.
+
+    ``norm`` keeps the historical name (``history_norm_stats.json``) so existing
+    bundles' fallback path is unchanged; other modes get a suffixed file
+    (``history_norm_stats_raw.json``). The mean/std for the cnr channel differ by
+    mode, so loading the wrong file silently mis-scales — the serving loader keys
+    this off the model's own ``cnr_mode`` to prevent exactly that.
+    """
+    if cnr_mode not in CNR_MODES:
+        raise ValueError(f"cnr_mode must be one of {CNR_MODES}, got {cnr_mode!r}")
+    suffix = "" if cnr_mode == "norm" else f"_{cnr_mode}"
+    return Path(__file__).resolve().parent / f"history_norm_stats{suffix}.json"
 
 
 def make_split(
@@ -72,12 +87,14 @@ class NormStats:
             np.asarray(self.std, dtype=np.float32),
         )
 
-    def save(self, path: "str | Path" = _STATS_PATH) -> None:
-        Path(path).write_text(json.dumps(self.__dict__, indent=2))
+    def save(self, path: "str | Path | None" = None, *, cnr_mode: str = "norm") -> None:
+        Path(path or stats_path_for_mode(cnr_mode)).write_text(
+            json.dumps(self.__dict__, indent=2)
+        )
 
     @classmethod
-    def load(cls, path: "str | Path" = _STATS_PATH) -> "NormStats":
-        return cls(**json.loads(Path(path).read_text()))
+    def load(cls, path: "str | Path | None" = None, *, cnr_mode: str = "norm") -> "NormStats":
+        return cls(**json.loads(Path(path or stats_path_for_mode(cnr_mode)).read_text()))
 
 
 def compute_norm_stats(
@@ -286,20 +303,23 @@ def make_history_collate(f_min: int, f_max: int, seed: int = 0):
 
 
 if __name__ == "__main__":
-    # Regenerate the frozen normalization stats (history_norm_stats.json) from the
-    # canonical training bundle over the seed-0 train split — the exact split the
-    # training notebook uses. Run this whenever HISTORY_FEATURES or the training
-    # bundle changes; the notebook and serving both load the saved file via
-    # NormStats.load(), so a stale file silently mismatches the channel count.
-    from optoerk.data.history_data import load_history_tracks
+    # Regenerate the frozen normalization stats from the canonical training bundle
+    # over the seed-0 train split — the exact split the training notebook uses. Run
+    # this whenever HISTORY_FEATURES or the training bundle changes; the notebook
+    # and serving both load the saved file via NormStats.load(), so a stale file
+    # silently mismatches the channel count. One file per cnr_mode: the cnr channel
+    # mean/std differ between baseline-normalized and raw CNR.
+    from optoerk.data.history_data import CNR_MODES, load_history_tracks
 
-    _cnr, _feats, _cond, _ = load_history_tracks()
-    _split = make_split(_cond, seed=0)
-    _stats = compute_norm_stats(_cnr, _feats, _split["train"])
-    _stats.save()
-    print(
-        f"saved {len(_stats.channels)}-channel norm stats -> {_STATS_PATH}\n"
-        f"  channels: {_stats.channels}\n"
-        f"  mean:     {[round(m, 4) for m in _stats.mean]}\n"
-        f"  std:      {[round(s, 4) for s in _stats.std]}"
-    )
+    for _mode in CNR_MODES:
+        _cnr, _feats, _cond, _ = load_history_tracks(cnr_mode=_mode)
+        _split = make_split(_cond, seed=0)
+        _stats = compute_norm_stats(_cnr, _feats, _split["train"])
+        _stats.save(cnr_mode=_mode)
+        print(
+            f"[{_mode}] saved {len(_stats.channels)}-channel norm stats "
+            f"-> {stats_path_for_mode(_mode)}\n"
+            f"  channels: {_stats.channels}\n"
+            f"  mean:     {[round(m, 4) for m in _stats.mean]}\n"
+            f"  std:      {[round(s, 4) for s in _stats.std]}"
+        )

@@ -62,11 +62,16 @@ class ServerConfig:
     dmd_quantum_ms: float = 25.0     # faro's DMD switch granularity (for logging)
 
     # --- online CNR baseline normalization --------------------------------
-    # The model's cnr input channel is ``cnr_median_norm`` = cnr_median divided
-    # by the cell's baseline (median of its first ``baseline_frames`` frames).
-    # faro sends raw cnr per frame, so the server accumulates the baseline
-    # online. Before ``baseline_frames`` frames are seen the baseline is a
-    # provisional running median.
+    # NOTE: this whole section applies only when the loaded checkpoint's
+    # ``cnr_mode == "norm"``. A ``cnr_mode == "raw"`` model is fed raw
+    # ``cnr_median`` directly and the server does NO online normalization and NO
+    # dark window (baseline_frames / dark_baseline / baseline_mode are ignored).
+    #
+    # For a norm-mode model, the cnr input channel is ``cnr_median_norm`` =
+    # cnr_median divided by the cell's baseline (median of its first
+    # ``baseline_frames`` frames). faro sends raw cnr per frame, so the server
+    # accumulates the baseline online. Before ``baseline_frames`` frames are seen
+    # the baseline is a provisional running median.
     baseline_frames: int = 10
 
     # --- dark baseline (do NOT poison the baseline with immediate stimulation) --

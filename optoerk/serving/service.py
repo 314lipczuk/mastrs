@@ -29,6 +29,10 @@ class InferenceService:
         self.engine, self.info = load_engine(self.cfg)
         self.store = StateStore(evict_after_frames=self.cfg.evict_after_frames)
         self.model_loaded = bool(self.info.get("model_loaded", False))
+        # cnr convention the loaded checkpoint expects: "norm" -> reconstruct
+        # cnr_median_norm online (baseline division); "raw" -> feed raw cnr_median
+        # with NO online normalization. Governs the normalization branch below.
+        self.cnr_mode = self.info.get("cnr_mode", "norm")
         self._n_predict = 0
 
         # Optional structured prediction log (see optoerk.serving.predict_log).
@@ -68,6 +72,7 @@ class InferenceService:
                     "particle", "x", "y", "cnr", "cnr_median",
                 ],
                 "input_channels": ["cnr", "u_t", "fov_density", "n_cells_200px"],
+                "cnr_mode": self.cnr_mode,
                 "output_units": "exposure_milliseconds",
                 "exposure_range_ms": [self.cfg.min_exposure_ms, self.cfg.max_exposure_ms],
                 "target_cnr": self.cfg.target_cnr,
@@ -140,9 +145,11 @@ class InferenceService:
 
         # Field-mode dark window: the FOV's first ``baseline_frames`` frames are
         # held dark to measure resting baselines (per-cell + a FOV field baseline).
+        # Norm-mode only — raw-CNR models do no online baseline normalization.
         window_start = self.store.fov_window_start(fov, timestep)
         in_field_window = (
-            cfg.dark_baseline
+            self.cnr_mode == "norm"
+            and cfg.dark_baseline
             and cfg.baseline_mode == "field"
             and timestep < window_start + cfg.baseline_frames
         )
@@ -182,7 +189,12 @@ class InferenceService:
             # Resolve cnr_norm and whether this cell is held dark this frame so its
             # baseline is measured at rest rather than under stimulation.
             dark = False
-            if not cfg.dark_baseline:
+            if self.cnr_mode == "raw":
+                # Model trained on absolute cnr_median: feed the raw scalar with no
+                # online baseline normalization and no dark window (both are
+                # norm-mode machinery). Cells are stimulated from their first frame.
+                cnr_norm = raw_cnr
+            elif not cfg.dark_baseline:
                 cnr_norm = st.update_baseline(raw_cnr, cfg.baseline_frames)
             elif cfg.baseline_mode == "per_cell":
                 # Hold each cell dark until it has measured its own resting baseline.

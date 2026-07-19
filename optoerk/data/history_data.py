@@ -8,7 +8,8 @@ memory ladder showed those are unused. See ``memory_characterization_plan.md``.
 rank; a static per-cell covariate for response gain).
 
 Returns per-cell object arrays (variable T preserved):
-    cnr        : (n_cells,)  each (T,) float32  — baseline-normalized CNR
+    cnr        : (n_cells,)  each (T,) float32  — CNR (baseline-normalized or
+                 raw absolute, per ``cnr_mode``; see ``CNR_MODE_COLUMNS``)
     feats      : (n_cells,)  each (K, T) float32 — rows = HISTORY_FEATURES
     conditions : (n_cells,)  str — stim_condition (protocol) per cell
     meta       : pd.DataFrame — one row per cell (uid, condition, fov, T)
@@ -26,11 +27,21 @@ from optoerk.core.utils import materials_path
 # Full model input = [cnr] + HISTORY_FEATURES.
 HISTORY_FEATURES = ["u_t", "fov_density", "n_cells_200px", "optortk_expr"]
 
+# The cnr channel can be either baseline-normalized (per-cell divide by resting
+# median, the historical default) or raw absolute CNR. This is the single source
+# of truth mapping the mode name -> parquet column; ``cnr_mode`` threads through
+# the model config and the serving path so a raw-CNR model is never fed (or
+# online-normalized) as if it were a norm-CNR model. See ``history_dataset`` and
+# ``optoerk.serving``.
+CNR_MODES = ("norm", "raw")
+CNR_MODE_COLUMNS = {"norm": "cnr_median_norm", "raw": "cnr_median"}
+
 
 def load_history_tracks(
     path: str | Path = materials_path("dataset_all.parquet"),
     *,
     radius: float = 200.0,
+    cnr_mode: str = "norm",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
     """Load real microscopy data as per-cell tracks with minimal raw features.
 
@@ -40,7 +51,12 @@ def load_history_tracks(
     would re-apply a global tracking-length threshold that drops every shorter
     protocol (e.g. the 90-frame bo_osc runs). Crowding features are computed on
     all detected rows, then carried through ``make_tracks``.
+
+    ``cnr_mode`` selects the cnr column: ``"norm"`` -> ``cnr_median_norm``
+    (baseline-normalized, default) or ``"raw"`` -> ``cnr_median`` (absolute).
     """
+    if cnr_mode not in CNR_MODE_COLUMNS:
+        raise ValueError(f"cnr_mode must be one of {CNR_MODES}, got {cnr_mode!r}")
     from optoerk.data.preprocessing import (
         add_crowding_features,
         add_optortk_expression,
@@ -51,7 +67,7 @@ def load_history_tracks(
     df = add_crowding_features(df, radius=radius)
     df = add_optortk_expression(df)
     cnr, feats, meta = make_tracks(
-        df, value_col="cnr_median_norm", stim_cols=HISTORY_FEATURES
+        df, value_col=CNR_MODE_COLUMNS[cnr_mode], stim_cols=HISTORY_FEATURES
     )
     conditions = meta["stim_condition"].to_numpy()
     return cnr, feats, conditions, meta

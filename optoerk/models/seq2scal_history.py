@@ -62,6 +62,10 @@ class HistoryConfig(BaseModel):
     sigma_step_bias: bool = False            # learnable per-forecast-step log-sigma bias
     data_source: str = "real_plus_bo"
     variant: str = "seq2scalar_history"
+    # cnr channel semantics: "norm" = baseline-normalized cnr_median_norm (default),
+    # "raw" = absolute cnr_median. Carried on the config so eval/serving know
+    # whether to online-normalize CNR and which frozen z-score stats to load.
+    cnr_mode: str = "norm"
     # frozen normalization (channel order matches history_dataset.CHANNELS),
     # carried so the model is self-contained for eval / deployment.
     norm_channels: list[str] = Field(default_factory=list)
@@ -72,6 +76,8 @@ class HistoryConfig(BaseModel):
     def _validate(self):
         if self.mlp_hidden is None:
             object.__setattr__(self, "mlp_hidden", self.hidden_dim)
+        if self.cnr_mode not in ("norm", "raw"):
+            raise ValueError(f"cnr_mode must be norm|raw, got {self.cnr_mode!r}")
         if self.head_type not in ("mdn", "gaussian"):
             raise ValueError(f"head_type must be mdn|gaussian, got {self.head_type!r}")
         if self.film not in ("none", "output", "hidden"):
