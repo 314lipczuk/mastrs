@@ -18,7 +18,8 @@ the full history every call (verified to ~1e-7). It never replays history.
 | POST   | `/reset`   | `{}` (all) or `{"fov": N}`             | `{status, reset}` |
 | GET    | `/info`    | –                                      | model / calibration / units metadata |
 
-Exposures are in **ms, clamped to `[0, 3000]`**; `0` = do not stimulate.
+Exposures are in **ms, clamped to `[min_exposure_ms, max_exposure_ms]`**
+(default `[0, 800]`); `0` = do not stimulate.
 Retries with the same `(fov, timestep)` return the cached response without
 advancing any state.
 
@@ -33,7 +34,7 @@ uv run python -m optoerk.serving.app --host 0.0.0.0 --port 8080
 
 # Real trained model:
 uv run python -m optoerk.serving.app --host 0.0.0.0 --port 8080 \
-    --checkpoint results/<bundle_dir> --device cuda --stim-power 100
+    --checkpoint results/<bundle_dir> --device cuda --stim-power 10
 
 # Smoke test (in-process; set the env var to test the real model):
 uv run python -m optoerk.serving.smoke_test
@@ -87,7 +88,7 @@ The model's `u_t` is fluence `mJ/cm2 = irradiance(mW/cm2) * exposure_ms * 1e-3`
 (from `preprocessing.calc_power`), where irradiance comes from the instrument
 power calibration at a given LED power `%`. `calibration.FluenceCalibration`
 reuses the exact same `CALIBRATIONS` table. **faro does not send the LED power,
-so a fixed `stim_power_pct` is assumed** (`--stim-power`, default 100 %). Set it
+so a fixed `stim_power_pct` is assumed** (`--stim-power`, default 10 %). Set it
 to the power faro actually drives the DMD at.
 
 ## Deltas to the faro contract (things to confirm)

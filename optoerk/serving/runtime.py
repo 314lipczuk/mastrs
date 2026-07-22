@@ -19,7 +19,6 @@ engine methods assume the caller holds the service lock (torch models and the
 state tensors are not thread-safe).
 """
 from __future__ import annotations
-from pprint import pprint
 
 import time
 from dataclasses import dataclass
@@ -196,9 +195,6 @@ class RealModelEngine:
 
     @torch.no_grad()
     def decide(self, frames: list[CellFrame]) -> list[float]:
-        #pprint(self)
-        #pprint(self.device)
-        #pprint(self.model)
         if not frames:
             return []
         N = len(frames)

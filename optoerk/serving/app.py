@@ -77,7 +77,7 @@ def make_handler(service: InferenceService):
                 else:
                     self._send(404, {"error": f"unknown path {self.path}"})
             except Exception as e:  # noqa: BLE001
-                traceback.print_exc(e)
+                traceback.print_exc()
                 self._send(500, {"error": repr(e)})
 
     return Handler
