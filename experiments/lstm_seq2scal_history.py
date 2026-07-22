@@ -87,13 +87,13 @@ def _(mo):
 
 
 @app.cell
-def _(MODE, mo):
+def _(CNR_MODE, MODE, mo):
     # Training bundle to load (parquet in materials/). Default = the full `all`
     # bundle; jobs override via --dataset (e.g. dataset_niesen.parquet).
     DATASET = mo.cli_args().get("dataset", "dataset_all.parquet")
     if MODE == "train":
         hist_cnr, hist_feats, hist_cond, _hist_meta = load_history_tracks(
-            materials_path(DATASET)
+            materials_path(DATASET), cnr_mode=CNR_MODE
         )
         hist_split = make_split(hist_cond, seed=0)
     else:
@@ -102,14 +102,14 @@ def _(MODE, mo):
 
 
 @app.cell
-def _(MODE, hist_cnr, hist_feats, hist_split):
+def _(CNR_MODE, MODE, hist_cnr, hist_feats, hist_split):
     # Standardization computed from THIS bundle's train split (not a frozen file),
     # so stats always match the loaded data/features. Stamped onto the model
     # config for eval/serving. Load mode: values unused (config comes from bundle).
     if MODE == "train":
         norm_stats = compute_norm_stats(hist_cnr, hist_feats, hist_split["train"])
     else:
-        norm_stats = NormStats.load()
+        norm_stats = NormStats.load(cnr_mode=CNR_MODE)
     return (norm_stats,)
 
 
@@ -119,15 +119,21 @@ def _(mo, parse_bool):
     IS_HEADLESS = "name" in mo.cli_args()
     EXPERIMENT_NAME = mo.cli_args().get("name", "lstm_seq2scal_history")
     DRY_RUN = parse_bool(mo.cli_args().get("dry_run", True))
+    # cnr channel semantics: "norm" = baseline-normalized cnr_median_norm (default),
+    # "raw" = absolute cnr_median. Stamped onto the model config so eval/serving
+    # know whether to online-normalize and which frozen z-score stats to load.
+    CNR_MODE = mo.cli_args().get("cnr_mode", "norm")
 
     if MODE not in ("train", "load"):
         raise ValueError(f"--mode must be 'train' or 'load', got {MODE!r}")
+    if CNR_MODE not in ("norm", "raw"):
+        raise ValueError(f"--cnr_mode must be 'norm' or 'raw', got {CNR_MODE!r}")
 
     mo.md(
-        f"**Mode:** `{MODE}` · **Headless:** `{IS_HEADLESS}` · "
+        f"**Mode:** `{MODE}` · **CNR:** `{CNR_MODE}` · **Headless:** `{IS_HEADLESS}` · "
         f"**Experiment:** `{EXPERIMENT_NAME}` · **Dry run:** `{DRY_RUN}`"
     )
-    return DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, MODE
+    return CNR_MODE, DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, MODE
 
 
 @app.cell
@@ -188,7 +194,7 @@ def _(IS_HEADLESS, MODE, form_from_configs, mo):
         form = form_from_configs(
             mo,
             {"m": HistoryConfig, "t": HistoryTrainingConfig},
-            skip={"m": {"input_dim", "variant", "norm_channels", "norm_mean", "norm_std"}},
+            skip={"m": {"input_dim", "variant", "cnr_mode", "norm_channels", "norm_mean", "norm_std"}},
             radio_choices={
                 "m": {
                     "encoder_type": ("lstm",),
@@ -205,6 +211,7 @@ def _(IS_HEADLESS, MODE, form_from_configs, mo):
 
 @app.cell(hide_code=True)
 def _(
+    CNR_MODE,
     DRY_RUN,
     EXPERIMENT_NAME,
     IS_HEADLESS,
@@ -223,6 +230,7 @@ def _(
         always={
             "m": {
                 "input_dim": len(CHANNELS),
+                "cnr_mode": CNR_MODE,
                 "norm_channels": norm_stats.channels,
                 "norm_mean": norm_stats.mean,
                 "norm_std": norm_stats.std,
