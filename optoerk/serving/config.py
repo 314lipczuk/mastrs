@@ -36,6 +36,14 @@ class ServerConfig:
     checkpoint_dir: str | None = None
     device: str = "auto"  # "auto" | "cpu" | "cuda" | "mps"
 
+    # --- per-FOV policies --------------------------------------------------
+    # Path to a .toml / .json policy file giving a default policy (checkpoint +
+    # objective + controller) plus per-FOV overrides. See optoerk.serving.policy.
+    # When None, every FOV shares one policy built from the fields below:
+    # ``checkpoint_dir``, a ``hold`` objective at ``target_cnr``, searched by
+    # ``constant_dose``. That is exactly the pre-policy-file behaviour.
+    policy_file: str | None = None
+
     # --- fluence <-> milliseconds conversion ------------------------------
     # The model's ``u_t`` channel is fluence in mJ/cm2 =
     #   irradiance(mW/cm2, from stim_power) * exposure_ms * 1e-3   (preprocessing.calc_power)
@@ -45,13 +53,21 @@ class ServerConfig:
     instrument: str = "niesen"     # selects the calibration curve
     stim_power_pct: float = 10.0    # LED power (%) faro stimulates at
 
-    # --- control law (PLACEHOLDER objective) ------------------------------
-    # The model predicts CNR given future fluence; the controller inverts that
-    # by searching candidate exposures and picking the one whose predicted CNR
-    # best tracks ``target_cnr`` over ``control_horizon`` future frames.
-    # ``target_cnr`` is in cnr_median_norm units (baseline == 1.0; population
-    # mean in the training data ~1.64). This is a stand-in for the real
-    # experimental objective — set it to what the experiment actually wants.
+    # --- control law ------------------------------------------------------
+    # The model predicts CNR given future fluence; the controller inverts that by
+    # searching dose plans and scoring them with an Objective. These three fields
+    # configure the *default* policy used when no ``policy_file`` is given:
+    # ``target_cnr`` is the setpoint of a ``hold`` objective, searched over an
+    # ``n_candidates``-wide exposure grid, ``control_horizon`` frames ahead.
+    # A policy file overrides all of this per FOV — see optoerk.serving.policy.
+    #
+    # ``target_cnr`` is in the loaded checkpoint's cnr units: cnr_median_norm for a
+    # cnr_mode="norm" model (resting baseline == 1.0; training population mean
+    # ~1.64), absolute cnr_median for a "raw" model. The startup banner prints both
+    # so a mismatch is visible.
+    #
+    # ``control_horizon`` is hard-capped at the checkpoint's ``future_len``:
+    # rolling further is untrained and indexes past ``sigma_step_bias_param``.
     target_cnr: float = 1.5
     control_horizon: int = 5         # frames to look ahead when scoring a dose
     n_candidates: int = 5           # exposure grid resolution (0..max_exposure_ms)
@@ -166,7 +182,7 @@ class ServerConfig:
             if raw is None:
                 continue
             default = getattr(defaults, f.name)
-            if f.name in ("checkpoint_dir", "predict_log_path"):
+            if f.name in ("checkpoint_dir", "predict_log_path", "policy_file"):
                 kwargs[f.name] = None if raw.strip().lower() in ("", "none") else raw
             elif f.name == "optortk_expr_value":
                 # float | None: empty / "none" clears the override to the default.

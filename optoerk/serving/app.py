@@ -108,6 +108,8 @@ def build_service(args) -> InferenceService:
         cfg.override_optortk_expr = True  # a value implies the override is on
     if args.predict_log is not None:
         cfg.predict_log_path = args.predict_log or None
+    if args.policy_file is not None:
+        cfg.policy_file = args.policy_file or None
     return InferenceService(cfg)
 
 
@@ -131,6 +133,9 @@ def main():
                    help="raw optoRTK-expr value to feed (implies --override-optortk-expr)")
     p.add_argument("--predict-log", dest="predict_log", default=None,
                    help="path to append a per-prediction JSONL log (off by default)")
+    p.add_argument("--policy-file", dest="policy_file", default=None,
+                   help="per-FOV policy file (.toml/.json): checkpoint + objective "
+                        "+ controller per FOV. Overrides --checkpoint/--target-cnr.")
     args = p.parse_args()
 
     service = build_service(args)

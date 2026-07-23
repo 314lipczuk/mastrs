@@ -40,6 +40,10 @@ class CellState:
     last_timestep: int = -1
     last_seen_timestep: int = -1
     n_frames: int = 0
+    # this cell's particle id (within its FOV). Set at creation. Used by
+    # StaggeredCadenceMPC to assign the cell a fixed cadence phase (particle % k),
+    # so a cell keeps its stimulation slot for its whole lifetime.
+    particle: int = -1
 
     def baseline_ready(self, baseline_frames: int) -> bool:
         """True once a full baseline window has been accumulated (or seeded)."""
@@ -122,6 +126,9 @@ class StateStore:
                     st.baseline_samples = list(pst.baseline_samples)
                     st.baseline = pst.baseline
                     st.last_cnr_norm = pst.last_cnr_norm
+            # The daughter carries its OWN particle id (its cadence phase), not the
+            # mother's — a division must not put both cells in the same slot.
+            st.particle = particle
             self._cells[key] = st
         return st
 

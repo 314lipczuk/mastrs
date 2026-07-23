@@ -72,15 +72,115 @@ falls back to the stub policy (so it still answers faro).
 - **Seam:** `runtime.load_engine(cfg)` returns a `RealModelEngine` or `StubEngine`,
   both exposing `decide(frames) -> [exposure_ms]`.
 
-## Control law (PLACEHOLDER — needs the real objective)
+## Goals, controllers and per-FOV policies
 
-The model predicts CNR given future fluence; faro needs a commanded dose. No
-controller existed in `masters`, so `RealModelEngine.decide` implements a simple
-**model-predictive search**: for a grid of candidate exposures it rolls the
-decoder forward `control_horizon` steps and picks the exposure whose predicted
-CNR best tracks `target_cnr` (squared-error over the horizon). `target_cnr`,
-`control_horizon`, and `n_candidates` are configurable. **Replace this objective
-with the real experimental goal.**
+The model predicts CNR *given* a dose; faro needs a commanded dose. Three pieces
+split that job, each swappable:
+
+| piece | module | question |
+|---|---|---|
+| **Objective** | `objectives.py` | what are we aiming for? |
+| **Controller** | `control.py` | how do we search for the dose that gets there? |
+| **Policy** | `policy.py` | which of each, for which FOV? |
+
+### Objectives — the goal *is* a cost function
+
+`Objective.cost(pred_cnr, ctx) -> (N, M)` scores every candidate plan for every
+cell; the controller takes the argmin. `pred_cnr` arrives in **absolute CNR
+units** (already denormalized), in the loaded checkpoint's `cnr_mode` convention,
+so objectives are written in human-readable CNR and never touch z-score stats.
+
+`TargetTrajectory(target_fn, gate_fn)` covers the common case: a setpoint that may
+vary over time *and over the forecast horizon*, plus a predicate deciding whether
+a cell may be stimulated at all. A gate is deliberately **not** folded into the
+cost — an enormous cost still leaves the controller picking a least-bad nonzero
+dose, whereas `allow_stim` forces exactly 0 ms.
+
+Built-ins, nameable from a policy file: `hold` (fixed setpoint), `schedule`
+(piecewise setpoint over time, evaluated per horizon step so the controller sees
+a step change coming), `gated` (`hold` plus predicates on `x`, `y`,
+`n_cells_200px`, `timestep`, `n_frames_seen`). Register your own with
+`objectives.register`.
+
+### Controllers
+
+- `constant_dose` — scores a **constant** dose held over the horizon. Cheap; the
+  historical behaviour; kept as the A/B baseline. Not MPC: it cannot express "a
+  pulse now, then nothing".
+- `sequence_mpc` — real receding-horizon MPC. Optimizes a dose *sequence*
+  `u[0..H-1]` by the cross-entropy method over the discrete DMD level set, applies
+  **only `u[0]`**, and re-plans next frame. The constant-dose plans are injected
+  into every CEM iteration, so MPC is provably never worse than `constant_dose`.
+
+Two things to know about `sequence_mpc`: each cell samples its own plans, so a low
+`n_samples` gives *identical cells different doses* (measured: split at S=128,
+stable by S=512 — hence the generous default); and the horizon is hard-capped at
+the checkpoint's `future_len`, because rolling further is untrained and indexes
+past `sigma_step_bias_param`.
+
+### Per-FOV policies
+
+```toml
+[default]
+checkpoint = "results/seq2scal_history_optortk_multilen_2026-07-14_09.48.21"
+objective  = { type = "hold", target_cnr = 1.4 }
+controller = { type = "sequence_mpc", n_samples = 512 }
+
+[fov.1]
+objective = { type = "hold", target_cnr = 2.0 }
+
+[fov.2]
+checkpoint = "results/some_other_model"
+objective  = { type = "gated", target_cnr = 1.8, after_t = 10, x_gt = 512,
+               max_neighbours_200px = 5 }
+```
+
+`--policy-file policies.toml` (JSON works too). A FOV inherits every field it does
+not set; `objective`/`controller` are replaced wholesale, never deep-merged.
+Models are cached by `(checkpoint, device)`, so N FOVs on one checkpoint load and
+warm up **one** model. A FOV whose policy fails to build degrades to the stub for
+that FOV alone. Every resolved policy is written into the log's `startup` record
+and echoed by `/info`, so a run's log is a complete record of what it ran.
+
+With no policy file, behaviour is exactly as before: one checkpoint, a `hold` at
+`target_cnr`, searched by `constant_dose`.
+
+## Replay and benchmarking
+
+`python -m optoerk.serving.bench` sweeps `decide()` wall time over
+horizon × candidates × cells × controller. It can build an **untrained** model at
+any `future_len`, so "can we afford F=30?" is answerable before paying for the
+retrain. Measured on CPU at 208 cells: `constant_dose` H=30 is 61 ms,
+`sequence_mpc@128` H=30 is 4.2 s — against a **60 s** frame budget. Horizon is
+limited by what the model was trained for, not by compute.
+
+`optoerk.serving.replay` re-drives the service with a recorded run's frames, and
+`experiments/replay_serving_run.py` wraps it in a notebook. Three modes that must
+not be conflated: **faithful** (same policy; a regression gate), **counterfactual**
+(different policy on the recorded CNR stream — open-loop, so it measures
+disagreement, *not* whether the new policy would track better), and
+`simulate_closed_loop` (the model stands in for the cells; compares tracking, but
+against the model's own beliefs).
+
+`crowding_match_frac` in the replay summary must be 1.0 — it proves the track
+positions were joined back in. Without it, a missing `tracks/` dir silently feeds
+the model different `n_cells_200px` while the summary still looks healthy.
+
+A faithful replay is exact on the same device. Replaying a **CUDA** run on **CPU**
+lands at ~0.998: float differences flip the occasional argmin near a decision
+boundary and drift compounds through the per-cell encoder state.
+
+## Performance — measured, before you optimize
+
+From the 2026-07-16 v5 run (2880 predicts, 4 FOVs, CUDA, ~208 cells/predict):
+p50/p99/max `infer_s` = 0.07/0.12/0.15 s, `lock_wait_s` = 0.00 throughout, and a
+per-FOV request cadence of a flat 60.0 s.
+
+**The server uses ~0.15 s of a 60 s budget and never contends on its lock.** If
+frames are being dropped, it is not inference — a 400× speedup would save 0.15 s
+per minute. Look upstream (faro acquisition, segmentation/tracking, `stim_mask`
+handling, the network); the notebook's cadence panel is the tool for that. This is
+also the headroom that makes `sequence_mpc` affordable.
 
 ## Fluence ↔ milliseconds
 
@@ -93,12 +193,39 @@ to the power faro actually drives the DMD at.
 
 ## Deltas to the faro contract (things to confirm)
 
-1. **CNR normalization:** the model's cnr channel is `cnr_median_norm` =
-   per-cell median CNR ÷ its baseline (median of first `baseline_frames`
-   frames). faro sends raw `cnr`; the server prefers `cnr_median` if present and
-   baseline-normalizes online. Cells must be tracked from experiment start for a
-   correct baseline; mid-experiment births use a provisional baseline. Sending
-   `cnr_median` is preferred over `cnr`.
+1. **CNR — one scalar per cell, and which convention:** faro sends a single
+   **`cnr_median`** per cell per frame — the ratio `median_intensity_C1_ring /
+   median_intensity_C1_nuc` (channel C1 only; the per-region pixel reduction
+   happens upstream in segmentation, so this is already a scalar, *not* pixels).
+   `extract_raw_cnr` prefers the `cnr_median` field, else reconstructs it from the
+   two C1 medians, and falls back to plain `cnr` (the *mean*-ratio) only as a last
+   resort — the model was trained on the median ratio, so **send `cnr_median`.**
+
+   What the server does with that scalar depends on the checkpoint's **`cnr_mode`**
+   (printed in the startup banner). Note "raw" is overloaded: the scalar faro sends
+   is "raw" in the sense of *not yet baseline-divided*, and separately a `cnr_mode
+   ="raw"` **model** is one trained on that absolute scalar.
+
+   - **`cnr_mode="norm"`** — the model's channel is `cnr_median_norm` = `cnr_median
+     ÷ per-cell baseline` (baseline = median of the cell's first `baseline_frames`
+     frames), so the server reconstructs the baseline **online**. This needs the
+     cell tracked **from experiment start**; a mid-experiment birth never had its
+     resting window observed and gets a provisional baseline (the `dark_baseline`
+     field-mode machinery mitigates this by seeding births from the FOV field
+     baseline, but it stays an approximation). This is the fragile part of the
+     contract — a bias appears whenever faro's track ids aren't stable from t=0.
+
+   - **`cnr_mode="raw"`** — the model consumes the absolute `cnr_median` directly:
+     **no online normalization, no dark window, no baseline.** The entire
+     tracking-from-start / provisional-baseline caveat above **does not apply.**
+     The tradeoff moves into the model: it must generalize across absolute CNR
+     levels that vary with cell line and sensor expression, rather than every cell
+     starting at 1.0 (the OOD-scale concern in `NIESEN_TOCHECK.md`). `baseline_frames`,
+     `dark_baseline` and `baseline_mode` are all ignored in this mode.
+
+   Either way faro sends the same field (`cnr_median`); the checkpoint decides how
+   it is interpreted, so serving a raw model with a norm checkpoint's target (or
+   vice versa) is the mismatch the startup banner exists to make obvious.
 2. **LED power:** not in the payload; assumed fixed (see above).
 3. **`fov_density` / `n_cells_200px`:** derived server-side from all cells'
    `x, y` in the payload (replicating `preprocessing.add_crowding_features`), so

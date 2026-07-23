@@ -38,6 +38,13 @@ class FluenceCalibration:
         # fluence per ms of exposure at this power.
         self._fluence_per_ms = self.irradiance_mW_cm2 * 1e-3
 
+    @property
+    def fluence_per_ms(self) -> float:
+        """mJ/cm2 per ms of exposure at the configured power. Exposed so the
+        controllers can do the ms->fluence conversion in torch, on-device, without
+        a numpy round-trip per candidate."""
+        return self._fluence_per_ms
+
     def ms_to_fluence(self, exposure_ms: float | np.ndarray):
         """exposure (ms) -> fluence (mJ/cm2)."""
         return np.asarray(exposure_ms, dtype=np.float64) * self._fluence_per_ms

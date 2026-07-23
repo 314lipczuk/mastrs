@@ -17,8 +17,10 @@ from typing import Any
 from optoerk.serving.config import ServerConfig
 from optoerk.serving.features import compute_crowding, extract_raw_cnr
 from optoerk.serving.gpu import GpuSampler, cuda_mem_mb
+from optoerk.serving.objectives import GoalContext
+from optoerk.serving.policy import PolicyRouter, load_policy_file
 from optoerk.serving.predict_log import PredictLogger
-from optoerk.serving.runtime import CellFrame, load_engine
+from optoerk.serving.runtime import CellFrame
 from optoerk.serving.state import StateStore
 
 
@@ -26,7 +28,14 @@ class InferenceService:
     def __init__(self, cfg: ServerConfig | None = None):
         self.cfg = cfg or ServerConfig()
         self.lock = threading.Lock()
-        self.engine, self.info = load_engine(self.cfg)
+        # One engine per distinct policy; FOVs without an override share the
+        # default. With no policy file this is a single engine, as before.
+        policy_file = (
+            load_policy_file(self.cfg.policy_file) if self.cfg.policy_file else None
+        )
+        self.router = PolicyRouter(self.cfg, policy_file)
+        self.engine = self.router.default_engine
+        self.info = self.router.default_info
         self.store = StateStore(evict_after_frames=self.cfg.evict_after_frames)
         self.model_loaded = bool(self.info.get("model_loaded", False))
         # cnr convention the loaded checkpoint expects: "norm" -> reconstruct
@@ -48,6 +57,10 @@ class InferenceService:
                     "engine": type(self.engine).__name__,
                     "model_loaded": self.model_loaded,
                     "info": self.info,
+                    # Every resolved policy, verbatim: the run's log is then a
+                    # complete record of what it actually ran, and the replay
+                    # harness can rebuild it without the original policy file.
+                    "policies": self.router.describe(),
                 }
             )
             # Background GPU telemetry (CUDA only) — runs off the prediction path
@@ -75,8 +88,7 @@ class InferenceService:
                 "cnr_mode": self.cnr_mode,
                 "output_units": "exposure_milliseconds",
                 "exposure_range_ms": [self.cfg.min_exposure_ms, self.cfg.max_exposure_ms],
-                "target_cnr": self.cfg.target_cnr,
-                "control_horizon": self.cfg.control_horizon,
+                "policies": self.router.describe(),
                 "calibration": {
                     "instrument": self.cfg.instrument,
                     "stim_power_pct": self.cfg.stim_power_pct,
@@ -143,12 +155,16 @@ class InferenceService:
         # Crowding features from all cells' positions in this frame.
         fov_density, n200 = compute_crowding(cells, radius=cfg.crowd_radius_px)
 
+        # cnr convention is a property of THIS FOV's checkpoint, not of the server:
+        # per-FOV policies may mix a raw-CNR model with a norm-CNR one.
+        cnr_mode = self.router.info_for(fov).get("cnr_mode", self.cnr_mode)
+
         # Field-mode dark window: the FOV's first ``baseline_frames`` frames are
         # held dark to measure resting baselines (per-cell + a FOV field baseline).
         # Norm-mode only — raw-CNR models do no online baseline normalization.
         window_start = self.store.fov_window_start(fov, timestep)
         in_field_window = (
-            self.cnr_mode == "norm"
+            cnr_mode == "norm"
             and cfg.dark_baseline
             and cfg.baseline_mode == "field"
             and timestep < window_start + cfg.baseline_frames
@@ -189,7 +205,7 @@ class InferenceService:
             # Resolve cnr_norm and whether this cell is held dark this frame so its
             # baseline is measured at rest rather than under stimulation.
             dark = False
-            if self.cnr_mode == "raw":
+            if cnr_mode == "raw":
                 # Model trained on absolute cnr_median: feed the raw scalar with no
                 # online baseline normalization and no dark window (both are
                 # norm-mode machinery). Cells are stimulated from their first frame.
@@ -220,6 +236,11 @@ class InferenceService:
                     cnr_norm=cnr_norm,
                     fov_density=float(fov_density[i]),
                     n_cells_200px=float(n200[i]),
+                    # Not model inputs — objectives gate on position (e.g. "only
+                    # the right half of the field"). Missing -> NaN, which fails
+                    # every position predicate rather than silently passing.
+                    x=float(cell.get("x", float("nan"))),
+                    y=float(cell.get("y", float("nan"))),
                 )
             )
             particles.append(particle)
@@ -243,8 +264,10 @@ class InferenceService:
                     }
                 )
 
+        engine = self.router.engine_for(fov)
+        goal_ctx = GoalContext(fov=fov, timestep=timestep, cells=frames)
         t_infer = time.perf_counter()
-        ms_list = self.engine.decide(frames)
+        ms_list = engine.decide(frames, goal_ctx)
         infer_s = time.perf_counter() - t_infer
 
         for particle, f, ms, dark in zip(particles, frames, ms_list, dark_flags):
@@ -272,7 +295,7 @@ class InferenceService:
             )
 
         if log_on:
-            optortk = getattr(self.engine, "optortk_fed", None)
+            optortk = getattr(engine, "optortk_fed", None)
             for rec, f, ms in zip(log_cells, frames, ms_list):
                 rec["exposure_ms"] = float(0.0 if rec["dark"] else ms)
                 rec["fluence_out"] = float(f.state.last_fluence)
@@ -286,13 +309,13 @@ class InferenceService:
                     "timestep": timestep,
                     "n_cells_in": len(cells),
                     "n_scored": len(frames),
-                    "engine": type(self.engine).__name__,
+                    "engine": type(engine).__name__,
                     "timing": {
                         "recv_epoch": recv_epoch,
                         "lock_wait_s": round(lock_wait_s, 4),
                         "infer_s": round(infer_s, 4),
                         "handler_s": round(handler_s, 4),
-                        **cuda_mem_mb(getattr(self.engine, "device", None)),
+                        **cuda_mem_mb(getattr(engine, "device", None)),
                     },
                     "cells": log_cells,
                     "skipped": skipped,

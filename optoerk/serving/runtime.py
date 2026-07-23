@@ -1,51 +1,66 @@
-"""Model runtime: load the checkpoint, advance the online encoder, and invert
-the CNR predictor into a per-cell exposure via a short-horizon search.
+"""Model runtime: load the checkpoint and advance the online per-cell encoder.
 
-Two interchangeable engines behind a common ``decide(frames) -> [ms]`` seam:
+This module is *model plumbing*. It owns:
 
-  * :class:`RealModelEngine` — wraps a trained ``Seq2ScalarHistory``. Per call it
-    (1) advances each cell's encoder LSTM by exactly one step with the carried
-    ``(h, c)`` (equivalent to full-history encoding), then (2) runs the control
-    law: for a grid of candidate exposures it rolls the decoder forward
-    ``control_horizon`` steps and picks the exposure whose predicted CNR best
-    tracks ``target_cnr``.
+  * loading a checkpoint bundle (with a process-wide cache, so several FOVs
+    sharing a checkpoint share one loaded model),
+  * assembling the standardized input channels for a frame,
+  * advancing each cell's encoder LSTM by exactly one step with the carried
+    ``(h, c)`` — numerically identical to re-encoding the whole causal past,
+  * the decoder rollout, exposed as a *plant* interface.
 
-  * :class:`StubEngine` — no neural net; a deterministic proportional policy
-    (``exposure = gain * max(0, target - cnr)``) so faro can integrate before a
-    real checkpoint exists.
+It does **not** decide what dose to command. "What are we aiming for" lives in
+:mod:`optoerk.serving.objectives` and "how do we search for the dose" lives in
+:mod:`optoerk.serving.control`; ``RealModelEngine.decide`` just wires the two to
+the plant.
 
-Use :func:`load_engine` to get whichever is appropriate for the config. All
-engine methods assume the caller holds the service lock (torch models and the
-state tensors are not thread-safe).
+Two interchangeable engines behind a common ``decide(frames, ctx) -> [ms]`` seam:
+:class:`RealModelEngine` (a trained ``Seq2ScalarHistory``) and :class:`StubEngine`
+(no neural net; a deterministic proportional policy so faro can integrate before a
+real checkpoint exists). All engine methods assume the caller holds the service
+lock — torch models and the state tensors are not thread-safe.
 """
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 
 from optoerk.serving.calibration import FluenceCalibration
 from optoerk.serving.config import ServerConfig
+from optoerk.serving.control import Controller, dose_levels
+from optoerk.serving.objectives import GoalContext, Objective
 from optoerk.serving.state import CellState
 
 CNR = 0  # channel index of cnr (first in norm_channels: [cnr, u_t, ...])
 FLU = 1  # channel index of u_t (fluence; second)
 
+DEFAULT_CHANNELS = ["cnr", "u_t", "fov_density", "n_cells_200px"]
+
 
 @dataclass
 class CellFrame:
-    """One cell's inputs for the current frame (baseline-normalized cnr)."""
+    """One cell's inputs for the current frame (baseline-normalized cnr).
+
+    ``x``/``y`` are the payload's centroid — not model inputs, but objectives gate
+    on them (e.g. "only stimulate the right half of the field"). They default to
+    NaN so a cell with no reported position fails any position predicate rather
+    than silently passing it.
+    """
     state: CellState
     cnr_norm: float
     fov_density: float
     n_cells_200px: float
+    x: float = float("nan")
+    y: float = float("nan")
 
 
 # ---------------------------------------------------------------------------
 # model / norm-stats loading
 # ---------------------------------------------------------------------------
+
 
 def _resolve_device(device: str) -> torch.device:
     if device != "auto":
@@ -74,54 +89,126 @@ def _load_norm_stats(model) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(stats.mean, np.float32), np.asarray(stats.std, np.float32)
 
 
-def load_engine(cfg: ServerConfig):
-    """Return a (engine, info) pair. Falls back to the stub on any load failure."""
-    calib = FluenceCalibration(cfg.instrument, cfg.stim_power_pct)
-    if cfg.checkpoint_dir:
-        try:
-            from optoerk.core.experiment import load_experiment
+@dataclass
+class ModelHandle:
+    """A loaded checkpoint plus its frozen norm stats, shareable across FOVs."""
+    model: object
+    mean: np.ndarray
+    std: np.ndarray
+    device: torch.device
+    info: dict = field(default_factory=dict)
 
-            bundle = load_experiment(cfg.checkpoint_dir)
-            model = bundle.reconstruct_model()
-            device = _resolve_device(cfg.device)
-            model.to(device).eval()
-            mean, std = _load_norm_stats(model)
-            engine = RealModelEngine(model, mean, std, calib, cfg, device)
-            cnr_mode = getattr(model.cfg, "cnr_mode", "norm")
-            info = {
-                "model_loaded": True,
-                "model_type": bundle.model_type,
-                "checkpoint_dir": cfg.checkpoint_dir,
-                "device": str(device),
-                "future_len": int(model.cfg.future_len),
-                "cnr_mode": cnr_mode,
-                "norm_channels": list(getattr(model.cfg, "norm_channels", []))
-                or ["cnr", "u_t", "fov_density", "n_cells_200px"],
-            }
-            # Load-bearing banner: which cnr convention this checkpoint expects, so
-            # a raw-CNR model served with online normalization (or vice versa) is
-            # obvious at a glance. cnr_mean is the frozen z-score center for the cnr
-            # channel — sanity-check target_cnr sits in the same units.
-            _cnr_norm = ("ONLINE baseline-normalization ON (faro raw cnr -> cnr_median_norm)"
-                         if cnr_mode == "norm"
-                         else "ONLINE normalization OFF (feeding raw cnr_median directly)")
+
+def load_model(checkpoint_dir: str, device: str, cache: dict | None = None) -> ModelHandle:
+    """Load a bundle into an eval-mode model. Raises on failure — callers decide
+    whether to degrade to the stub.
+
+    ``cache`` (keyed by ``(checkpoint_dir, device)``) lets several FOV policies
+    share one loaded model and one warmup instead of paying for a copy each.
+    """
+    key = (checkpoint_dir, device)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    from optoerk.core.experiment import load_experiment
+
+    bundle = load_experiment(checkpoint_dir)
+    model = bundle.reconstruct_model()
+    dev = _resolve_device(device)
+    model.to(dev).eval()
+    mean, std = _load_norm_stats(model)
+    handle = ModelHandle(
+        model=model, mean=mean, std=std, device=dev,
+        info={
+            "model_type": bundle.model_type,
+            "checkpoint_dir": checkpoint_dir,
+            "device": str(dev),
+            "future_len": int(model.cfg.future_len),
+            "cnr_mode": getattr(model.cfg, "cnr_mode", "norm"),
+            "norm_channels": list(getattr(model.cfg, "norm_channels", [])) or DEFAULT_CHANNELS,
+        },
+    )
+    if cache is not None:
+        cache[key] = handle
+    return handle
+
+
+def describe_cnr_convention(handle: ModelHandle, cfg: ServerConfig) -> str:
+    """The load-bearing startup banner: which cnr convention this checkpoint
+    expects, so a raw-CNR model served with online normalization (or vice versa)
+    is obvious at a glance."""
+    cnr_mode = handle.info["cnr_mode"]
+    norm = (
+        "ONLINE baseline-normalization ON (faro raw cnr -> cnr_median_norm)"
+        if cnr_mode == "norm"
+        else "ONLINE normalization OFF (feeding raw cnr_median directly)"
+    )
+    return (
+        f"cnr_mode={cnr_mode!r} | {norm} | cnr z-score mean="
+        f"{float(handle.mean[CNR]):.4f} std={float(handle.std[CNR]):.4f}"
+    )
+
+
+def load_engine(
+    cfg: ServerConfig,
+    objective: Objective | None = None,
+    controller: Controller | None = None,
+    checkpoint_dir: str | None = ...,  # type: ignore[assignment]
+    cache: dict | None = None,
+):
+    """Return an ``(engine, info)`` pair. Falls back to the stub on any load failure.
+
+    ``objective``/``controller`` default to the ones implied by ``cfg`` (a ``hold``
+    at ``cfg.target_cnr``, searched by ``ConstantDoseSearch``), so the no-policy-file
+    path behaves exactly as before.
+    """
+    from optoerk.serving.objectives import hold
+
+    if checkpoint_dir is ...:
+        checkpoint_dir = cfg.checkpoint_dir
+    if objective is None:
+        objective = hold(cfg.target_cnr)
+    levels = dose_levels(cfg.min_exposure_ms, cfg.max_exposure_ms, cfg.n_candidates)
+    if controller is None:
+        from optoerk.serving.control import ConstantDoseSearch
+
+        controller = ConstantDoseSearch(levels)
+
+    calib = FluenceCalibration(cfg.instrument, cfg.stim_power_pct)
+    if checkpoint_dir:
+        try:
+            handle = load_model(checkpoint_dir, cfg.device, cache)
+            engine = RealModelEngine(handle, calib, cfg, objective, controller)
+            info = {"model_loaded": True, **handle.info,
+                    "objective": objective.describe(),
+                    "controller": controller.describe(),
+                    "control_horizon": engine.horizon}
             print(
-                f"[serving] cnr_mode={cnr_mode!r} | {_cnr_norm} | "
-                f"cnr z-score mean={float(mean[CNR]):.4f} std={float(std[CNR]):.4f} | "
-                f"target_cnr={cfg.target_cnr} (must be in the same cnr units)"
+                f"[serving] {describe_cnr_convention(handle, cfg)} | "
+                f"objective={objective.describe()} | controller={controller.name} | "
+                f"horizon={engine.horizon}"
             )
-            if cnr_mode == "raw" and cfg.dark_baseline:
+            if handle.info["cnr_mode"] == "raw" and cfg.dark_baseline:
                 print(
                     "[serving] NOTE: cnr_mode='raw' ignores dark_baseline/baseline_frames "
                     "(no online baseline to measure); cells are stimulated from frame 0."
                 )
-            if cfg.warmup and device.type == "cuda":
+            if cfg.control_horizon > handle.info["future_len"]:
+                print(
+                    f"[serving] NOTE: control_horizon={cfg.control_horizon} exceeds the "
+                    f"checkpoint's future_len={handle.info['future_len']}; clamped to "
+                    f"{engine.horizon}. Rolling further is untrained — retrain with a "
+                    f"larger future_len to actually look that far ahead."
+                )
+            if cfg.warmup and handle.device.type == "cuda":
                 warmup_engine(engine)
             return engine, info
         except Exception as e:  # noqa: BLE001 - degrade gracefully to the stub
             print(f"[serving] checkpoint load failed ({e!r}); using STUB policy")
-    engine = StubEngine(calib, cfg)
-    return engine, {"model_loaded": False, "policy": "stub", "checkpoint_dir": cfg.checkpoint_dir}
+    engine = StubEngine(calib, cfg, objective)
+    return engine, {"model_loaded": False, "policy": "stub",
+                    "checkpoint_dir": checkpoint_dir,
+                    "objective": objective.describe()}
 
 
 def warmup_engine(engine, batch_sizes: tuple[int, ...] = (1, 8, 32, 64)) -> None:
@@ -134,10 +221,10 @@ def warmup_engine(engine, batch_sizes: tuple[int, ...] = (1, 8, 32, 64)) -> None
         for n in batch_sizes:
             frames = [
                 CellFrame(state=CellState(), cnr_norm=1.0, fov_density=float(n),
-                          n_cells_200px=1.0)
+                          n_cells_200px=1.0, x=0.0, y=0.0)
                 for _ in range(n)
             ]
-            engine.decide(frames)
+            engine.decide(frames, GoalContext(fov=-1, timestep=0, cells=frames))
         dev = getattr(engine, "device", None)
         if dev is not None and dev.type == "cuda":
             torch.cuda.synchronize(dev)
@@ -147,21 +234,31 @@ def warmup_engine(engine, batch_sizes: tuple[int, ...] = (1, 8, 32, 64)) -> None
 
 
 # ---------------------------------------------------------------------------
-# real model engine
+# real model engine — also the "plant" the controllers drive
 # ---------------------------------------------------------------------------
 
+
 class RealModelEngine:
-    def __init__(self, model, mean, std, calib: FluenceCalibration, cfg: ServerConfig, device):
-        self.model = model
+    def __init__(
+        self,
+        handle: ModelHandle,
+        calib: FluenceCalibration,
+        cfg: ServerConfig,
+        objective: Objective,
+        controller: Controller,
+    ):
+        self.model = handle.model
         self.calib = calib
         self.cfg = cfg
-        self.device = device
-        self.mean = torch.tensor(mean, dtype=torch.float32, device=device)  # (C,)
-        self.std = torch.tensor(std, dtype=torch.float32, device=device)
+        self.objective = objective
+        self.controller = controller
+        self.device = handle.device
+        mean, std = handle.mean, handle.std
+        self.mean = torch.tensor(mean, dtype=torch.float32, device=self.device)  # (C,)
+        self.std = torch.tensor(std, dtype=torch.float32, device=self.device)
         self.mean_np = np.asarray(mean, np.float32)
         # Model's channel order; unsupplied channels default to the pop. mean.
-        self.channels = list(getattr(model.cfg, "norm_channels", []) or
-                             ["cnr", "u_t", "fov_density", "n_cells_200px"])
+        self.channels = list(getattr(self.model.cfg, "norm_channels", []) or DEFAULT_CHANNELS)
         # Optional server-side override of the optoRTK-expression channel: feed a
         # fixed raw value for every cell (ignoring the payload). Defaults to the
         # channel's population mean (history_norm_stats.json), i.e. neutral.
@@ -182,24 +279,62 @@ class RealModelEngine:
             )
         else:
             self.optortk_fed = None
-        self.num_layers = model.cfg.num_layers
-        self.hidden = model.cfg.hidden_dim
-        self.horizon = min(cfg.control_horizon, int(model.cfg.future_len))
-        # Candidate exposure grid (ms) -> fluence (mJ/cm2) -> standardized u_t.
-        ms_grid = np.linspace(cfg.min_exposure_ms, cfg.max_exposure_ms, cfg.n_candidates)
-        self.cand_ms = torch.tensor(ms_grid, dtype=torch.float32, device=device)  # (M,)
-        cand_flu = self.calib.ms_to_fluence(ms_grid)  # (M,) mJ/cm2
-        cand_flu_std = (cand_flu - float(mean[FLU])) / float(std[FLU])
-        self.cand_flu_std = torch.tensor(cand_flu_std, dtype=torch.float32, device=device)
-        self.target_std = (cfg.target_cnr - float(mean[CNR])) / float(std[CNR])
+        self.num_layers = self.model.cfg.num_layers
+        self.hidden = self.model.cfg.hidden_dim
+        # Rolling past the trained future_len is both untrained and an IndexError
+        # into sigma_step_bias_param, so the horizon is hard-capped by the model.
+        self.horizon = min(cfg.control_horizon, int(self.model.cfg.future_len))
+        self._flu_per_ms = calib.fluence_per_ms
+
+    # -- plant interface (what a Controller needs) -------------------------
+
+    def std_fluence(self, ms: torch.Tensor) -> torch.Tensor:
+        """exposure (ms) -> standardized ``u_t``, in torch, on the model's device."""
+        flu = ms.to(self.device) * self._flu_per_ms
+        return (flu - self.mean[FLU]) / self.std[FLU]
+
+    def denorm_cnr(self, pred_std: torch.Tensor) -> torch.Tensor:
+        """standardized CNR -> absolute CNR (the units objectives are written in)."""
+        return pred_std * self.std[CNR] + self.mean[CNR]
+
+    def rollout(self, h, c, cnr_fb, fut) -> torch.Tensor:
+        """Decoder-only rollout from a given (h, c); mirrors
+        ``Seq2ScalarHistory.forward`` (free-running feedback, no teacher forcing).
+        Returns standardized predicted CNR mean over the horizon, shape (B, F)."""
+        model = self.model
+        dh, dc = h, c
+        means = []
+        F = fut.shape[1]
+        for i in range(F):
+            flu_i = fut[:, i, :]                                  # (B, stim_dim=1)
+            dec_in = torch.cat([cnr_fb, flu_i], dim=-1).unsqueeze(1)
+            out, (dh, dc) = model.decoder(dec_in, (dh, dc))
+            h_step = out[:, -1, :]
+            if model.film_layer is not None:                     # default: none
+                gamma, beta = model.film_layer(flu_i)
+                if model.cfg.film == "output":
+                    h_step = gamma * h_step + beta
+                else:
+                    dh = gamma.unsqueeze(0) * dh + beta.unsqueeze(0)
+                    h_step = dh[-1]
+            sigma_bias = (
+                model.sigma_step_bias_param[i]
+                if model.sigma_step_bias_param is not None else 0.0
+            )
+            feats = model.trunk(torch.cat([h_step, flu_i], dim=-1))
+            pi, mu, _sigma = model.head(feats, sigma_bias=sigma_bias)
+            pred = (pi * mu).sum(dim=-1, keepdim=True)            # (B,1) std cnr
+            means.append(pred)
+            cnr_fb = pred
+        return torch.cat(means, dim=1)
+
+    # -- the frame step ----------------------------------------------------
 
     @torch.no_grad()
-    def decide(self, frames: list[CellFrame]) -> list[float]:
+    def decide(self, frames: list[CellFrame], ctx: GoalContext) -> list[float]:
         if not frames:
             return []
         N = len(frames)
-        M = self.cand_ms.shape[0]
-        model = self.model
         L, H = self.num_layers, self.hidden
 
         # --- raw per-frame channels, assembled by NAME in the model's channel
@@ -235,24 +370,16 @@ class RealModelEngine:
         # --- ADVANCE THE ENCODER BY EXACTLY ONE STEP -------------------------
         # nn.LSTM with a length-1 sequence and carried (h, c) == encoding the
         # whole causal past (verified equivalent to pack_padded full encode).
-        _, (h_new, c_new) = model.encoder.lstm(xs.unsqueeze(1), (h, c))  # (L, N, H)
+        _, (h_new, c_new) = self.model.encoder.lstm(xs.unsqueeze(1), (h, c))  # (L, N, H)
 
-        # --- control: score candidate exposures via the decoder rollout ------
+        # --- control: the objective says what we want, the controller finds it
         cnr_fb = xs[:, CNR : CNR + 1]  # (N,1) feedback = cnr at last real frame
-        # expand each cell across the M candidates -> batch of N*M rollouts.
-        h_b = h_new.repeat_interleave(M, dim=1)   # (L, N*M, H)
-        c_b = c_new.repeat_interleave(M, dim=1)
-        cnr_fb_b = cnr_fb.repeat_interleave(M, dim=0)              # (N*M, 1)
-        flu_b = self.cand_flu_std.repeat(N).unsqueeze(-1)          # (N*M, 1)
-        fut = flu_b.unsqueeze(1).expand(-1, self.horizon, -1)     # (N*M, horizon, 1) constant dose
+        best_ms = self.controller.solve(self, h_new, c_new, cnr_fb, self.objective, ctx)
 
-        pred_std = self._rollout(h_b, c_b, cnr_fb_b, fut)          # (N*M, horizon) std cnr
-        cost = ((pred_std - self.target_std) ** 2).mean(dim=1)     # (N*M,)
-        cost = cost.view(N, M)
-        best = torch.argmin(cost, dim=1)                          # (N,)
-        best_ms = self.cand_ms[best]                              # (N,)
-
-        # --- persist new encoder state + commanded fluence -------------------
+        # --- persist new encoder state + the APPLIED fluence ------------------
+        # Only u[0] is applied; the rest of the optimized plan is discarded and
+        # re-planned next frame (receding horizon). Persisting anything but the
+        # applied dose would corrupt the u_t channel at the next encoder step.
         out_ms: list[float] = []
         for i, f in enumerate(frames):
             f.state.h = h_new[:, i : i + 1].detach().clone()
@@ -262,57 +389,40 @@ class RealModelEngine:
             out_ms.append(ms)
         return out_ms
 
-    def _rollout(self, h, c, cnr_fb, fut) -> torch.Tensor:
-        """Decoder-only rollout from a given (h, c); mirrors
-        ``Seq2ScalarHistory.forward`` (free-running feedback, no teacher forcing).
-        Returns standardized predicted CNR mean over the horizon, shape (B, F)."""
-        model = self.model
-        dh, dc = h, c
-        means = []
-        F = fut.shape[1]
-        for i in range(F):
-            flu_i = fut[:, i, :]                                  # (B, stim_dim=1)
-            dec_in = torch.cat([cnr_fb, flu_i], dim=-1).unsqueeze(1)
-            out, (dh, dc) = model.decoder(dec_in, (dh, dc))
-            h_step = out[:, -1, :]
-            if model.film_layer is not None:                     # default: none
-                gamma, beta = model.film_layer(flu_i)
-                if model.cfg.film == "output":
-                    h_step = gamma * h_step + beta
-                else:
-                    dh = gamma.unsqueeze(0) * dh + beta.unsqueeze(0)
-                    h_step = dh[-1]
-            sigma_bias = (
-                model.sigma_step_bias_param[i]
-                if model.sigma_step_bias_param is not None else 0.0
-            )
-            feats = model.trunk(torch.cat([h_step, flu_i], dim=-1))
-            pi, mu, _sigma = model.head(feats, sigma_bias=sigma_bias)
-            pred = (pi * mu).sum(dim=-1, keepdim=True)            # (B,1) std cnr
-            means.append(pred)
-            cnr_fb = pred
-        return torch.cat(means, dim=1)
-
 
 # ---------------------------------------------------------------------------
 # stub engine (no model) — deterministic, runnable before a checkpoint exists
 # ---------------------------------------------------------------------------
 
-class StubEngine:
-    """Proportional placeholder: dose up cells whose CNR is below target."""
 
-    def __init__(self, calib: FluenceCalibration, cfg: ServerConfig):
+class StubEngine:
+    """Proportional placeholder: dose up cells whose CNR is below target.
+
+    It has no model, so it cannot evaluate an arbitrary objective's cost — it
+    tracks ``cfg.target_cnr`` regardless of which objective is configured. It does
+    honour the objective's :meth:`~optoerk.serving.objectives.Objective.allow_stim`
+    gate, so "which cells may be stimulated" behaves identically to the real
+    engine. This is an integration placeholder, not a research artifact.
+    """
+
+    def __init__(self, calib: FluenceCalibration, cfg: ServerConfig,
+                 objective: Objective | None = None):
         self.calib = calib
         self.cfg = cfg
+        self.objective = objective
         self.optortk_fed: float | None = None  # stub ignores the optoRTK channel
 
-    def decide(self, frames: list[CellFrame]) -> list[float]:
+    def decide(self, frames: list[CellFrame], ctx: GoalContext) -> list[float]:
         cfg = self.cfg
+        mask = self.objective.allow_stim(ctx) if self.objective is not None else None
         out: list[float] = []
-        for f in frames:
-            deficit = max(0.0, cfg.target_cnr - f.cnr_norm)
-            ms = cfg.stub_gain_ms_per_cnr * deficit
-            ms = float(np.clip(ms, cfg.min_exposure_ms, cfg.max_exposure_ms))
+        for i, f in enumerate(frames):
+            if mask is not None and not bool(mask[i]):
+                ms = 0.0
+            else:
+                deficit = max(0.0, cfg.target_cnr - f.cnr_norm)
+                ms = float(np.clip(cfg.stub_gain_ms_per_cnr * deficit,
+                                   cfg.min_exposure_ms, cfg.max_exposure_ms))
             f.state.last_fluence = float(self.calib.ms_to_fluence(ms))
             out.append(ms)
         return out
