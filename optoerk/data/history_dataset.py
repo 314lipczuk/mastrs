@@ -161,9 +161,23 @@ class HistoryDataset(Dataset):
     ):
         self.cnr = cnr
         self.feats = feats
-        self.idx = np.asarray(indices, dtype=np.int64)
         self.F = F
         self.t_min = t_min
+        # Drop tracks too short to yield a full sample: a prediction point needs
+        # at least t_min frames of context and a full F-length future ahead, so
+        # T >= F + t_min. At small F every track qualifies; at large F (e.g. 30)
+        # the shortest tracks (~37 frames) can't and would otherwise produce a
+        # truncated <F target that breaks batch stacking.
+        idx = np.asarray(indices, dtype=np.int64)
+        lengths = np.array([len(cnr[c]) for c in idx])
+        keep = lengths >= F + t_min
+        if not keep.all():
+            print(
+                f"[history_dataset] dropping {int((~keep).sum())}/{len(idx)} tracks "
+                f"shorter than F+t_min={F + t_min} (min kept len "
+                f"{int(lengths[keep].min()) if keep.any() else 0})"
+            )
+        self.idx = idx[keep]
         self.p_concat = p_concat
         self.break_min = break_min
         self.break_max = break_max
@@ -245,7 +259,10 @@ class HistoryDataset(Dataset):
             fut_flu = X[tau : tau + F, FLU_IDX]              # copy-2 future == original
             tgt = X[tau : tau + F, CNR_IDX]
         else:
-            t_hi = max(t_min, T - F)
+            # t + F <= T is guaranteed: tracks shorter than F + t_min are dropped
+            # at construction (see __init__), so t_hi = T - F >= t_min and the
+            # future slice X[t:t+F] is always full length F.
+            t_hi = T - F
             t = int(rng.integers(t_min, t_hi + 1))
             ctx = X[0:t]
             fut_flu = X[t : t + F, FLU_IDX]
