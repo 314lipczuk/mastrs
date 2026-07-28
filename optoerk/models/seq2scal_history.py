@@ -326,7 +326,10 @@ class Seq2ScalarHistory(nn.Module):
         train_collate = make_history_collate(f_min, f_max, seed=tcfg.seed)
 
         if tcfg.use_stratified_sampler:
-            resp = np.array([float(np.std(np.asarray(c))) for c in cnr_tr])
+            # Align response weights to the dataset's kept tracks: HistoryDataset
+            # may drop tracks shorter than F+t_min, so index cnr_tr by train_ds.idx
+            # (== arange when nothing is dropped) to keep sampler positions valid.
+            resp = np.array([float(np.std(np.asarray(cnr_tr[c]))) for c in train_ds.idx])
             train_loader = DataLoader(
                 train_ds, batch_size=tcfg.batch_size,
                 sampler=_response_sampler(resp, tcfg.n_strata),

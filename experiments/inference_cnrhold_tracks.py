@@ -1382,6 +1382,9 @@ def _(FOV_META, mo, np, pl, timing):
             "handler_med_ms", "handler_p95_ms", "handler_max_ms",
         ).round(1)
     )
+
+    tbl = _tbl
+
     mo.ui.table(_tbl, selection=None)
     return
 
