@@ -1,0 +1,68 @@
+# 9-FOV controller comparison on the raw-CNR model.
+#
+# 3 conditions x 3 replicates. Every FOV loads the SAME raw-cnr checkpoint and
+# targets the SAME absolute CNR (1.2, in cnr_median units — this is a cnr_mode
+# "raw" model, so no baseline normalization; 1.2 is an elevated setpoint over the
+# cells' resting cnr_median of ~0.7-0.8). The ONLY thing that varies across the
+# three conditions is the controller:
+#
+#   condition A (fov 0,1,2)  -> constant_dose    (baseline: best flat dose held)
+#   condition B (fov 3,4,5)  -> sequence_mpc     (true receding-horizon MPC)
+#   condition C (fov 6,7,8)  -> staggered_mpc    (MPC, stimulate every 4 min)
+#
+# FOVs are assigned in contiguous blocks; renumber the [fov.N] sections to match
+# your physical stage layout if the scope interleaves conditions.
+#
+# Because the checkpoint + objective + control_horizon live in [default], every
+# FOV inherits them and only names its controller. One checkpoint is loaded once
+# and shared across all 9 FOVs (models are cached by (checkpoint, device)).
+#
+# Run:
+#   uv run python -m optoerk.serving.app --port 8080 --device cuda \
+#       --policy-file policy_9fov_raw.toml --predict-log run.jsonl
+
+[default]
+# EDIT to the raw-cnr bundle's path on the serving host. On the cluster this is
+# under results_write_path(); the bundle dir seen during development was
+# `seq2scal_history_raw_cnr_2026-07-19_12.34.57`.
+
+checkpoint = "seq2scal_history_raw_cnr_2026-07-19_12.34.57"
+
+# Shared goal: hold absolute cnr_median at 1.2 for every FOV.
+objective = { type = "hold", target_cnr = 1.2 }
+
+# Shared lookahead. Clamped to the checkpoint's future_len at load time; with
+# staggered_mpc k=4 a horizon of 8 puts two of the cell's own ticks (offsets 0
+# and 4) inside the plan. Also used by conditions A and B, so the comparison is
+# at a matched horizon.
+control_horizon = 8
+
+# Fallback for any FOV not listed below (none, here) — mirror condition A.
+controller = { type = "constant_dose" }
+
+# --- Condition A: constant-dose search -------------------------------------
+[fov.0]
+controller = { type = "constant_dose" }
+[fov.1]
+controller = { type = "constant_dose" }
+[fov.2]
+controller = { type = "constant_dose" }
+
+# --- Condition B: sequence MPC ---------------------------------------------
+[fov.3]
+controller = { type = "sequence_mpc" }
+[fov.4]
+controller = { type = "sequence_mpc" }
+[fov.5]
+controller = { type = "sequence_mpc" }
+
+# --- Condition C: staggered cadence MPC, stimulate every 4 min -------------
+# dt = 1 min/frame, so "every 4 minutes" is k = 4. Cells split into 4 phase
+# groups (particle % 4); each is stimulated on its own every-4th frame, and only
+# ~1/4 of the population runs the search on any given frame.
+[fov.6]
+controller = { type = "staggered_mpc", k = 4 }
+[fov.7]
+controller = { type = "staggered_mpc", k = 4 }
+[fov.8]
+controller = { type = "staggered_mpc", k = 4 }

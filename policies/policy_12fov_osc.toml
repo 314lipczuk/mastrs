@@ -1,0 +1,170 @@
+# 12-FOV oscillation-tracking comparison on the raw-CNR F=30 model.
+#
+# 4 arms x 3 replicates. Every FOV loads the SAME checkpoint, tracks the SAME
+# oscillating reference, and searches the SAME dose ladder at the SAME horizon.
+# The arms are NESTED — each adds exactly one thing over the previous:
+#
+#   arm 1  constant_dose   L2 kernel    no move penalty   (baseline: best flat dose)
+#   arm 2  sequence_mpc    L2 kernel    no move penalty   (adds planning)
+#   arm 3  sequence_mpc    L2 kernel    move penalty ON   (adds move suppression)
+#   arm 4  sequence_mpc    band kernel  move penalty ON   (adds distributional cost)
+#
+# 1->2 isolates planning. 2->3 isolates move suppression. 3->4 isolates the
+# distributional cost. Nothing else may differ between adjacent arms.
+#
+# The reference lives in [default] and each FOV overrides only `controller`,
+# `kernel` and `lambda_move`. That is structural, not stylistic: `objective` is
+# replaced wholesale on override, so restating the waveform in twelve blocks
+# would let a single typo desynchronize one arm's reference and silently void the
+# comparison. `kernel` / `lambda_move` compose onto the inherited objective
+# instead, so an arm can only vary what an arm is allowed to vary.
+#
+# NOTE: cnr_mode is NOT set here. It is a property of the checkpoint (this one is
+# "raw"), read from the bundle at load time and printed in the startup banner. A
+# second copy in the policy file would be a second source of truth for something
+# the model already knows.
+#
+# Run:
+#   uv run python -m optoerk.serving.app --port 8080 --device cuda \
+#       --policy-file policies/policy_12fov_osc.toml --predict-log run.jsonl
+
+
+# --- PLACEHOLDER GATE -------------------------------------------------------
+# Every value tagged "PLACEHOLDER" below is a working assumption for wiring and
+# tests, NOT a measured value for the real run. The server refuses to start while
+# this is false. Fill in the real values from the sources listed against each one,
+# then set this to true. Twelve hours of scope time against a placeholder is not
+# recoverable.
+placeholders_resolved = false
+
+
+[default]
+
+# The F=30 raw-CNR checkpoint. VERIFIED 2026-07-29: future_len = 30,
+# cnr_mode = "raw", 3 mixture components, cnr z-score mean 0.8220 / std 0.3322,
+# norm_channels = [cnr, u_t, fov_density, n_cells_200px, optortk_expr].
+# The two sibling runs from the same evening (19.57.14, 20.12.46) have no
+# bundle.pt — they failed. This is the only loadable F=30 bundle.
+checkpoint = "seq2scal_history_raw_cnr_f30_2026-07-27_20.18.46"
+
+# Matched across all four arms. 30 frames = 30 min at the 1-frame-per-minute
+# acquisition grid, and equals the checkpoint's future_len, so it is not clamped.
+control_horizon = 30
+
+# PLACEHOLDER — source: Jungfrau hold-strata analysis (rebinned dose ladder).
+# The ladder is deliberately non-uniform and therefore cannot be expressed as
+# (min_exposure_ms, max_exposure_ms, n_candidates); it is set here per policy.
+# The move penalty normalizes by this ladder's max, so rebinning it does not
+# rescale lambda_move.
+levels_ms = [0, 20, 45, 85, 150]
+
+# The oscillating reference. Identical for every FOV — it is a property of the
+# experiment, not of an arm.
+#
+#   PLACEHOLDER low / high  — source: Jungfrau per-cell reachable-ceiling
+#     distribution. Resting cnr_median is ~0.82 (the checkpoint's own z-score
+#     mean), so low = 0.85 sits just above rest and high = 1.15 is an elevated
+#     but plausibly reachable setpoint. Amplitude (half of peak-to-peak) = 0.15.
+#   PLACEHOLDER segment durations — source: D6 refit with right-censoring, which
+#     sets tau_decay_min and hence the admissible period band.
+#   PLACEHOLDER tau_decay_min — source: D6 refit. 7.3 is the CURRENT median,
+#     which the refit is expected to RAISE.
+#
+# Period = 8 + 2 + 15 + 15 = 40 min. Both bounds are checked at startup:
+#   lower (plant):      period >= 4 x tau  ->  40 >= 29.2   OK
+#                       t_fall >= 1.5 x tau ->  15 >= 11.0  OK
+#   upper (controller): period <= 2 x horizon -> 40 <= 60   OK
+# The rise is short (dose-limited, let the controller go as fast as it can); the
+# fall is sized at ~2 x tau because falls are decay-limited and not adjustable.
+#
+# HEADROOM WARNING: the upper bound binds at tau = 10.0 min (6 x tau = 60 = 2H).
+# If the D6 refit puts tau above ~10 min the two bounds cross at this horizon and
+# there is no admissible period. That is not a number to pick quietly — it means
+# either extending the horizon (needs a checkpoint with a larger future_len) or
+# accepting a partly untrackable reference by design. Escalate.
+objective = { type = "oscillation", low = 0.85, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15, tau_decay_min = 7.3, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+
+# Fallback for any FOV not listed below (none, here) — mirror arm 1.
+controller = { type = "constant_dose" }
+kernel = "l2"
+lambda_move = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Arms, INTERLEAVED across FOV positions: arm = (fov % 4) + 1
+#
+#   FOV  0 1 2 3 4 5 6 7 8 9 10 11
+#   arm  1 2 3 4 1 2 3 4 1 2  3  4
+#
+# Not contiguous blocks. FOV index typically follows stage position, so blocking
+# would align each arm with a contiguous plate region and maximally confound arm
+# with any spatial gradient in illumination, temperature or media depth.
+# Interleaving does not remove the FOV confound — the controller is still
+# FOV-locked — but it stops the confound being systematic across the plate. It
+# also permutes positions relative to the hold run (blocked 0-2 / 3-5 / 6-8),
+# which is what makes the two runs comparable over time.
+#
+# PLACEHOLDER lambda_move = 0.6 — source: offline held-out-model screen.
+# PLACEHOLDER half_width  = 0.05 — source: offline, ~1/3 of the reference
+#   amplitude (0.15). Must straddle the achievable tracking error: verify offline
+#   that band scores SPREAD across candidate plans rather than saturating at 0 or
+#   1. A flat band cost means arm 4 measures nothing.
+# ---------------------------------------------------------------------------
+
+# --- arm 1: constant dose, L2, no move penalty ------------------------------
+[fov.0]
+controller = { type = "constant_dose" }
+kernel = "l2"
+lambda_move = 0.0
+[fov.4]
+controller = { type = "constant_dose" }
+kernel = "l2"
+lambda_move = 0.0
+[fov.8]
+controller = { type = "constant_dose" }
+kernel = "l2"
+lambda_move = 0.0
+
+# --- arm 2: sequence MPC, L2, no move penalty -------------------------------
+# Must be bit-for-bit the existing controller. Guarded by
+# tests/test_serving_control.py::test_refactor_reproduces_the_pre_refactor_controller
+[fov.1]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.0
+[fov.5]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.0
+[fov.9]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.0
+
+# --- arm 3: sequence MPC, L2, move penalty ON -------------------------------
+[fov.2]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.6
+[fov.6]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.6
+[fov.10]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.6
+
+# --- arm 4: sequence MPC, band kernel, move penalty ON ----------------------
+[fov.3]
+controller = { type = "sequence_mpc" }
+kernel = { type = "band", half_width = 0.05 }
+lambda_move = 0.6
+[fov.7]
+controller = { type = "sequence_mpc" }
+kernel = { type = "band", half_width = 0.05 }
+lambda_move = 0.6
+[fov.11]
+controller = { type = "sequence_mpc" }
+kernel = { type = "band", half_width = 0.05 }
+lambda_move = 0.6

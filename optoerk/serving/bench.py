@@ -46,7 +46,7 @@ from optoerk.serving.control import (
     StaggeredCadenceMPC,
     dose_levels,
 )
-from optoerk.serving.objectives import GoalContext, hold
+from optoerk.serving.objectives import GoalContext, build_objective, hold
 from optoerk.serving.runtime import (
     CellFrame,
     ModelHandle,
@@ -145,6 +145,76 @@ def _build_controllers(levels, mpc_samples, stagger_k):
     return variants
 
 
+def arm_sweep(
+    device: str = "auto",
+    checkpoint: str | None = None,
+    horizon: int = 30,
+    cell_counts: tuple[int, ...] = (64, 208, 512),
+    levels_ms: tuple[float, ...] = (0.0, 20.0, 45.0, 85.0, 150.0),
+    n_samples: int = 512,
+    lambda_move: float = 0.6,
+    band_half_width: float = 0.05,
+    n_fovs: int = 12,
+) -> pl.DataFrame:
+    """Time the four nested arms of the 12-FOV oscillation run, as configured.
+
+    The arms differ in cost *kernel* and in whether the move penalty is on, and
+    the band kernel adds a mixture rollout plus CDF evaluations inside every CEM
+    iteration — so their latencies are not interchangeable and the run's budget
+    has to be checked against the slowest, not the first.
+
+    ``n_fovs`` only sets the reported inter-arrival budget (a faro frame is 60 s
+    shared across all FOVs), it does not change what is timed.
+    """
+    dev = _resolve_device(device)
+    base = ServerConfig(device=device, warmup=False, control_horizon=horizon)
+    calib = FluenceCalibration(base.instrument, base.stim_power_pct)
+    levels = np.asarray(levels_ms, dtype=np.float64)
+
+    osc = dict(type="oscillation", low=0.85, high=1.15, t_low_min=8,
+               t_rise_min=2, t_high_min=15, t_fall_min=15, tau_decay_min=7.3,
+               settle_periods=2, n_phase_groups=4, frame_interval_min=1.0)
+    arms = [
+        (1, "constant_dose", ConstantDoseSearch(levels), "l2", 0.0),
+        (2, "sequence_mpc", SequenceMPC(levels, n_samples=n_samples), "l2", 0.0),
+        (3, "sequence_mpc", SequenceMPC(levels, n_samples=n_samples), "l2", lambda_move),
+        (4, "sequence_mpc", SequenceMPC(levels, n_samples=n_samples),
+         {"type": "band", "half_width": band_half_width}, lambda_move),
+    ]
+
+    if checkpoint:
+        handle = load_model(checkpoint, device)
+        if horizon > handle.info["future_len"]:
+            raise ValueError(
+                f"horizon {horizon} exceeds the checkpoint's future_len "
+                f"{handle.info['future_len']}"
+            )
+    else:
+        handle = synthetic_handle(horizon, dev)
+
+    budget_s = 60.0 / n_fovs
+    rows = []
+    for arm, ctrl_name, ctrl, kernel, lam in arms:
+        objective = build_objective({**osc, "kernel": kernel, "lambda_move": lam})
+        engine = RealModelEngine(handle, calib, base, objective, ctrl)
+        for n in cell_counts:
+            secs, peak, n_searched = time_per_frame(engine, n)
+            rows.append({
+                "arm": arm, "controller": ctrl_name,
+                "kernel": kernel if isinstance(kernel, str) else kernel["type"],
+                "lambda_move": lam, "horizon": horizon, "n_cells": n,
+                "seconds": round(secs, 4),
+                "ms_per_frame": round(secs * 1000, 1),
+                "per_fov_budget_pct": round(100 * secs / budget_s, 1),
+                "device": str(dev),
+            })
+            print(f"[bench] arm {arm} {ctrl_name:14s} kernel="
+                  f"{rows[-1]['kernel']:4s} lam={lam:.2f} n={n:4d} -> "
+                  f"{secs*1000:8.1f} ms ({100*secs/budget_s:.1f}% of the "
+                  f"{budget_s:.1f} s per-FOV budget at {n_fovs} FOVs)")
+    return pl.DataFrame(rows)
+
+
 def sweep(
     device: str = "auto",
     checkpoint: str | None = None,
@@ -226,7 +296,34 @@ def main():
                    help="FOV size for the per-FOV summary table (v5 run was ~208)")
     p.add_argument("--out", default=None, help="write the results parquet here")
     p.add_argument("--plot", default=None, help="write a PNG of seconds vs horizon")
+    p.add_argument("--arms", action="store_true",
+                   help="time the four nested arms of the 12-FOV oscillation run "
+                        "instead of the full controller sweep")
+    p.add_argument("--horizon", type=int, default=30,
+                   help="--arms only: the matched control horizon")
+    p.add_argument("--levels-ms", dest="levels_ms", default="0,20,45,85,150",
+                   help="--arms only: the dose ladder")
+    p.add_argument("--n-fovs", dest="n_fovs", type=int, default=12,
+                   help="--arms only: FOV count, for the inter-arrival budget")
     args = p.parse_args()
+
+    if args.arms:
+        df = arm_sweep(
+            device=args.device,
+            checkpoint=args.checkpoint,
+            horizon=args.horizon,
+            cell_counts=tuple(int(x) for x in args.cells.split(",")),
+            levels_ms=tuple(float(x) for x in args.levels_ms.split(",")),
+            n_samples=max(int(x) for x in args.mpc_samples.split(",")),
+            n_fovs=args.n_fovs,
+        )
+        print(f"\n=== per-arm latency, H={args.horizon}, {args.n_fovs} FOVs ===")
+        with pl.Config(tbl_rows=-1):
+            print(df)
+        if args.out:
+            df.write_parquet(args.out)
+            print(f"[bench] wrote {args.out}")
+        return
 
     df = sweep(
         device=args.device,

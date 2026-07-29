@@ -39,7 +39,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from optoerk.serving.objectives import GoalContext, Objective
+from optoerk.serving.objectives import GoalContext, Objective, Prediction
 
 
 def dose_levels(min_ms: float, max_ms: float, n: int) -> np.ndarray:
@@ -71,25 +71,82 @@ class Controller:
     def describe(self) -> dict[str, Any]:
         return {"type": self.name}
 
+    @property
+    def max_ms(self) -> float:
+        """The ladder's top rung, used to normalize the dose for the plan-side
+        regularizers.
+
+        Deliberately the **ladder** max rather than ``cfg.max_exposure_ms``: it is
+        what keeps ``lambda_move`` meaning the same thing after the ladder is
+        rebinned (0-800 ms -> 0-150 ms would otherwise rescale the penalty ~28x).
+        An all-zero ladder normalizes by 1.0 rather than dividing by zero; every
+        plan is then 0 and the penalties vanish, which is correct.
+        """
+        m = float(np.max(np.abs(self.levels_ms)))
+        return m if m > 0 else 1.0
+
     # -- shared helpers ----------------------------------------------------
 
-    @staticmethod
+    def _prev_norm(self, ctx: GoalContext, device) -> torch.Tensor:
+        """(N,) the normalized dose actually applied to each cell last frame.
+
+        This is ``u_{-1}`` for :class:`~optoerk.serving.objectives.MovePenalty`.
+        Read from per-cell state rather than taken as ``u[0]``, so the first move
+        of a plan is not free. A cell's first frame and a freshly seeded daughter
+        both report 0.0 — see ``CellState.last_applied_ms``.
+        """
+        return torch.tensor(
+            [float(f.state.last_applied_ms) / self.max_ms for f in ctx.cells],
+            dtype=torch.float32, device=device,
+        )
+
     @torch.no_grad()
-    def _score(plant, h, c, cnr_fb, fut_ms_std, objective, ctx) -> torch.Tensor:
+    def _score(self, plant, h, c, cnr_fb, fut_ms_std, plan_ms, objective, ctx) -> torch.Tensor:
         """Evaluate a batch of dose plans.
 
         ``fut_ms_std``: (N, S, H) standardized fluence per cell / plan / step.
-        Returns (N, S) cost from the objective, with predictions denormalized to
-        absolute CNR first (objectives are written in CNR units, never z-scores).
+        ``plan_ms``:    (N, S, H) the same plans in raw exposure ms, which the
+        plan-side regularizers need (the standardized fluence is not a dose scale
+        they can normalize). ``None`` when the objective has no regularizers.
+
+        Returns (N, S) cost from the objective. Predictions are denormalized to
+        absolute CNR first — objectives are written in CNR units, never z-scores.
+
+        Two things are built only when something actually reads them: the
+        predictive **mixture** (``needs_mixture``, i.e. a distributional kernel)
+        and the **dose plan** (``needs_plan``, i.e. any regularizer). An
+        objective with neither — ``constant`` + ``l2``, the pre-refactor
+        controller — allocates nothing beyond what it always did.
         """
         N, S, H = fut_ms_std.shape
         h_b = h.repeat_interleave(S, dim=1)              # (L, N*S, H_hidden)
         c_b = c.repeat_interleave(S, dim=1)
         fb_b = cnr_fb.repeat_interleave(S, dim=0)        # (N*S, 1)
         fut_b = fut_ms_std.reshape(N * S, H, 1)
-        pred_std = plant.rollout(h_b, c_b, fb_b, fut_b)  # (N*S, H) standardized
-        pred_cnr = plant.denorm_cnr(pred_std).view(N, S, H)
-        return objective.cost(pred_cnr, ctx)             # (N, S)
+
+        pi = mu = sigma = None
+        if objective.needs_mixture:
+            pred_std, pi_s, mu_s, sigma_s = plant.rollout_mixture(h_b, c_b, fb_b, fut_b)
+            K = pi_s.shape[-1]
+            pi = pi_s.view(N, S, H, K)
+            # De-standardize the components into absolute CNR, the units the
+            # reference and the band half-width are written in.
+            mu = plant.denorm_cnr(mu_s).view(N, S, H, K)
+            sigma = plant.denorm_sigma(sigma_s).view(N, S, H, K)
+        else:
+            pred_std = plant.rollout(h_b, c_b, fb_b, fut_b)  # (N*S, H) standardized
+
+        plan_norm = prev_norm = None
+        if plan_ms is not None:
+            plan_norm = plan_ms / self.max_ms
+            prev_norm = self._prev_norm(ctx, fut_ms_std.device)
+
+        pred = Prediction(
+            cnr=plant.denorm_cnr(pred_std).view(N, S, H),
+            plan_norm=plan_norm, prev_norm=prev_norm,
+            pi=pi, mu=mu, sigma=sigma,
+        )
+        return objective.cost(pred, ctx)                 # (N, S)
 
     @staticmethod
     def _apply_gate(ms: torch.Tensor, objective: Objective, ctx: GoalContext) -> torch.Tensor:
@@ -114,7 +171,10 @@ class ConstantDoseSearch(Controller):
         M, H = levels.shape[0], plant.horizon
         std = plant.std_fluence(levels)                          # (M,)
         fut = std.view(1, M, 1).expand(N, M, H)                  # constant over H
-        cost = self._score(plant, h, c, cnr_fb, fut, objective, ctx)
+        plan_ms = (
+            levels.view(1, M, 1).expand(N, M, H) if objective.needs_plan else None
+        )
+        cost = self._score(plant, h, c, cnr_fb, fut, plan_ms, objective, ctx)
         best_cost, best = cost.min(dim=1)                        # (N,)
         return levels[best], best_cost
 
@@ -214,7 +274,11 @@ class SequenceMPC(Controller):
                 idx[:, :, non_stim] = zero_idx
 
             fut = std_levels[idx]                                             # (N,S+L,H)
-            cost = self._score(plant, h, c, cnr_fb, fut, objective, ctx)      # (N,S+L)
+            # Second gather only when a regularizer will read it.
+            plan_ms = levels[idx] if objective.needs_plan else None            # (N,S+L,H)
+            cost = self._score(
+                plant, h, c, cnr_fb, fut, plan_ms, objective, ctx
+            )                                                                 # (N,S+L)
 
             # Track the global best plan's first action across all iterations.
             it_cost, it_arg = cost.min(dim=1)

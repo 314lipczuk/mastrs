@@ -72,6 +72,14 @@ class ServerConfig:
     control_horizon: int = 5         # frames to look ahead when scoring a dose
     n_candidates: int = 5           # exposure grid resolution (0..max_exposure_ms)
 
+    # Acquisition cadence. The training data is built on a 1-frame = 1-minute grid
+    # (``preprocessing.add_stim_features``), so this is 1.0 for every dataset so
+    # far. It is explicit because time-parameterized references (the oscillation
+    # step train) are configured in *minutes* while the horizon is in *frames*,
+    # and the bound relating them is load-bearing: get this wrong and the startup
+    # period check passes on a period the controller cannot actually see.
+    frame_interval_min: float = 1.0
+
     # --- exposure output bounds (faro contract) ---------------------------
     min_exposure_ms: float = 0.0
     max_exposure_ms: float = 800.0

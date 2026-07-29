@@ -32,6 +32,13 @@ class CellState:
     c: torch.Tensor | None = None
     # last commanded fluence (mJ/cm2) -> u_t input for the next encoder step.
     last_fluence: float = 0.0
+    # last commanded exposure (ms) -> u_{-1} for the move penalty. Held in ms
+    # because the penalty normalizes by the dose ladder's max ms; recovering it
+    # from last_fluence would make it depend on the power calibration. Unlike the
+    # encoder state and the baseline, this is deliberately NOT inherited by a
+    # seeded daughter (see StateStore.get_or_create): a daughter has applied no
+    # dose of its own yet, so its first move is measured from zero.
+    last_applied_ms: float = 0.0
     # online CNR baseline (median of first `baseline_frames` cnr_median values).
     baseline_samples: list[float] = field(default_factory=list)
     baseline: float | None = None
@@ -126,6 +133,11 @@ class StateStore:
                     st.baseline_samples = list(pst.baseline_samples)
                     st.baseline = pst.baseline
                     st.last_cnr_norm = pst.last_cnr_norm
+                    # NOTE: last_applied_ms is deliberately NOT copied. The mother's
+                    # dose is the right u_t model input for the daughter's encoder
+                    # (it is the light the daughter's lineage actually saw), but it
+                    # is not a dose the daughter was itself commanded, so the move
+                    # penalty measures its first move from zero.
             # The daughter carries its OWN particle id (its cadence phase), not the
             # mother's — a division must not put both cells in the same slot.
             st.particle = particle

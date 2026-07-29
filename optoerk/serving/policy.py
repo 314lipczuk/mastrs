@@ -37,11 +37,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from optoerk.serving.config import ServerConfig
 from optoerk.serving.control import build_controller, dose_levels
-from optoerk.serving.objectives import build_objective
+from optoerk.serving.objectives import PolicyViolation, build_objective
 
 
 class PolicySpec(BaseModel):
@@ -52,6 +53,27 @@ class PolicySpec(BaseModel):
     controller: dict[str, Any] | None = None
     # Per-FOV lookahead override. Still hard-capped by the checkpoint's future_len.
     control_horizon: int | None = None
+    # --- arm-varying pieces of the objective ------------------------------
+    # An objective decomposes into a reference (what to track), a cost kernel
+    # (how to score the prediction against it) and plan-side regularizers. In a
+    # controlled comparison the reference is a property of the EXPERIMENT and
+    # must be byte-identical across arms, while the kernel and the regularizer
+    # coefficients are exactly what the arms vary.
+    #
+    # ``objective`` is replaced wholesale on override (never deep-merged), so
+    # restating it per FOV would put that invariant at the mercy of a typo in one
+    # of twelve blocks. These three fields instead compose onto the inherited
+    # objective, so an arm can only change the parts an arm is allowed to change.
+    kernel: str | dict[str, Any] | None = None
+    lambda_move: float | None = None
+    lambda_dose: float | None = None
+    # Explicit dose ladder in ms. When None the ladder is the evenly-spaced grid
+    # implied by (min_exposure_ms, max_exposure_ms, n_candidates) on the config.
+    # A linspace cannot express a rebinned ladder like [0, 20, 45, 85, 150], and
+    # the ladder is an experiment parameter rather than a code constant, so it has
+    # to be settable here. Normally set once in [default] and shared by every FOV —
+    # arms that differ in their ladder are not comparable.
+    levels_ms: list[float] | None = None
 
 
 class PolicyFile(BaseModel):
@@ -59,6 +81,12 @@ class PolicyFile(BaseModel):
 
     default: PolicySpec = Field(default_factory=PolicySpec)
     fov: dict[int, PolicySpec] = Field(default_factory=dict)
+    # Guard for experiments whose real parameters are not known yet (dose ladder,
+    # setpoints, period, lambda_move, band half-width). A policy file ships with
+    # working assumptions so it can be wired and tested, and refuses to serve
+    # until whoever filled in the measured values flips this to true. Twelve hours
+    # of microscope time run against a placeholder is not recoverable.
+    placeholders_resolved: bool = True
 
 
 def load_policy_file(path: str | Path) -> PolicyFile:
@@ -82,7 +110,28 @@ def load_policy_file(path: str | Path) -> PolicyFile:
         str(fov): {**default_raw, **(spec or {})}
         for fov, spec in (raw.get("fov", {}) or {}).items()
     }
-    return PolicyFile(default=default_raw, fov=merged_fovs)
+    return PolicyFile(
+        default=default_raw,
+        fov=merged_fovs,
+        placeholders_resolved=bool(raw.get("placeholders_resolved", True)),
+    )
+
+
+def _objective_spec(spec: PolicySpec) -> dict[str, Any]:
+    """The inherited objective with this FOV's arm-varying pieces composed in.
+
+    Only the kernel and the regularizer coefficients can be set this way — the
+    reference comes from the inherited ``objective`` and is therefore identical
+    across every FOV sharing a ``[default]``.
+    """
+    out = dict(spec.objective or {})
+    if spec.kernel is not None:
+        out["kernel"] = spec.kernel
+    if spec.lambda_move is not None:
+        out["lambda_move"] = spec.lambda_move
+    if spec.lambda_dose is not None:
+        out["lambda_dose"] = spec.lambda_dose
+    return out
 
 
 class PolicyRouter:
@@ -92,6 +141,14 @@ class PolicyRouter:
         self.cfg = cfg
         self.policy_file = policy_file
         self._cache: dict = {}  # (checkpoint, device) -> ModelHandle
+        if policy_file is not None and not policy_file.placeholders_resolved:
+            raise PolicyViolation(
+                "policy file has placeholders_resolved = false: it still carries "
+                "working assumptions (dose ladder / setpoints / period / "
+                "lambda_move / band half-width) rather than measured values. "
+                "Fill them in from their stated sources and set "
+                "placeholders_resolved = true to serve."
+            )
         self.default_engine, self.default_info = self._build(
             policy_file.default if policy_file else PolicySpec(), label="default"
         )
@@ -107,19 +164,38 @@ class PolicyRouter:
         cfg = self.cfg
         if spec.control_horizon is not None:
             cfg = replace(cfg, control_horizon=spec.control_horizon)
-        levels = dose_levels(cfg.min_exposure_ms, cfg.max_exposure_ms, cfg.n_candidates)
+        levels = (
+            np.asarray(spec.levels_ms, dtype=np.float64)
+            if spec.levels_ms
+            else dose_levels(cfg.min_exposure_ms, cfg.max_exposure_ms, cfg.n_candidates)
+        )
         print(f"[serving] building policy for {label}")
         try:
-            objective = build_objective(spec.objective) if spec.objective else None
+            objective = (
+                build_objective(_objective_spec(spec)) if spec.objective else None
+            )
             controller = (
                 build_controller(spec.controller, levels) if spec.controller else None
             )
+        except PolicyViolation:
+            raise  # a misconfigured experiment stops the server, it does not degrade
         except Exception as e:  # noqa: BLE001 - one bad FOV must not sink the server
             print(f"[serving] policy for {label} is invalid ({e!r}); using STUB")
             objective, controller = None, None
             cfg = replace(cfg, checkpoint_dir=None)
         checkpoint = spec.checkpoint if spec.checkpoint is not None else cfg.checkpoint_dir
-        return load_engine(cfg, objective, controller, checkpoint, self._cache)
+        engine, info = load_engine(cfg, objective, controller, checkpoint, self._cache)
+        # Record what this FOV was ASKED to run, not only what it managed to build.
+        # A FOV that degraded to the stub previously logged `{"policy": "stub"}` and
+        # nothing else, so the hold run's controller assignment had to be recovered
+        # from the .toml afterwards. The requested spec makes the log self-contained.
+        info = {
+            **info,
+            "label": label,
+            "requested": spec.model_dump(exclude_none=True),
+            "levels_ms": [float(x) for x in levels],
+        }
+        return engine, info
 
     def engine_for(self, fov: int):
         return self.engines.get(fov, self.default_engine)

@@ -25,14 +25,18 @@ from optoerk.serving.state import StateStore
 
 
 class InferenceService:
-    def __init__(self, cfg: ServerConfig | None = None):
+    def __init__(self, cfg: ServerConfig | None = None, policy_file=None):
+        """``policy_file``: an already-parsed :class:`~optoerk.serving.policy.PolicyFile`
+        to use instead of loading ``cfg.policy_file`` from disk. Only the soak
+        benchmark passes this — it needs to run a policy whose placeholders are
+        still unresolved, which the router rightly refuses to load for a real run.
+        """
         self.cfg = cfg or ServerConfig()
         self.lock = threading.Lock()
         # One engine per distinct policy; FOVs without an override share the
         # default. With no policy file this is a single engine, as before.
-        policy_file = (
-            load_policy_file(self.cfg.policy_file) if self.cfg.policy_file else None
-        )
+        if policy_file is None and self.cfg.policy_file:
+            policy_file = load_policy_file(self.cfg.policy_file)
         self.router = PolicyRouter(self.cfg, policy_file)
         self.engine = self.router.default_engine
         self.info = self.router.default_info
@@ -274,9 +278,12 @@ class InferenceService:
             if dark:
                 # No stimulation while the resting baseline is being measured. Zero
                 # last_fluence too, so the next encoder step sees the true (zero)
-                # applied dose as its u_t input.
+                # applied dose as its u_t input — and last_applied_ms with it, so
+                # the move penalty measures the next move from the dose that was
+                # really applied rather than the one the controller proposed.
                 ms = 0.0
                 f.state.last_fluence = 0.0
+                f.state.last_applied_ms = 0.0
             f.state.last_timestep = timestep
             f.state.last_seen_timestep = timestep
             f.state.n_frames += 1
@@ -296,10 +303,21 @@ class InferenceService:
 
         if log_on:
             optortk = getattr(engine, "optortk_fed", None)
-            for rec, f, ms in zip(log_cells, frames, ms_list):
+            # What the controller was actually tracking this frame, per cell: r_t,
+            # and for an oscillating reference the segment label and the cell's
+            # phase offset. Emitted explicitly so the analysis never re-derives the
+            # waveform from parameters and gets it subtly wrong.
+            objective = getattr(engine, "objective", None)
+            notes = (
+                objective.annotate(goal_ctx)
+                if objective is not None and hasattr(objective, "annotate")
+                else [{}] * len(frames)
+            )
+            for rec, f, ms, note in zip(log_cells, frames, ms_list, notes):
                 rec["exposure_ms"] = float(0.0 if rec["dark"] else ms)
                 rec["fluence_out"] = float(f.state.last_fluence)
                 rec["optortk_expr"] = None if optortk is None else float(optortk)
+                rec.update(note)
             self._logger.write(
                 {
                     "t": time.time(),

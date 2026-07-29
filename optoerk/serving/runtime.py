@@ -31,7 +31,7 @@ import torch
 from optoerk.serving.calibration import FluenceCalibration
 from optoerk.serving.config import ServerConfig
 from optoerk.serving.control import Controller, dose_levels
-from optoerk.serving.objectives import GoalContext, Objective
+from optoerk.serving.objectives import GoalContext, Objective, PolicyViolation
 from optoerk.serving.state import CellState
 
 CNR = 0  # channel index of cnr (first in norm_channels: [cnr, u_t, ...])
@@ -68,6 +68,37 @@ def _resolve_device(device: str) -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _resolve_checkpoint(checkpoint_dir: str) -> str:
+    """Resolve a bundle name or path to a directory that exists.
+
+    Policy files name bundles bare (``seq2scal_history_raw_cnr_f30_...``) rather
+    than by absolute path, so the same file works on the cluster and on a laptop
+    with the Kingston mount. A bare name is therefore resolved against
+    ``results_write_path()``. An explicit path is used as given.
+
+    Raises with BOTH attempted locations rather than letting the loader report
+    only the bare name — a checkpoint that fails to resolve degrades that FOV to
+    the stub, and "no .pt files found in <bare name>" does not make it obvious
+    that the name was never resolved against the results directory at all.
+    """
+    from pathlib import Path
+
+    from optoerk.core.utils import results_write_path
+
+    p = Path(checkpoint_dir)
+    if p.exists():
+        return str(p)
+    if not p.is_absolute():
+        cand = Path(results_write_path()) / checkpoint_dir
+        if cand.exists():
+            return str(cand)
+        raise FileNotFoundError(
+            f"checkpoint {checkpoint_dir!r} not found: tried {p} (relative to "
+            f"cwd {Path.cwd()}) and {cand} (results_write_path)"
+        )
+    raise FileNotFoundError(f"checkpoint {checkpoint_dir!r} not found at {p}")
 
 
 def _load_norm_stats(model) -> tuple[np.ndarray, np.ndarray]:
@@ -112,7 +143,7 @@ def load_model(checkpoint_dir: str, device: str, cache: dict | None = None) -> M
 
     from optoerk.core.experiment import load_experiment
 
-    bundle = load_experiment(checkpoint_dir)
+    bundle = load_experiment(_resolve_checkpoint(checkpoint_dir))
     model = bundle.reconstruct_model()
     dev = _resolve_device(device)
     model.to(dev).eval()
@@ -179,6 +210,11 @@ def load_engine(
         try:
             handle = load_model(checkpoint_dir, cfg.device, cache)
             engine = RealModelEngine(handle, calib, cfg, objective, controller)
+            # The objective may be incompatible with the horizon the checkpoint
+            # actually permits (e.g. an oscillation period the controller can
+            # never see a transition inside). That is a broken experiment, not a
+            # broken FOV, so it is raised past the degrade-to-stub handler below.
+            objective.validate_horizon(engine.horizon)
             info = {"model_loaded": True, **handle.info,
                     "objective": objective.describe(),
                     "controller": controller.describe(),
@@ -203,8 +239,16 @@ def load_engine(
             if cfg.warmup and handle.device.type == "cuda":
                 warmup_engine(engine)
             return engine, info
+        except PolicyViolation:
+            raise  # a misconfigured experiment must stop the server, not degrade
         except Exception as e:  # noqa: BLE001 - degrade gracefully to the stub
             print(f"[serving] checkpoint load failed ({e!r}); using STUB policy")
+    # Also validate on the stub path. Degrading to the stub is a *serving*
+    # fallback; it must not double as a way for an incoherent experiment
+    # definition to slip through unchecked. There is no checkpoint here to clamp
+    # against, so the configured horizon is the best bound available — the real
+    # engine re-checks against the clamped one.
+    objective.validate_horizon(cfg.control_horizon)
     engine = StubEngine(calib, cfg, objective)
     return engine, {"model_loaded": False, "policy": "stub",
                     "checkpoint_dir": checkpoint_dir,
@@ -297,13 +341,38 @@ class RealModelEngine:
         """standardized CNR -> absolute CNR (the units objectives are written in)."""
         return pred_std * self.std[CNR] + self.mean[CNR]
 
+    def denorm_sigma(self, sigma_std: torch.Tensor) -> torch.Tensor:
+        """standardized CNR *scale* -> absolute CNR scale.
+
+        A standard deviation transforms under the affine de-standardization by the
+        scale factor only — no mean offset. Kept as its own method so a caller
+        cannot reach for :meth:`denorm_cnr` and shift a width by ~0.82 CNR.
+        """
+        return sigma_std * self.std[CNR]
+
     def rollout(self, h, c, cnr_fb, fut) -> torch.Tensor:
         """Decoder-only rollout from a given (h, c); mirrors
         ``Seq2ScalarHistory.forward`` (free-running feedback, no teacher forcing).
         Returns standardized predicted CNR mean over the horizon, shape (B, F)."""
+        return self._rollout(h, c, cnr_fb, fut, want_mixture=False)[0]
+
+    def rollout_mixture(self, h, c, cnr_fb, fut):
+        """As :meth:`rollout`, but also returns the per-step predictive mixture.
+
+        ``(mean (B, F), pi (B, F, K), mu (B, F, K), sigma (B, F, K))``, all still
+        **standardized** — de-standardizing is the caller's job because ``mu`` and
+        ``sigma`` transform differently (see :meth:`denorm_sigma`).
+
+        Only the distributional kernels need this; the mean-only path avoids
+        materializing three (B, F, K) tensors per CEM iteration.
+        """
+        return self._rollout(h, c, cnr_fb, fut, want_mixture=True)
+
+    def _rollout(self, h, c, cnr_fb, fut, want_mixture: bool):
         model = self.model
         dh, dc = h, c
         means = []
+        pis, mus, sigmas = [], [], []
         F = fut.shape[1]
         for i in range(F):
             flu_i = fut[:, i, :]                                  # (B, stim_dim=1)
@@ -322,11 +391,26 @@ class RealModelEngine:
                 if model.sigma_step_bias_param is not None else 0.0
             )
             feats = model.trunk(torch.cat([h_step, flu_i], dim=-1))
-            pi, mu, _sigma = model.head(feats, sigma_bias=sigma_bias)
+            pi, mu, sigma = model.head(feats, sigma_bias=sigma_bias)
             pred = (pi * mu).sum(dim=-1, keepdim=True)            # (B,1) std cnr
             means.append(pred)
+            if want_mixture:
+                pis.append(pi)
+                mus.append(mu)
+                sigmas.append(sigma)
+            # Free-running feedback uses the mixture MEAN regardless of the kernel,
+            # so a band-scored plan and an L2-scored plan see the same trajectory
+            # and the arms differ only in how that trajectory is costed.
             cnr_fb = pred
-        return torch.cat(means, dim=1)
+        mean = torch.cat(means, dim=1)
+        if not want_mixture:
+            return mean, None, None, None
+        return (
+            mean,
+            torch.stack(pis, dim=1),                              # (B, F, K)
+            torch.stack(mus, dim=1),
+            torch.stack(sigmas, dim=1),
+        )
 
     # -- the frame step ----------------------------------------------------
 
@@ -386,6 +470,10 @@ class RealModelEngine:
             f.state.c = c_new[:, i : i + 1].detach().clone()
             ms = float(best_ms[i].item())
             f.state.last_fluence = float(self.calib.ms_to_fluence(ms))
+            # Kept in ms alongside the fluence: the move penalty normalizes by the
+            # dose ladder's max ms, and round-tripping through the calibration to
+            # recover it would silently depend on stim_power_pct.
+            f.state.last_applied_ms = ms
             out_ms.append(ms)
         return out_ms
 
@@ -424,5 +512,6 @@ class StubEngine:
                 ms = float(np.clip(cfg.stub_gain_ms_per_cnr * deficit,
                                    cfg.min_exposure_ms, cfg.max_exposure_ms))
             f.state.last_fluence = float(self.calib.ms_to_fluence(ms))
+            f.state.last_applied_ms = ms
             out.append(ms)
         return out
