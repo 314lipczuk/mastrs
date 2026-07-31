@@ -38,3 +38,15 @@ uv run python launcher.py                # dispatch SLURM jobs (--local to run h
 - Training runs persist via `ExperimentTracker`, checkpointing each epoch so jobs resume after a crash.
 - New notebooks are marimo (`.py` with `@app.cell`), not Jupyter. Run `marimo check --fix` after editing.
 - Data lives in `materials/`; address it via `optoerk.core.utils.materials_path(...)`, never a bare relative filename.
+
+
+
+
+
+
+uv run python -m optoerk.serving.app \
+    --port 8080 --device cuda \
+    --policy-file policies/policy_10fov_osc.toml \
+    --optortk-expr-value 0.5 \
+    --stim-power 10 \
+    --predict-log log_v10.jsonl
