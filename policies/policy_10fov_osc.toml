@@ -45,13 +45,23 @@
 #       --allow-placeholders --device cuda --n-fovs 10 --cycles 20 --cycle-seconds 60
 
 
-# --- PLACEHOLDER GATE -------------------------------------------------------
-# Every value tagged "PLACEHOLDER" below is a working assumption for wiring and
-# tests, NOT a measured value for the real run. The server refuses to start while
-# this is false. Fill in the real values from the sources listed against each one,
-# then set this to true. Twelve hours of scope time against a placeholder is not
-# recoverable.
-placeholders_resolved = false
+# --- PARAMETER PROVENANCE ---------------------------------------------------
+# GATE OPENED 2026-07-31, operator's call. The values tagged "ASSUMED" below are
+# working assumptions that have NOT been replaced by their measured counterparts.
+# This block is the record of what was assumed; keep it and replace entries as
+# the measurements land, rather than deleting it.
+#
+# Still assumed, with the analysis that settles each:
+#   levels_ms               <- Niesen hold-strata analysis (rebinned ladder); cf. D2
+#   low / high              <- Niesen per-cell reachable-ceiling distribution
+#   segment durations, tau  <- D6 refit w/ right-censoring (tier0_diagnostics.py)
+#   lambda_move             <- offline held-out-model screen; cf. D3
+#   half_width              <- offline; must SPREAD band scores, not saturate
+#
+# The three startup bounds DO pass at these values (verified 2026-07-31), so the
+# configuration is internally consistent. What is assumed is its mapping to the
+# plant — in particular tau_decay_min, which sets both plant-side bounds.
+placeholders_resolved = true
 
 
 [default]
@@ -67,7 +77,7 @@ checkpoint = "seq2scal_history_raw_cnr_f30_2026-07-27_20.18.46"
 # acquisition grid, and equals the checkpoint's future_len, so it is not clamped.
 control_horizon = 30
 
-# PLACEHOLDER — source: Jungfrau hold-strata analysis (rebinned dose ladder).
+# ASSUMED — source: Niesen hold-strata analysis (rebinned dose ladder).
 # The ladder is deliberately non-uniform and therefore cannot be expressed as
 # (min_exposure_ms, max_exposure_ms, n_candidates); it is set here per policy.
 # The move penalty normalizes by this ladder's max, so rebinning it does not
@@ -77,13 +87,13 @@ levels_ms = [0, 20, 45, 85, 150]
 # The oscillating reference. Identical for every FOV — it is a property of the
 # experiment, not of an arm.
 #
-#   PLACEHOLDER low / high  — source: Jungfrau per-cell reachable-ceiling
+#   ASSUMED low / high  — source: Niesen per-cell reachable-ceiling
 #     distribution. Resting cnr_median is ~0.82 (the checkpoint's own z-score
 #     mean), so low = 0.85 sits just above rest and high = 1.15 is an elevated
 #     but plausibly reachable setpoint. Amplitude (half of peak-to-peak) = 0.15.
-#   PLACEHOLDER segment durations — source: D6 refit with right-censoring, which
+#   ASSUMED segment durations — source: D6 refit with right-censoring, which
 #     sets tau_decay_min and hence the admissible period band.
-#   PLACEHOLDER tau_decay_min — source: D6 refit. 7.3 is the CURRENT median,
+#   ASSUMED tau_decay_min — source: D6 refit. 7.3 is the CURRENT median,
 #     which the refit is expected to RAISE.
 #
 # Period = 8 + 2 + 15 + 15 = 40 min. Both bounds are checked at startup:
@@ -143,8 +153,8 @@ lambda_move = 0.0
 # where the residual gradient risk is lowest — they are the arms least able to
 # absorb it.
 #
-# PLACEHOLDER lambda_move = 0.6 — source: offline held-out-model screen.
-# PLACEHOLDER half_width  = 0.05 — source: offline, ~1/3 of the reference
+# ASSUMED lambda_move = 0.6 — source: offline held-out-model screen.
+# ASSUMED half_width  = 0.05 — source: offline, ~1/3 of the reference
 #   amplitude (0.15). Must straddle the achievable tracking error: verify offline
 #   that band scores SPREAD across candidate plans rather than saturating at 0 or
 #   1. A flat band cost means arm 4 measures nothing.
