@@ -110,7 +110,16 @@ def test_startup_record_carries_the_resolved_policies(tmp_path):
     rec = startup_record(log)
     assert rec is not None
     policies = rec["policies"]["default"]
-    assert policies["objective"] == {"type": "hold", "target_cnr": 1.75}
+    # The objective describes its full composition — reference, cost kernel and
+    # any plan-side regularizers — so an arm is reconstructible from the log
+    # alone, not just its headline setpoint.
+    assert policies["objective"] == {
+        "type": "hold",
+        "target_cnr": 1.75,
+        "reference": {"type": "constant", "target_cnr": 1.75},
+        "kernel": {"type": "l2"},
+        "regularizers": [],
+    }
 
 
 def test_record_to_payload_rebuilds_the_request(tmp_path):
