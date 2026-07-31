@@ -1,5 +1,10 @@
 # 12-FOV controller comparison on the raw-CNR model.
 #
+# WARNING: 
+# ----------------------------------------
+#  misleading name; This is erroneously committed policy - does not do what the name suggest it does
+#  It is being left here to analyse the experiments after they run without renaming policies. Afterwards it will be deleted. 
+
 # 4 conditions x 3 replicates. Every FOV loads the SAME raw-cnr checkpoint and
 # targets TODO
 # the SAME absolute CNR (1.2, in cnr_median units — this is a cnr_mode
