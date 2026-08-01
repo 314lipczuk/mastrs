@@ -39,14 +39,23 @@ uv run python launcher.py                # dispatch SLURM jobs (--local to run h
 - New notebooks are marimo (`.py` with `@app.cell`), not Jupyter. Run `marimo check --fix` after editing.
 - Data lives in `materials/`; address it via `optoerk.core.utils.materials_path(...)`, never a bare relative filename.
 
+## Serving on the microscope
 
+Run on the acquisition host, with the GPU:
 
-
-
-
+```sh
 uv run python -m optoerk.serving.app \
     --port 8080 --device cuda \
-    --policy-file policies/policy_10fov_osc.toml \
+    --policy-file policies/policy_10fov_osc_p50.toml \
     --optortk-expr-value 0.5 \
     --stim-power 10 \
-    --predict-log log_v10.jsonl
+    --predict-log exp_v11.jsonl
+```
+
+- `--optortk-expr-value 0.5` short-circuits the optoRTK-expr channel to a fixed
+  0.5 for every cell, so the run does not depend on a per-cell expression
+  measurement. It implies `--override-optortk-expr`.
+- `--policy-file` supersedes `--checkpoint` and `--target-cnr`: the checkpoint,
+  objective and controller all come from the policy file, per FOV.
+- `--predict-log` is the run's record. It is append-only, so give each run its own
+  path — reusing one silently concatenates two experiments into one file.

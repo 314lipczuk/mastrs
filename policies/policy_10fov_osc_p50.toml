@@ -1,0 +1,292 @@
+# 10-FOV oscillation-tracking run, SECOND WAVEFORM — integral-matched to
+# policies/policy_10fov_osc.toml.
+#
+# Same checkpoint, same ladder, same horizon, same four arms, same FOV->arm map.
+# The ONLY thing that differs from policy_10fov_osc.toml is the reference
+# waveform, and it differs in exactly two ways:
+#
+#                       policy_10fov_osc.toml      THIS FILE
+#   period                 40 min                    50 min      (x1.25, f x0.8)
+#   peak-to-peak           0.30 CNR                  0.375 CNR   (x1.25)
+#   time-mean CNR          1.02625                   1.02625     (IDENTICAL)
+#
+# So the two runs deliver the same integrated CNR per unit time at a different
+# (frequency, amplitude) point. That is the whole design: if the cells' downstream
+# readout is a low-pass integrator of ERK activity, the two runs are the same
+# stimulus and must give the same answer; if the readout decodes dynamics, they
+# must not. Anything else varying between the runs would make that contrast
+# uninterpretable, which is why every other field below is copied verbatim.
+#
+# Run:
+#   uv run python -m optoerk.serving.app --port 8080 --device cuda \
+#       --policy-file policies/policy_10fov_osc_p50.toml --predict-log run.jsonl
+#
+# Soak:
+#   uv run python -m optoerk.serving.soak --policy-file policies/policy_10fov_osc_p50.toml \
+#       --allow-placeholders --device cuda --n-fovs 10 --cycles 20 --cycle-seconds 60
+
+
+# --- THE INTEGRAL CONSTRAINT, AND WHY THE NUMBERS ARE WHAT THEY ARE ----------
+#
+# The reference is a trapezoid (low hold / linear rise / high hold / linear fall),
+# so its mean over one period has a closed form. With A = high - low:
+#
+#     mean = low + A * X / period,   where X = t_high + (t_rise + t_fall) / 2
+#
+# X is the "effective high-dwell": the high hold plus half of each ramp, because a
+# linear ramp contributes its midpoint. Both files use X = 23.5 min, so matching
+# the mean reduces to holding A / period fixed:
+#
+#     policy_10fov_osc.toml   0.300 / 40 = 0.0075 CNR/min
+#     THIS FILE               0.375 / 50 = 0.0075 CNR/min
+#
+# i.e. amplitude x frequency = const, which is the integral constraint written out.
+# Both give mean = 0.85 + 0.0075 * 23.5 = 1.02625 CNR. Exactly, not to rounding.
+#
+# DISCRETE-TIME EXACTNESS. The controller samples the reference at integer frames,
+# so what actually matters is the mean of the 50 sampled values, not the continuous
+# integral. They coincide here, and not by luck: a ramp of n frames sampled from
+# its start under-counts its midpoint by A/2, a ramp sampled from its top
+# over-counts by A/2, and the rise and the fall cancel exactly whenever the segment
+# boundaries land on frame boundaries. All four durations are therefore INTEGER
+# minutes. They must stay integer — a half-minute segment breaks the cancellation
+# and the two runs' integrals silently stop matching at the 3rd decimal.
+#
+# The phase offsets are 0 / 12.5 / 25 / 37.5 min (period / 4). The two half-minute
+# offsets shift every boundary by exactly 0.5 frame, which is the one non-integer
+# offset that still cancels (the ramp deviation is A * (delta - 1/2), zero at
+# delta = 1/2). So the per-period mean is 1.02625 for every phase group, not just
+# on average across them. Verified numerically against
+# StepTrainReference.value_at, not just derived here.
+#
+# WHY THE AMPLITUDE HAD TO GO *UP* AND THE PERIOD *OUT*. Neither direction was
+# free; both are forced by constraints already in the sibling file.
+#
+#   Amplitude down is not reachable at this mean. `low` is pinned just above the
+#   resting cnr_median (~0.82) because a cell cannot be driven BELOW rest — there
+#   is no inhibitory actuator, only light and decay. With low ~ 0.85 fixed, the
+#   mean sits 0.17625 above low, so A * X / period = 0.17625: shrinking A forces
+#   X / period toward 1, i.e. the waveform degenerates into a constant hold near
+#   `high`. That is the constant_dose baseline, not a second oscillation.
+#
+#   Period down is not safe. The admissible band is
+#   4 x tau_decay_min <= period <= 2 x horizon, i.e. [29.2, 60] min at tau = 7.3
+#   and H = 30. A shorter period (32 min, say) leaves 2.8 min of headroom against
+#   a tau that the D6 refit is EXPECTED TO RAISE — the refit invalidates the file.
+#   50 min stays admissible up to tau = 12.5 min, where the 40-min sibling already
+#   fails at tau = 10.0. Going slower is the direction with headroom.
+#
+# The corollary is that the two runs are not symmetric about a centre point: this
+# file is the slower, larger-swing arm of the pair, and there is no viable
+# faster/smaller counterpart at this mean with this checkpoint's horizon. If the
+# design needs one, it needs a checkpoint with a larger future_len.
+
+
+# --- PARAMETER PROVENANCE ---------------------------------------------------
+# Inherits the assumption set of policy_10fov_osc.toml, whose gate the operator
+# opened on 2026-07-31 (levels_ms, low, segment durations, tau, lambda_move,
+# half_width — all still ASSUMED, none replaced by measurement). Those are
+# unchanged here and are not re-litigated.
+#
+# ONE assumption is NEW and is NOT covered by that gate decision:
+#
+#   high = 1.225  <- extrapolated. The gated file assumed 1.15 was "elevated but
+#     plausibly reachable" from the Niesen per-cell reachable-ceiling
+#     distribution. 1.225 is 0.075 CNR beyond it and has not been checked against
+#     that distribution at all.
+#
+#     WHAT BREAKS IF IT IS WRONG: cells whose ceiling sits below 1.225 saturate on
+#     the high hold. The *reference* integrals still match — nothing here changes —
+#     but the *achieved* integral of the fast run then exceeds the slow run's, and
+#     the experiment's one invariant is gone while every log still says it holds.
+#     This failure is silent in the policy and only visible in the achieved CNR.
+#
+#     CHECK BEFORE RUNNING: the fraction of cells with reachable ceiling >= 1.225
+#     at the top of the ladder (150 ms). If that fraction is materially below the
+#     fraction >= 1.15, do not run this file as written — raise `low` and shorten
+#     the period instead of raising `high` (that trades the ceiling risk for
+#     ceiling-free tracking at the cost of never returning to rest, which is a
+#     different experiment and should be argued for, not slipped in).
+#
+# placeholders_resolved is left TRUE to match the sibling file's gate decision
+# rather than silently re-closing a gate the operator opened. Set it to false if
+# you want the server to refuse to start until the ceiling check above lands.
+placeholders_resolved = true
+
+
+[default]
+
+# Identical to policy_10fov_osc.toml. VERIFIED 2026-07-29: future_len = 30,
+# cnr_mode = "raw", 3 mixture components, cnr z-score mean 0.8220 / std 0.3322.
+checkpoint = "seq2scal_history_raw_cnr_f30_2026-07-27_20.18.46"
+
+# Identical to policy_10fov_osc.toml. 30 frames = 30 min, equals the checkpoint's
+# future_len, so it is not clamped. Note this is the binding constraint on the
+# period: 50 <= 2 x 30 leaves 10 min of headroom, and a third, slower waveform
+# would need a different checkpoint.
+control_horizon = 30
+
+# Identical to policy_10fov_osc.toml — MUST be. Two waveforms searched over
+# different dose ladders are not comparable, and the move penalty normalizes by
+# this ladder's max, so a rebin would also change what lambda_move = 0.6 means.
+levels_ms = [0, 20, 45, 85, 150]
+
+# The oscillating reference — the ONE field that differs from the sibling file.
+#
+#   low = 0.85            unchanged. Pinned just above the resting cnr_median
+#                         (~0.82, the checkpoint's own z-score mean). Holding it
+#                         fixed across the two runs makes the waveform contrast a
+#                         pure (period, amplitude) contrast rather than also a
+#                         baseline shift.
+#   high = 1.225          NEW ASSUMPTION — see the provenance block above.
+#                         Peak-to-peak = 0.375; half of peak-to-peak = 0.1875,
+#                         which is the number half_width is set against below.
+#
+#   t_low = 17            absorbs the period change. The low hold is the only
+#                         segment with no slope demand attached to it, so the
+#                         extra 10 min of period is parked here rather than being
+#                         spread over segments whose duration encodes physics.
+#   t_rise = 3            scaled with the amplitude (2 x 1.25, rounded up), so the
+#                         DEMANDED RISE SLOPE is 0.375/3 = 0.125 CNR/min against
+#                         the sibling's 0.30/2 = 0.150. The rise is deliberately
+#                         no harder here than there — if it were, a lag on the
+#                         rise would separate the two runs for a reason that has
+#                         nothing to do with the integral hypothesis.
+#   t_high = 14           set by the integral constraint once the other three are
+#                         chosen (X must be 23.5).
+#   t_fall = 16           2.19 x tau, in the same "~2 tau" band as the sibling's
+#                         15 min = 2.05 tau. Falls are decay-limited and not
+#                         adjustable; sizing them in tau rather than in CNR is the
+#                         sibling file's doctrine and is kept.
+#
+#     CAVEAT, stated because it is invisible in the guard: free decay from 1.225
+#     to 0.85 toward a 0.82 rest takes tau * ln((1.225-0.82)/(0.85-0.82)) = 19.0
+#     min, so a 16-min fall demands slightly faster-than-free decay. The sibling
+#     file already does this (17.5 min of free decay demanded in 15), so this is
+#     not a new compromise, but the gap widens from 2.5 to 3.0 min. Expect the
+#     fall-time diagnostic to show a floor in BOTH runs; it is the difference
+#     between arms within a run that is interpretable, not the absolute lag.
+#
+# Period = 17 + 3 + 14 + 16 = 50 min. All three bounds checked at startup:
+#   lower (plant):      period >= 4 x tau   ->  50 >= 29.2   OK  (holds to tau=12.5)
+#                       t_fall >= 1.5 x tau ->  16 >= 11.0   OK  (holds to tau=10.7)
+#   upper (controller): period <= 2 x horizon -> 50 <= 60    OK
+#
+# settle_periods = 2 is unchanged, which means 100 min of settle here against 80
+# min in the sibling run — settle is counted in the waveform's own periods, which
+# is what it is for. The two runs' post-settle windows therefore start at
+# different wall-clock offsets; align on each cell's own settle boundary, not on
+# acquisition frame 0.
+objective = { type = "oscillation", low = 0.85, high = 1.225, t_low_min = 17, t_rise_min = 3, t_high_min = 14, t_fall_min = 16, tau_decay_min = 7.3, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+
+# Fallback for any FOV not listed below (none, here) — mirror arm 1.
+controller = { type = "constant_dose" }
+kernel = "l2"
+lambda_move = 0.0
+
+
+# --- RUN LENGTH -------------------------------------------------------------
+# The integral matches PER PERIOD, so the two runs' TOTAL integrals match only
+# over a whole number of periods of each. Periods 40 and 50 have LCM 200 min, so
+# acquire a multiple of 200 min post-settle in both runs — 600 min (15 periods
+# there, 12 here) is the natural choice. Total acquisition:
+#
+#   policy_10fov_osc.toml   80 min settle + 600 =  680 min
+#   THIS FILE              100 min settle + 600 =  700 min
+#
+# Truncating mid-period biases the total integral by up to half an excursion, and
+# it biases the SLOW run more. Do not stop this run on a wall-clock alarm shared
+# with the fast one.
+
+
+# ---------------------------------------------------------------------------
+# Arms and FOV layout: IDENTICAL to policy_10fov_osc.toml, deliberately.
+#
+#   FOV  0 1 2 3 4 5 6 7 8 9
+#   arm  3 4 1 2 3 4 2 1 3 4
+#
+#   ARM_OF = {0: 3, 1: 4, 2: 1, 3: 2, 4: 3, 5: 4, 6: 2, 7: 1, 8: 3, 9: 4}
+#
+# The sibling file permuted its layout relative to the hold run. This one does
+# NOT permute again, and the reason is the primary contrast. Waveform is the
+# thing being tested here, and it varies BETWEEN runs, so it is fully confounded
+# with run — the only defence is to hold everything else fixed across the pair.
+# Keeping the map identical makes the waveform comparison paired by position:
+# FOV 4 runs arm 3 under both waveforms, so any per-position illumination /
+# temperature / media-depth effect cancels in the within-position difference.
+# Permuting would push that effect straight into the contrast the run exists to
+# measure. It also means there is still exactly ONE arm map to keep in sync
+# instead of three.
+#
+# !! arm = (fov % 4) + 1 DOES NOT HOLD, same as the sibling file. soak.py:177
+# (`arm_of`) hardcodes it and will silently mislabel every per-arm row against
+# this file. Pass ARM_OF explicitly.
+#
+#   arm 1: fov 2, 7       -> mean position 4.5   (exact)   n=2
+#   arm 2: fov 3, 6       -> mean position 4.5   (exact)   n=2
+#   arm 3: fov 0, 4, 8    -> mean position 4.0             n=3
+#   arm 4: fov 1, 5, 9    -> mean position 5.0             n=3
+#
+# lambda_move = 0.6 is unchanged (ASSUMED, offline held-out-model screen). It is
+# in normalized dose units and the ladder is unchanged, so it carries over
+# without rescaling — that is exactly what the normalization in MovePenalty is
+# for.
+#
+# half_width = 0.0625 is CHANGED, from 0.05, and must be. The band kernel measures
+# "did the plan stay within delta of the reference"; delta was set at ~1/3 of the
+# sibling's half-peak-to-peak amplitude (0.05 / 0.15), and this waveform's is
+# 0.1875, so the same fraction gives 0.0625. Holding delta at 0.05 against a 1.25x
+# larger swing would tighten arm 4's band in relative terms and turn the
+# waveform contrast into a band-width contrast for that arm alone.
+#   Same offline check still applies, at the new value: band scores must SPREAD
+#   across candidate plans rather than saturating at 0 or 1. A flat band cost
+#   means arm 4 measures nothing.
+# ---------------------------------------------------------------------------
+
+# --- arm 1: constant dose, L2, no move penalty ------------------------------
+[fov.2]
+controller = { type = "constant_dose" }
+kernel = "l2"
+lambda_move = 0.0
+[fov.7]
+controller = { type = "constant_dose" }
+kernel = "l2"
+lambda_move = 0.0
+
+# --- arm 2: sequence MPC, L2, no move penalty -------------------------------
+[fov.3]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.0
+[fov.6]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.0
+
+# --- arm 3: sequence MPC, L2, move penalty ON -------------------------------
+[fov.0]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.6
+[fov.4]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.6
+[fov.8]
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.6
+
+# --- arm 4: sequence MPC, band kernel, move penalty ON ----------------------
+[fov.1]
+controller = { type = "sequence_mpc" }
+kernel = { type = "band", half_width = 0.0625 }
+lambda_move = 0.6
+[fov.5]
+controller = { type = "sequence_mpc" }
+kernel = { type = "band", half_width = 0.0625 }
+lambda_move = 0.6
+[fov.9]
+controller = { type = "sequence_mpc" }
+kernel = { type = "band", half_width = 0.0625 }
+lambda_move = 0.6

@@ -5,6 +5,15 @@
 #  misleading name; This is erroneously committed policy - does not do what the name suggest it does
 #  It is being left here to analyse the experiments after they run without renaming policies. Afterwards it will be deleted. 
 
+
+uv run python -m optoerk.serving.app \
+    --port 8080 --device cuda \
+    --policy-file policies/policy_10fov_osc.toml \
+    --optortk-expr-value 0.5 \
+    --stim-power 10 \
+    --predict-log log_v10.jsonl
+
+
 # 4 conditions x 3 replicates. Every FOV loads the SAME raw-cnr checkpoint and
 # targets TODO
 # the SAME absolute CNR (1.2, in cnr_median units — this is a cnr_mode
