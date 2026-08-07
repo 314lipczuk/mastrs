@@ -82,7 +82,10 @@ levels_ms = [0, 20, 45, 85, 150]
 # there is no admissible period. That is not a number to pick quietly — it means
 # either extending the horizon (needs a checkpoint with a larger future_len) or
 # accepting a partly untrackable reference by design. Escalate.
-objective = { type = "oscillation", low = 0.85, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15, tau_decay_min = 7.3, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+#
+# 2026-08-06: tau_decay_min = 7.3 removed here too — see policy_10fov_osc.toml.
+# Waveform unchanged; the guard it fed no longer exists.
+objective = { type = "oscillation", low = 0.85, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
 
 # Fallback for any FOV not listed below (none, here) — mirror arm 1.
 controller = { type = "constant_dose" }
@@ -113,14 +116,17 @@ lambda_move = 0.0
 
 # --- arm 1: constant dose, L2, no move penalty ------------------------------
 [fov.0]
+arm = 1
 controller = { type = "constant_dose" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.4]
+arm = 1
 controller = { type = "constant_dose" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.8]
+arm = 1
 controller = { type = "constant_dose" }
 kernel = "l2"
 lambda_move = 0.0
@@ -129,42 +135,51 @@ lambda_move = 0.0
 # Must be bit-for-bit the existing controller. Guarded by
 # tests/test_serving_control.py::test_refactor_reproduces_the_pre_refactor_controller
 [fov.1]
+arm = 2
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.5]
+arm = 2
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.9]
+arm = 2
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.0
 
 # --- arm 3: sequence MPC, L2, move penalty ON -------------------------------
 [fov.2]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 [fov.6]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 [fov.10]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 
 # --- arm 4: sequence MPC, band kernel, move penalty ON ----------------------
 [fov.3]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.05 }
 lambda_move = 0.6
 [fov.7]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.05 }
 lambda_move = 0.6
 [fov.11]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.05 }
 lambda_move = 0.6

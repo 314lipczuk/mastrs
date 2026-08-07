@@ -48,6 +48,12 @@ from optoerk.serving.objectives import PolicyViolation, build_objective
 class PolicySpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Which experimental arm this FOV belongs to. Pure metadata — nothing in the
+    # control path reads it — but it is the experiment's own grouping, and until
+    # it existed every consumer that wanted it reinvented `fov % 4 + 1`, which is
+    # right for the blocked 12-FOV layout and wrong for every interleaved one.
+    # Declared here it travels with the policy into the startup log.
+    arm: int | None = None
     checkpoint: str | None = None
     objective: dict[str, Any] | None = None
     controller: dict[str, Any] | None = None
@@ -131,6 +137,50 @@ def _objective_spec(spec: PolicySpec) -> dict[str, Any]:
         out["lambda_move"] = spec.lambda_move
     if spec.lambda_dose is not None:
         out["lambda_dose"] = spec.lambda_dose
+    return out
+
+
+def arm_map(policy_file: PolicyFile) -> dict[int, int]:
+    """``{fov: arm}`` — the declared ``arm`` of each FOV, or, failing that, FOVs
+    grouped by identical resolved policy and numbered from 1 in FOV order.
+
+    An arm used to be a comment-header convention rather than a field, so every
+    consumer that wanted arm labels reinvented one, and they all reinvented the
+    same wrong one: ``fov % 4 + 1``. That holds for ``policy_12fov_osc.toml`` and
+    for neither 10-FOV file, whose layouts are interleaved so that arm is not
+    confounded with stage position — mislabelling every per-arm row rather than
+    failing. Declared arms end that.
+
+    The derived fallback keeps files without declarations working, and gets the
+    grouping right even when arms differ in ``objective`` rather than in
+    ``controller`` (the pattern-zoo case). It cannot recover the file's own arm
+    *numbering*, only its partition, which is why declaring is preferred.
+
+    Half-declared is rejected: a file where some FOVs name an arm and others do
+    not has no consistent numbering, and silently mixing declared ids with
+    derived ones is the failure this function exists to remove.
+    """
+    fovs = sorted(policy_file.fov)
+    declared = {f: policy_file.fov[f].arm for f in fovs}
+    named = [f for f in fovs if declared[f] is not None]
+    if named and len(named) != len(fovs):
+        missing = [f for f in fovs if declared[f] is None]
+        raise PolicyViolation(
+            f"policy declares `arm` for FOVs {named} but not for {missing}. "
+            f"Declare it for every FOV or for none — a partial labelling has no "
+            f"consistent numbering."
+        )
+    if named:
+        return {f: int(declared[f]) for f in fovs}
+
+    seen: dict[str, int] = {}
+    out: dict[int, int] = {}
+    for fov in fovs:
+        spec = policy_file.fov[fov]
+        key = json.dumps(spec.model_dump(exclude_none=True), sort_keys=True)
+        if key not in seen:
+            seen[key] = len(seen) + 1
+        out[fov] = seen[key]
     return out
 
 

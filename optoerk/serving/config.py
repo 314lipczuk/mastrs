@@ -124,6 +124,34 @@ class ServerConfig:
     override_optortk_expr: bool = False
     optortk_expr_value: float | None = None
 
+    # --- LIVE per-cell optoRTK expression ---------------------------------
+    # When on, the server reconstructs the real feature instead of feeding any
+    # constant: the per-cell mCitrine value from the payload's optocheck /
+    # reference measurement, ranked against the session's cohort pooled across
+    # FOVs (see `optoerk.serving.expression`).
+    #
+    # OFF BY DEFAULT, and switching it on is a change of EXPERIMENTAL CONDITION,
+    # not a bug fix: it gives the controller a per-cell gain covariate it has never
+    # had, so a run with it on is not comparable to one with it off.
+    #
+    # It requires the payload to carry the optocheck/reference measurement
+    # (`ref_mean_intensity`, or the older `optocheck_mean_intensity`). faro's
+    # `RefFE` writes it into the tracks, but `InferenceServerStim._current_cells`
+    # keeps only identity columns plus the columns ITS OWN feature extractor
+    # produced — and the ref extractor is a different one — so it has to be let
+    # through explicitly on the faro side. If nothing ever arrives the server
+    # aborts once the cohort seals empty (`_check_optortk_coverage`) rather than
+    # quietly feeding the constant, because a silent fallback looks exactly like a
+    # successful run and produces a whole experiment of median-expresser
+    # predictions.
+    live_optortk_expr: bool = False
+    # How many optocheck samples one cell contributes before its rank freezes. One
+    # optocheck per run is the normal case, so 1 is the sensible default.
+    optortk_baseline_frames: int = 1
+    # When the session cohort closes. Must be long enough to span the FIRST
+    # optocheck of the run — nobody can be ranked before the population exists.
+    optortk_cohort_frames: int = 10
+
     # --- prediction logging -----------------------------------------------
     # When set, the server appends a structured JSONL record per prediction
     # (startup + per-cell decisions) to this path, matching the schema the

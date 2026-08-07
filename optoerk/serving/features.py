@@ -1,7 +1,8 @@
 """Turn a faro ``/predict`` payload into the model's per-frame channels.
 
-The model input per frame is the standardized 4-vector
-``[cnr, u_t, fov_density, n_cells_200px]`` (``history_dataset.CHANNELS``):
+The model input per frame is the standardized 5-vector
+``[cnr, u_t, fov_density, n_cells_200px, optortk_expr]``
+(``history_dataset.CHANNELS``):
 
   * ``cnr``            — a norm-mode model was trained on ``cnr_median_norm`` =
                         per-cell baseline-normalized *median* CNR, so the server
@@ -14,6 +15,11 @@ The model input per frame is the standardized 4-vector
                         (the last commanded dose), not by the payload.
   * ``fov_density``    — number of cells detected in this FOV at this frame.
   * ``n_cells_200px``  — number of *other* cells within ``radius`` px.
+  * ``optortk_expr``   — the cell's optoRTK expression as a session-relative
+                        percentile rank. Derived from the mCitrine measurement
+                        this module extracts, but the ranking needs the whole
+                        session's cohort and so lives in
+                        :mod:`optoerk.serving.expression`.
 
 The two crowding channels are derived server-side from all cells' (x, y) in the
 payload, replicating ``preprocessing.add_crowding_features`` exactly (it also
@@ -43,6 +49,61 @@ def extract_raw_cnr(cell: dict[str, Any]) -> float | None:
     v = cell.get("cnr")
     if v is not None and np.isfinite(v):
         return float(v)
+    return None
+
+
+#: Payload keys carrying the raw optoRTK expression measurement, in preference
+#: order. faro's ``RefFE`` writes ``ref_mean_intensity``; the older Cedric-side
+#: export of the same quantity is ``optocheck_mean_intensity``.
+OPTORTK_KEYS = ("ref_mean_intensity", "optocheck_mean_intensity")
+
+
+def extract_optortk_value(cell: dict[str, Any]) -> float | None:
+    """The raw optoRTK expression measurement for this cell, pre-ranking.
+
+    This is **mCitrine**, imaged in its own short optocheck/reference acquisition
+    — a different fluorescence channel from the timelapse's ``miRFP`` (C0) and
+    ``mScarlet3`` (C1, which ``cnr_median`` comes from). It is what
+    ``preprocessing.add_optortk_expression`` ranks offline, so it is what serving
+    must feed for train and serve to agree.
+
+    **Returns None on most frames, and that is normal.** The optocheck runs once
+    or twice per experiment, not every frame, so the value arrives only on those
+    frames and the cell carries it thereafter. A caller must not treat a single
+    absent frame as an error; see ``InferenceService._check_optortk_coverage`` for
+    where the real contract failure is detected.
+
+    It must never be reconstructed from the C0 channels. That surrogate — whole-
+    cell miRFP — was what the pipeline used before the measurement was wired
+    through, and measured against mCitrine on the same cells it reaches only
+    Spearman 0.60-0.71 and misplaces 27-30% of cells across a high/low split.
+    """
+    for key in OPTORTK_KEYS:
+        v = cell.get(key)
+        if v is not None and np.isfinite(v) and float(v) > 0:
+            return float(v)
+    return None
+
+
+#: Payload keys carrying the nuclear area, in preference order. faro's
+#: ``FE_ErkKtr`` renames skimage's ``area`` to ``area_nuc``; the training bundles
+#: call the same quantity ``nuc_area``. Both spellings are accepted so neither
+#: side has to be renamed to make a model that uses the channel servable.
+AREA_KEYS = ("area_nuc", "nuc_area", "area")
+
+
+def extract_nuc_area(cell: dict[str, Any]) -> float | None:
+    """The cell's nuclear area, the model's ``nuc_area`` channel.
+
+    Named differently on the two sides of the wire — ``area_nuc`` in the payload,
+    ``nuc_area`` in the model's channel list — which is exactly the sort of
+    mismatch that ends with a used channel being fed its population mean and
+    nothing saying so.
+    """
+    for key in AREA_KEYS:
+        v = cell.get(key)
+        if v is not None and np.isfinite(v) and float(v) > 0:
+            return float(v)
     return None
 
 

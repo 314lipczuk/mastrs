@@ -31,7 +31,7 @@ import torch
 from optoerk.serving.calibration import FluenceCalibration
 from optoerk.serving.config import ServerConfig
 from optoerk.serving.control import Controller, dose_levels
-from optoerk.serving.objectives import GoalContext, Objective, PolicyViolation
+from optoerk.serving.objectives import GoalContext, Objective
 from optoerk.serving.state import CellState
 
 CNR = 0  # channel index of cnr (first in norm_channels: [cnr, u_t, ...])
@@ -55,6 +55,12 @@ class CellFrame:
     n_cells_200px: float
     x: float = float("nan")
     y: float = float("nan")
+    # Session-relative optoRTK expression rank, when the server is reconstructing
+    # it live. None means "not available", and the engine then falls back to the
+    # channel's population mean exactly as it always has.
+    optortk_expr: float | None = None
+    # Nuclear area, for checkpoints whose feature set includes it. Same fallback.
+    nuc_area: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +216,6 @@ def load_engine(
         try:
             handle = load_model(checkpoint_dir, cfg.device, cache)
             engine = RealModelEngine(handle, calib, cfg, objective, controller)
-            # The objective may be incompatible with the horizon the checkpoint
-            # actually permits (e.g. an oscillation period the controller can
-            # never see a transition inside). That is a broken experiment, not a
-            # broken FOV, so it is raised past the degrade-to-stub handler below.
-            objective.validate_horizon(engine.horizon)
             info = {"model_loaded": True, **handle.info,
                     "objective": objective.describe(),
                     "controller": controller.describe(),
@@ -239,16 +240,8 @@ def load_engine(
             if cfg.warmup and handle.device.type == "cuda":
                 warmup_engine(engine)
             return engine, info
-        except PolicyViolation:
-            raise  # a misconfigured experiment must stop the server, not degrade
         except Exception as e:  # noqa: BLE001 - degrade gracefully to the stub
             print(f"[serving] checkpoint load failed ({e!r}); using STUB policy")
-    # Also validate on the stub path. Degrading to the stub is a *serving*
-    # fallback; it must not double as a way for an incoherent experiment
-    # definition to slip through unchecked. There is no checkpoint here to clamp
-    # against, so the configured horizon is the best bound available — the real
-    # engine re-checks against the clamped one.
-    objective.validate_horizon(cfg.control_horizon)
     engine = StubEngine(calib, cfg, objective)
     return engine, {"model_loaded": False, "policy": "stub",
                     "checkpoint_dir": checkpoint_dir,
@@ -416,26 +409,48 @@ class RealModelEngine:
 
     @torch.no_grad()
     def decide(self, frames: list[CellFrame], ctx: GoalContext) -> list[float]:
+        # Per-cell diagnostics for the predict log, read back by the service via
+        # getattr (the same pattern as `optortk_fed`). Cleared first so a frame
+        # with no cells cannot leave the previous frame's values standing.
+        self.last_plan_cost = None
+        self.last_pred_cnr_h1 = None
         if not frames:
             return []
         N = len(frames)
         L, H = self.num_layers, self.hidden
 
         # --- raw per-frame channels, assembled by NAME in the model's channel
-        # order (robust to CHANNELS growing/reordering). Channels the live payload
-        # doesn't carry — currently optortk_expr — default to the population mean
-        # (→ 0 after standardizing, i.e. neutral median expression).
-        # TODO: feed the real session-relative optoRTK expression rank once the
-        # server accumulates per-cell baseline C0 (see NIESEN_TOCHECK.md).
+        # order (robust to CHANNELS growing/reordering). Any channel not supplied
+        # here falls back to the population mean (→ 0 after standardizing, i.e. the
+        # neutral median value for that channel).
         _supplied = {
             "cnr": lambda f: f.cnr_norm,
             "u_t": lambda f: f.state.last_fluence,
             "fov_density": lambda f: f.fov_density,
             "n_cells_200px": lambda f: f.n_cells_200px,
         }
-        # Server-side hardcode of the optoRTK-expression channel, if enabled.
+        # Channels a model may or may not use, supplied only when the payload
+        # carried them. A model without the channel never asks; one WITH it would
+        # otherwise be fed the population mean on a channel it actually uses —
+        # `nuc_area` is the second most important channel in the area variants
+        # (permutation dNLL 0.0118, behind only u_t and the expression rank).
+        if any(f.nuc_area is not None for f in frames):
+            _supplied["nuc_area"] = (
+                lambda f: f.nuc_area if f.nuc_area is not None
+                else float(self.mean_np[self.channels.index("nuc_area")])
+            )
+        # The optoRTK-expression channel, in precedence order:
+        #   1. an operator-set constant   (--optortk-expr-value)
+        #   2. the live per-cell rank     (--live-optortk-expr), when it arrived
+        #   3. the channel population mean, i.e. every cell a median expresser
+        # Case 2 is per-cell, so it cannot be a single closure over the frame list.
         if self._optortk_override is not None:
             _supplied[self._optortk_channel] = lambda f, v=self._optortk_override: v
+        elif self._optortk_channel in self.channels:
+            _mean = float(self.mean_np[self.channels.index(self._optortk_channel)])
+            _supplied[self._optortk_channel] = (
+                lambda f, m=_mean: m if f.optortk_expr is None else float(f.optortk_expr)
+            )
         raw = torch.tensor(
             [[_supplied[name](f) if name in _supplied else float(self.mean_np[i])
               for i, name in enumerate(self.channels)] for f in frames],
@@ -458,7 +473,25 @@ class RealModelEngine:
 
         # --- control: the objective says what we want, the controller finds it
         cnr_fb = xs[:, CNR : CNR + 1]  # (N,1) feedback = cnr at last real frame
-        best_ms = self.controller.solve(self, h_new, c_new, cnr_fb, self.objective, ctx)
+        # plan() rather than solve(), because the plan's cost is logged: it is what
+        # separates "the controller knew it could not reach the reference" from "the
+        # controller expected to reach it and was wrong". On the border-probing arms
+        # that distinction IS the measurement, and a log carrying only the applied
+        # dose cannot make it without a full replay.
+        plan_ms, plan_cost = self.controller.plan(
+            self, h_new, c_new, cnr_fb, self.objective, ctx
+        )
+        best_ms = self.controller.apply_gate(plan_ms, self.objective, ctx)
+        self.last_plan_cost = [float(v) for v in plan_cost]
+
+        # One-step prediction under the dose about to be commanded. One extra
+        # decoder step for N cells, against the CEM's 512 plans x H steps — free in
+        # practice, and it turns every frame into a one-step model-error
+        # measurement: the drift of (achieved delta / predicted delta) is a direct
+        # per-cell sensitivity readout that needs no rolling regression.
+        fut1 = self.std_fluence(best_ms.reshape(N, 1, 1))
+        pred1 = self.denorm_cnr(self.rollout(h_new, c_new, cnr_fb, fut1))  # (N, 1)
+        self.last_pred_cnr_h1 = [float(v) for v in pred1[:, 0]]
 
         # --- persist new encoder state + the APPLIED fluence ------------------
         # Only u[0] is applied; the rest of the optimized plan is discarded and

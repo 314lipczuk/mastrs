@@ -108,7 +108,14 @@ levels_ms = [0, 20, 45, 85, 150]
 # there is no admissible period. That is not a number to pick quietly — it means
 # either extending the horizon (needs a checkpoint with a larger future_len) or
 # accepting a partly untrackable reference by design. Escalate.
-objective = { type = "oscillation", low = 0.85, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15, tau_decay_min = 7.3, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+#
+# 2026-08-06: tau_decay_min = 7.3 was removed from this line along with the two
+# plant-side guards and the period/horizon guard it fed. The waveform is UNCHANGED
+# — tau never entered value_at, it only gated — so this file still defines exactly
+# the run it defined before. The bounds quoted above are now checked in the
+# pre-flight (experiments/policy_preflight.py), against measured distributions
+# rather than against a hand-typed tau.
+objective = { type = "oscillation", low = 0.85, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
 
 # Fallback for any FOV not listed below (none, here) — mirror arm 1.
 controller = { type = "constant_dose" }
@@ -123,11 +130,12 @@ lambda_move = 0.0
 #   arm  3 4 1 2 3 4 2 1 3 4
 #
 # !! arm = (fov % 4) + 1 NO LONGER HOLDS. That identity was a property of the
-# 12-FOV file and is hardcoded in the analysis path — soak.py:177 (`arm_of`),
-# soak.py:260 (`server_timings`) and tests/test_serving_service.py:238. Against
-# this file those produce SILENTLY WRONG arm labels (e.g. fov 0 is arm 3, not
-# arm 1). Pass an explicit map, or the per-arm latency table and every pooled
-# per-arm result are mislabelled rather than merely noisy. The map is:
+# 12-FOV file, and it used to be hardcoded across the analysis path, silently
+# mislabelling every per-arm row against this file (fov 0 is arm 3, not arm 1).
+#
+# 2026-08-06: each [fov.N] block below now declares `arm = N` explicitly, and
+# `optoerk.serving.policy.arm_map()` is the single reader. Nothing derives an arm
+# from the FOV index any more. The map is:
 #
 #   ARM_OF = {0: 3, 1: 4, 2: 1, 3: 2, 4: 3, 5: 4, 6: 2, 7: 1, 8: 3, 9: 4}
 #
@@ -163,10 +171,12 @@ lambda_move = 0.0
 # --- arm 1: constant dose, L2, no move penalty ------------------------------
 # n = 2 (one replicate cut from the 12-FOV design)
 [fov.2]
+arm = 1
 controller = { type = "constant_dose" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.7]
+arm = 1
 controller = { type = "constant_dose" }
 kernel = "l2"
 lambda_move = 0.0
@@ -176,38 +186,46 @@ lambda_move = 0.0
 # Must be bit-for-bit the existing controller. Guarded by
 # tests/test_serving_control.py::test_refactor_reproduces_the_pre_refactor_controller
 [fov.3]
+arm = 2
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.6]
+arm = 2
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.0
 
 # --- arm 3: sequence MPC, L2, move penalty ON -------------------------------
 [fov.0]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 [fov.4]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 [fov.8]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 
 # --- arm 4: sequence MPC, band kernel, move penalty ON ----------------------
 [fov.1]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.05 }
 lambda_move = 0.6
 [fov.5]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.05 }
 lambda_move = 0.6
 [fov.9]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.05 }
 lambda_move = 0.6

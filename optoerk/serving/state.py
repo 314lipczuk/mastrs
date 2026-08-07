@@ -43,6 +43,13 @@ class CellState:
     baseline_samples: list[float] = field(default_factory=list)
     baseline: float | None = None
     last_cnr_norm: float = 1.0
+    # optoRTK expression: the cell's mCitrine measurements (one per optocheck)
+    # and the session-relative percentile drawn from them. The rank is
+    # owned by `expression.ExpressionCohort` — it needs the whole session's cells
+    # to compute — and is cached here only so the log and the model input can read
+    # it per cell. Frozen once the window fills; see that module for why.
+    c0_samples: list[float] = field(default_factory=list)
+    optortk_rank: float | None = None
     # bookkeeping
     last_timestep: int = -1
     last_seen_timestep: int = -1

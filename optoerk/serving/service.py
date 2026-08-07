@@ -15,7 +15,14 @@ import time
 from typing import Any
 
 from optoerk.serving.config import ServerConfig
-from optoerk.serving.features import compute_crowding, extract_raw_cnr
+from optoerk.serving.expression import ExpressionCohort
+from optoerk.serving.features import (
+    OPTORTK_KEYS,
+    compute_crowding,
+    extract_nuc_area,
+    extract_optortk_value,
+    extract_raw_cnr,
+)
 from optoerk.serving.gpu import GpuSampler, cuda_mem_mb
 from optoerk.serving.objectives import GoalContext
 from optoerk.serving.policy import PolicyRouter, load_policy_file
@@ -48,6 +55,33 @@ class InferenceService:
         self.cnr_mode = self.info.get("cnr_mode", "norm")
         self._n_predict = 0
 
+        # Live optoRTK expression. ONE cohort for the whole service, not one per
+        # FOV: offline the cohort is the imaging session, so ranking per field
+        # would make each field its own population and change what the feature
+        # means. Everything else here is namespaced by FOV; this deliberately is
+        # not.
+        self._n_optortk_seen = 0
+        self._optortk_checked = False
+        self.cohort: ExpressionCohort | None = (
+            ExpressionCohort(
+                baseline_frames=self.cfg.optortk_baseline_frames,
+                cohort_frames=self.cfg.optortk_cohort_frames,
+                # The policy declares the run's fields, so the cohort can wait for
+                # ALL of them rather than sealing on whichever reports first.
+                expected_fovs=(frozenset(policy_file.fov)
+                               if policy_file and policy_file.fov else None),
+            )
+            if self.cfg.live_optortk_expr
+            else None
+        )
+        if self.cohort is not None and self.cfg.override_optortk_expr:
+            raise ValueError(
+                "live_optortk_expr and override_optortk_expr are both set. The "
+                "override feeds a fixed value to every cell, which is exactly what "
+                "the live feature exists to stop doing — pick one."
+            )
+        print(f"[serving] optoRTK expression: {self.optortk_expr_mode()}")
+
         # Optional structured prediction log (see optoerk.serving.predict_log).
         self._logger: PredictLogger | None = None
         self._gpu_sampler: GpuSampler | None = None
@@ -65,6 +99,10 @@ class InferenceService:
                     # complete record of what it actually ran, and the replay
                     # harness can rebuild it without the original policy file.
                     "policies": self.router.describe(),
+                    # Which of the three optoRTK-expression regimes this run used.
+                    # It changes what the controller can condition on, so a run is
+                    # only comparable to another with the same value here.
+                    "optortk_expr": self.optortk_expr_mode(),
                 }
             )
             # Background GPU telemetry (CUDA only) — runs off the prediction path
@@ -81,6 +119,68 @@ class InferenceService:
         # Ready to serve as soon as an engine (real or stub) is loaded.
         return {"status": "ok", "model_loaded": self.model_loaded}
 
+    def _check_optortk_coverage(self, fov: int, timestep: int, n_seen: int) -> None:
+        """Fail when the cohort seals with nobody in it.
+
+        Most frames legitimately carry no optoRTK value: the optocheck is its own
+        short acquisition, run once or twice per experiment, so per-frame absence
+        is the normal case and never an error.
+
+        The real failure is structural — the cohort window closed and not one cell
+        ever supplied a measurement. That means the acquisition has no optocheck /
+        reference channel wired up, or faro dropped the column: `RefFE` writes
+        `ref_mean_intensity`, but `InferenceServerStim._current_cells` keeps only
+        identity columns plus the columns ITS OWN feature extractor produced, and
+        the ref extractor is a different one. Aborting beats feeding every cell the
+        population mean, which would look exactly like a successful run.
+        """
+        self._n_optortk_seen += n_seen
+        if not self.cohort.sealed or self._optortk_checked:
+            return
+        self._optortk_checked = True
+        if self.cohort.n_cells > 0:
+            return
+        raise ValueError(
+            f"live_optortk_expr is on but the expression cohort sealed EMPTY at "
+            f"fov {fov} timestep {timestep}: no cell supplied any of {OPTORTK_KEYS} "
+            f"in the first {self.cohort.cohort_frames} frames. Either the "
+            f"acquisition has no optocheck/reference channel, or faro is not "
+            f"forwarding it — `RefFE` writes `ref_mean_intensity` into the tracks, "
+            f"but InferenceServerStim keeps only its own feature extractor's "
+            f"columns, so it has to be let through explicitly. Raise "
+            f"optortk_cohort_frames if the first optocheck lands later than that."
+        )
+
+    def optortk_expr_mode(self) -> dict:
+        """Which optoRTK-expression regime this run is in, for the log and /info.
+
+        Three regimes, and they are not interchangeable — the feature is a per-cell
+        gain covariate, so it changes what the controller can condition on:
+
+          ``live``     per-cell session-relative rank, reconstructed online
+          ``constant`` one operator-chosen value for every cell
+          ``neutral``  the channel's training population mean for every cell,
+                       i.e. every cell treated as a median expresser
+
+        ``neutral`` is the historical default and is still a constant — dropping
+        ``--optortk-expr-value`` moves between the two constant regimes, it does
+        not turn the feature on.
+        """
+        if self.cohort is not None:
+            return {
+                "mode": "live",
+                "source": "payload ref_mean_intensity (mCitrine optocheck), session-ranked",
+                # How many (cell, frame) pairs actually carried a measurement.
+                # Small by design — the optocheck runs once or twice per run.
+                "n_optortk_values_seen": self._n_optortk_seen,
+                **self.cohort.describe(),
+            }
+        fed = getattr(self.engine, "optortk_fed", None)
+        return {
+            "mode": "constant" if self.cfg.override_optortk_expr else "neutral",
+            "value_fed": None if fed is None else float(fed),
+        }
+
     def info_dict(self) -> dict:
         with self.lock:
             return {
@@ -93,6 +193,7 @@ class InferenceService:
                 "output_units": "exposure_milliseconds",
                 "exposure_range_ms": [self.cfg.min_exposure_ms, self.cfg.max_exposure_ms],
                 "policies": self.router.describe(),
+                "optortk_expr": self.optortk_expr_mode(),
                 "calibration": {
                     "instrument": self.cfg.instrument,
                     "stim_power_pct": self.cfg.stim_power_pct,
@@ -174,6 +275,7 @@ class InferenceService:
             and timestep < window_start + cfg.baseline_frames
         )
 
+        n_with_optortk = 0
         frames: list[CellFrame] = []
         particles: list[int] = []
         dark_flags: list[bool] = []
@@ -234,12 +336,26 @@ class InferenceService:
                             st.seed_baseline(fb, cfg.baseline_frames)
                     cnr_norm = st.normalize(raw_cnr)
 
+            # Live optoRTK expression rank, if enabled. `observe` folds this
+            # frame's measurement into the cell's window and returns its rank
+            # while the window fills, frozen once it is full.
+            expr = None
+            if self.cohort is not None:
+                # None on the many frames that are not optochecks — normal, not a
+                # gap. `observe` also returns None while the cohort is still open.
+                value = extract_optortk_value(cell)
+                if value is not None:
+                    n_with_optortk += 1
+                expr = self.cohort.observe(fov, st, value, timestep)
+
             frames.append(
                 CellFrame(
                     state=st,
                     cnr_norm=cnr_norm,
                     fov_density=float(fov_density[i]),
                     n_cells_200px=float(n200[i]),
+                    optortk_expr=expr,
+                    nuc_area=extract_nuc_area(cell),
                     # Not model inputs — objectives gate on position (e.g. "only
                     # the right half of the field"). Missing -> NaN, which fails
                     # every position predicate rather than silently passing.
@@ -267,6 +383,9 @@ class InferenceService:
                         "dark": bool(dark),
                     }
                 )
+
+        if self.cohort is not None:
+            self._check_optortk_coverage(fov, timestep, n_with_optortk)
 
         engine = self.router.engine_for(fov)
         goal_ctx = GoalContext(fov=fov, timestep=timestep, cells=frames)
@@ -313,10 +432,30 @@ class InferenceService:
                 if objective is not None and hasattr(objective, "annotate")
                 else [{}] * len(frames)
             )
-            for rec, f, ms, note in zip(log_cells, frames, ms_list, notes):
+            # What the controller believed about the plan it picked. `None` on the
+            # stub, which has neither a cost nor a forward model.
+            costs = getattr(engine, "last_plan_cost", None) or [None] * len(frames)
+            preds = getattr(engine, "last_pred_cnr_h1", None) or [None] * len(frames)
+            for rec, f, ms, note, cost, pred in zip(
+                log_cells, frames, ms_list, notes, costs, preds
+            ):
                 rec["exposure_ms"] = float(0.0 if rec["dark"] else ms)
                 rec["fluence_out"] = float(f.state.last_fluence)
-                rec["optortk_expr"] = None if optortk is None else float(optortk)
+                # Per-cell when the live feature is on, the engine-wide constant
+                # otherwise. Same key either way, so the analysis reads one column
+                # and `optortk_live` next to it says which it is.
+                rec["optortk_expr"] = (
+                    float(f.optortk_expr) if f.optortk_expr is not None
+                    else (None if optortk is None else float(optortk))
+                )
+                rec["optortk_live"] = f.optortk_expr is not None
+                rec["plan_cost"] = None if cost is None else float(cost)
+                # decide() predicted under the dose it commanded; a dark cell is
+                # forced to 0 ms afterwards, so that prediction is for a dose that
+                # was never applied. Null rather than log a number that is wrong.
+                rec["pred_cnr_h1"] = (
+                    None if pred is None or rec["dark"] else float(pred)
+                )
                 rec.update(note)
             self._logger.write(
                 {

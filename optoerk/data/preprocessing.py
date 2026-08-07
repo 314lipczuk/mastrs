@@ -653,39 +653,57 @@ def add_crowding_features(
 def add_optortk_expression(
     df,
     *,
-    baseline_frames: int = 10,
     cohort_col: str = "original_experiment_name",
+    value_col: str = "mcitrine",
 ):
     """Add per-cell optoRTK expression as a session-relative percentile rank.
 
-    Expression proxy = whole-cell C0 intensity (mean of nuclear + ring C0),
-    summarized per cell by its **median over the baseline frames**
-    (``frame < baseline_frames``, i.e. pre-stimulation), then **rank-normalized
-    to (0, 1] within each cohort** (default: ``original_experiment_name`` = one
-    imaging session). Broadcast to every frame of the cell — expression is static
-    (within-cell temporal CV ~1%). Column added: ``optortk_expr``.
+    The measurement is **mCitrine**, imaged in its own short optocheck/reference
+    acquisition once or twice per experiment, so it arrives as one value per cell
+    already. This function only ranks it: **rank-normalized to (0, 1] within each
+    cohort** (default ``original_experiment_name`` = one imaging session), then
+    broadcast to every frame. Column added: ``optortk_expr``.
 
-    Ranking within the session is invariant to the per-session imaging gain (raw
-    C0 differs ~2x across sessions), so the feature is comparable across
-    experiments and reproducible **live** from the current session's co-imaged
-    cells — no frozen dataset statistics required (the population analog of the
-    per-cell baseline normalization already used for CNR).
+    **Why a rank and not a z-score.** Raw mCitrine is not comparable across
+    sessions — medians span 3x with the imaging gain. Neither is a z-score:
+    z-scoring is affine, so it cannot change shape, and the shapes genuinely
+    differ (skew 3.0 to 13.3 across the eleven training experiments). Taking a log
+    first fixes the bulk but *worsens* the tail; measured cross-experiment
+    disagreement at p99 is 185% (linear z), 359% (log + MAD) and 0% (rank), as a
+    fraction of each transform's own spread. Only a rank aligns the
+    high-expresser tail, which is the part a gain covariate exists to capture.
+    A rank is also bounded and outlier-proof, which is what makes it safe to
+    reconstruct live from co-imaged cells (``optoerk.serving.expression``).
 
-    Cells with no baseline frames get NaN (dropped downstream by
-    ``make_tracks(drop_nan_cells=True)``).
+    The ranking is stable: between two optochecks 5.5 h apart the per-cell rank
+    correlates at 0.92 and only 9% of cells cross the median, even though absolute
+    intensity drifts down 6.4% — everything drifts together, and a within-session
+    ordering absorbs that.
+
+    Cells with no mCitrine (~1% — a (fov, particle) that did not join back
+    upstream) rank as the population median rather than being dropped: online
+    they still have to be steered, so the offline feature must define them.
+
+    Raises if ``value_col`` is absent. There used to be a fallback here — whole-
+    cell C0 (miRFP) from the timelapse — and it was silently wrong: measured
+    against mCitrine on the same cells it reaches only Spearman 0.60-0.71 and
+    misplaces 27-30% of cells across a high/low split. Build the bundle with
+    ``experiments/build_mcitrine_dataset.py`` instead of substituting a proxy.
     """
+    if value_col not in df.columns:
+        raise KeyError(
+            f"add_optortk_expression needs a {value_col!r} column (per-cell mCitrine). "
+            f"Build the bundle with experiments/build_mcitrine_dataset.py; the raw "
+            f"C0 channels are NOT a substitute (see this function's docstring)."
+        )
     df = df.copy()
-    bl = df.loc[
-        df["frame"] < baseline_frames,
-        ["uid", cohort_col, "mean_intensity_C0_nuc", "mean_intensity_C0_ring"],
-    ].copy()
-    bl["_c0"] = 0.5 * (bl["mean_intensity_C0_nuc"] + bl["mean_intensity_C0_ring"])
-    per_cell = bl.groupby("uid").agg(
-        _expr=("_c0", "median"), _cohort=(cohort_col, "first")
+    per_cell = df.groupby("uid").agg(
+        _expr=(value_col, "first"), _cohort=(cohort_col, "first")
     )
-    per_cell["optortk_expr"] = (
-        per_cell.groupby("_cohort")["_expr"].rank(pct=True).astype(np.float32)
-    )
+    ranked = per_cell.groupby("_cohort")["_expr"].rank(pct=True)
+    # Unmeasured cells sit at the median of their own session, i.e. "no evidence
+    # either way", which is exactly what the model's neutral value means.
+    per_cell["optortk_expr"] = ranked.fillna(0.5).astype(np.float32)
     df["optortk_expr"] = df["uid"].map(per_cell["optortk_expr"]).astype(np.float32)
     return df
 

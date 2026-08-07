@@ -429,12 +429,29 @@ def make_cell_video(
         # wrong-scale cnr and true-vs-pred are in different units. Old bundles
         # predate the field and default to "norm".
         cnr_mode = bundle.model_config.get("cnr_mode", "norm")
-        print(f"[cell_video] cnr_mode={cnr_mode!r} (from bundle config)")
+        # Load the features THIS bundle was trained on, in its own channel order —
+        # not a hardcoded default. `predict_history_cell` zips the stim rows
+        # against `model.cfg.norm_channels`, so a mismatch here would feed the
+        # model the right number of wrong channels. Bundles predating the field
+        # fall back to the historical four.
+        features = list(bundle.model_config.get("norm_channels") or [])[1:] or None
+        # The dataset has to carry every one of them. `nuc_area` and the real
+        # mCitrine-derived `optortk_expr` only exist in the mCitrine bundle;
+        # `dataset_all.parquet` has no `mcitrine` column at all and the loader
+        # now refuses it rather than falling back to the old C0 surrogate.
+        dataset = "dataset_all_mcitrine.parquet"
+        if not materials_path(dataset).exists():
+            dataset = "dataset_all.parquet"
+            print(f"[cell_video] WARNING: mCitrine bundle missing, falling back to "
+                  f"{dataset} — this will fail for any model using nuc_area, and "
+                  f"the expression channel will not match training.")
+        print(f"[cell_video] cnr_mode={cnr_mode!r} dataset={dataset} "
+              f"features={features} (from bundle config)")
         cnr_arr, feats_arr, conditions, _hist_meta = load_history_tracks(
-            materials_path("dataset_all.parquet"), cnr_mode=cnr_mode
+            materials_path(dataset), cnr_mode=cnr_mode, features=features
         )
         cnr_list = [np.asarray(c, dtype=np.float32) for c in cnr_arr]
-        # stim rows = [u_t, fov_density, n_cells_200px]; predict_fn reads them.
+        # stim rows are in the model's channel order; predict_fn reads them BY NAME.
         stim_list = [np.asarray(f, dtype=np.float32) for f in feats_arr]
     else:
         # Match the training-time baseline prepend so the video shows the same

@@ -122,6 +122,35 @@ def frames_summary(frames: dict[int, list[dict]], cycles: int) -> str:
             f"p50={counts[len(counts) // 2]} max={counts[-1]}")
 
 
+def augment_cells(frames: dict[int, list[dict]]) -> dict[int, list[dict]]:
+    """Add the per-cell fields a modern checkpoint needs, where they are missing.
+
+    Two channels arrived after the existing predict logs were written, so a
+    replayed payload does not carry them and a synthetic one never did:
+
+      * ``ref_mean_intensity`` — the mCitrine optoRTK measurement. WITHOUT IT a
+        server running ``--live-optortk-expr`` aborts: the expression cohort seals
+        with nobody in it, which is the correct response to a run whose reference
+        channel never arrives, and a fatal one for a benchmark.
+      * ``area_nuc`` — the payload spelling of the ``nuc_area`` channel.
+
+    Values are deterministic in ``(fov, particle)`` so a soak is reproducible, and
+    static per cell because that is what the real quantities are. They are
+    fabricated: fine for a LATENCY benchmark, where compute depends on the number
+    of cells and not on what the numbers say, and meaningless for anything else.
+    """
+    for fov, seq in frames.items():
+        for payload in seq:
+            for c in payload.get("cells", []):
+                pid = int(c.get("particle", 0))
+                if not any(k in c for k in ("ref_mean_intensity",
+                                            "optocheck_mean_intensity")):
+                    c["ref_mean_intensity"] = 400.0 + (pid * 7919 % 2100)
+                if "area_nuc" not in c and "nuc_area" not in c:
+                    c["area_nuc"] = 120.0 + (pid * 104729 % 180)
+    return frames
+
+
 def payloads_synthetic(n_fovs: int, n_frames: int, n_cells: int) -> dict[int, list[dict]]:
     """Flat synthetic fallback when no previous log is available.
 
@@ -174,7 +203,7 @@ def drive(
     cycles: int,
     cycle_seconds: float,
     concurrency: int,
-    arm_of=lambda fov: fov % 4 + 1,
+    arms: dict[int, int] | None = None,
 ) -> pl.DataFrame:
     """Issue one predict per (cycle, FOV) on the real acquisition schedule.
 
@@ -197,7 +226,7 @@ def drive(
             secs, status, err = _post(url, payload, FARO_STIM_MASK_TIMEOUT_S + 20)
             with lock:
                 rows.append({
-                    "cycle": cycle, "fov": fov, "arm": arm_of(fov),
+                    "cycle": cycle, "fov": fov, "arm": (arms or {}).get(fov, 1),
                     "n_cells": len(payload.get("cells", [])),
                     "seconds": secs, "status": status, "error": err,
                     # how late the request was dispatched relative to its slot:
@@ -228,7 +257,8 @@ def drive(
 # ---------------------------------------------------------------------------
 
 
-def server_timings(log_path: str | Path, since: float) -> pl.DataFrame:
+def server_timings(log_path: str | Path, since: float,
+                   arms: dict[int, int] | None = None) -> pl.DataFrame:
     """The server's own latency decomposition per prediction, since ``since``.
 
     Client-side round-trip says *whether* it was slow; this says *why* —
@@ -257,7 +287,7 @@ def server_timings(log_path: str | Path, since: float) -> pl.DataFrame:
             t = rec.get("timing", {}) or {}
             rows.append({
                 "fov": rec.get("fov"), "timestep": rec.get("timestep"),
-                "arm": (rec.get("fov") or 0) % 4 + 1,
+                "arm": (arms or {}).get(rec.get("fov"), 1),
                 "n_scored": rec.get("n_scored"),
                 "lock_wait_s": t.get("lock_wait_s"),
                 "infer_s": t.get("infer_s"),
@@ -395,7 +425,16 @@ def main():
                    help="skip this many frames into --from-log. Use it to soak "
                         "against the CROWDED late part of a run rather than the "
                         "sparse first frames — hour 12 is the question, not hour 1.")
-    p.add_argument("--n-fovs", dest="n_fovs", type=int, default=12)
+    p.add_argument("--n-fovs", dest="n_fovs", type=int, default=None,
+                   help="fields to drive (default: the policy's FOV count, else 12)")
+    p.add_argument("--live-optortk-expr", dest="live_optortk_expr",
+                   action="store_true",
+                   help="benchmark with live per-cell optoRTK expression on, as "
+                        "the real run uses it. Payloads are augmented with a "
+                        "fabricated reference measurement so the cohort can seal; "
+                        "latency is representative, the ranks are not.")
+    p.add_argument("--optortk-cohort-frames", dest="optortk_cohort_frames",
+                   type=int, default=None)
     p.add_argument("--n-cells", dest="n_cells", type=int, default=208,
                    help="synthetic cells per FOV when --from-log is not given")
     p.add_argument("--cycles", type=int, default=20)
@@ -406,13 +445,41 @@ def main():
     p.add_argument("--out", default=None, help="write client latencies parquet here")
     args = p.parse_args()
 
-    frames = (
+    # Default the field count to the policy's, so a 10-FOV policy is not
+    # benchmarked as 12 with two FOVs silently falling back to [default].
+    if args.n_fovs is None:
+        if args.policy_file:
+            from optoerk.serving.policy import load_policy_file as _lpf
+
+            args.n_fovs = len(_lpf(args.policy_file).fov) or 12
+            print(f"[soak] --n-fovs not given; using {args.n_fovs} from the policy")
+        else:
+            args.n_fovs = 12
+
+    frames = augment_cells(
         payloads_from_log(args.from_log, args.n_fovs, args.start_frame)
         if args.from_log
         else payloads_synthetic(args.n_fovs, args.cycles, args.n_cells)
     )
     print(f"[soak] {args.n_fovs} FOVs, {args.cycles} cycles; "
           f"{frames_summary(frames, args.cycles)}")
+
+    # Arm labels come from the policy file, never from a formula over the FOV
+    # index — the 10-FOV layouts interleave arms to balance stage position, so
+    # `fov % 4 + 1` mislabels every row against them. Without a policy file there
+    # is only one arm, and saying so beats inventing four.
+    arms: dict[int, int] = {}
+    if args.policy_file:
+        from optoerk.serving.policy import arm_map, load_policy_file
+
+        arms = arm_map(load_policy_file(args.policy_file))
+        by_arm: dict[int, list[int]] = defaultdict(list)
+        for fov, arm in sorted(arms.items()):
+            by_arm[arm].append(fov)
+        print("[soak] arms from policy: " + "; ".join(
+            f"arm {a} -> fov {fovs}" for a, fovs in sorted(by_arm.items())))
+    elif args.url is None:
+        print("[soak] no --policy-file: every FOV is reported as arm 1")
 
     server = None
     url = args.url
@@ -425,8 +492,14 @@ def main():
         cfg = ServerConfig(
             device=args.device, checkpoint_dir=args.checkpoint,
             policy_file=args.policy_file, predict_log_path=args.predict_log,
-            port=0,
+            port=0, live_optortk_expr=args.live_optortk_expr,
         )
+        if args.optortk_cohort_frames is not None:
+            cfg.optortk_cohort_frames = args.optortk_cohort_frames
+        if args.live_optortk_expr:
+            print("[soak] live optoRTK expression ON — the cohort ranks a "
+                  "FABRICATED reference measurement. Latency is representative; "
+                  "the per-cell ranks are not.")
         pf = None
         if args.allow_placeholders and args.policy_file:
             # Benchmarking before the measured values exist is exactly the case
@@ -466,11 +539,12 @@ def main():
     # not, and must not contribute to rho.
     t_window = time.time()
     t0 = time.perf_counter()
-    client = drive(url, frames, args.cycles, args.cycle_seconds, args.concurrency)
+    client = drive(url, frames, args.cycles, args.cycle_seconds, args.concurrency,
+                   arms=arms)
     print(f"[soak] {client.height} requests in {time.perf_counter() - t0:.1f} s")
 
     srv = (
-        server_timings(args.predict_log, since=t_window)
+        server_timings(args.predict_log, since=t_window, arms=arms)
         if args.predict_log and Path(args.predict_log).exists()
         else pl.DataFrame()
     )

@@ -7,7 +7,9 @@ Pieces, in order of construction:
   * (added next) sliding sample generation with self-concat random-break
     augmentation and the T-F context cap.
 
-Input channels per frame = ``CHANNELS`` = [cnr] + HISTORY_FEATURES. cnr is also
+Input channels per frame = ``channels_for(features)`` = [cnr] + features. The
+channel list is per-run (the encoding comparison varies it) and travels on
+:class:`NormStats`, so a bundle is self-describing. cnr is also
 the MDN target, kept in its native cnr units (baseline-normalized
 `cnr_median_norm` or raw `cnr_median`, per the training ``cnr_mode``); the
 encoder-input cnr is standardized like the other channels. The frozen z-score
@@ -26,7 +28,17 @@ from torch.utils.data import Dataset
 from optoerk.data.baseline_prepend import bootstrap_baseline_indices, prepend_channels
 from optoerk.data.history_data import CNR_MODES, HISTORY_FEATURES
 
-CHANNELS = ["cnr", *HISTORY_FEATURES]  # ["cnr", "u_t", "fov_density", "n_cells_200px", "optortk_expr"]
+
+def channels_for(features: list[str] | None = None) -> list[str]:
+    """Full input channel order for a feature set: cnr first, then the features.
+
+    There is deliberately no module-level ``CHANNELS`` constant any more. The
+    channel list is per-run (the encoding comparison varies it), and a global
+    would silently disagree with whichever variant is loaded. Everything
+    downstream reads the order off :class:`NormStats`, which carries it, so a
+    bundle is self-describing.
+    """
+    return ["cnr", *(features if features is not None else HISTORY_FEATURES)]
 
 
 def stats_path_for_mode(cnr_mode: str = "norm") -> Path:
@@ -102,28 +114,30 @@ def compute_norm_stats(
     feats: np.ndarray,
     train_idx: np.ndarray,
     *,
+    features: list[str] | None = None,
     std_floor: float = 1e-6,
 ) -> NormStats:
     """Per-channel mean/std over all frames of the TRAIN cells only.
 
     ``cnr`` : object array of (T,) ; ``feats`` : object array of (K, T) with
-    rows ordered as HISTORY_FEATURES. Channel order = CHANNELS.
+    rows ordered as ``features``. Channel order = ``channels_for(features)``.
     """
+    n_feat = int(np.asarray(feats[train_idx[0]]).shape[0])
+    channels = channels_for(features)
+    if len(channels) != n_feat + 1:
+        raise ValueError(
+            f"feature list {channels} implies {len(channels)} channels but the "
+            f"data has {n_feat + 1}; pass the same `features` used to load."
+        )
     cnr_vals = np.concatenate([np.asarray(cnr[i], np.float64) for i in train_idx])
     feat_vals = [
         np.concatenate([np.asarray(feats[i], np.float64)[k] for i in train_idx])
-        for k in range(len(HISTORY_FEATURES))
+        for k in range(n_feat)
     ]
     cols = [cnr_vals, *feat_vals]
     mean = [float(c.mean()) for c in cols]
     std = [float(max(c.std(), std_floor)) for c in cols]
-    return NormStats(channels=list(CHANNELS), mean=mean, std=std)
-
-
-# Channel index of the fluence (u_t) within CHANNELS — the only future/decoder
-# input (commanded; future crowding is unknown live).
-FLU_IDX = CHANNELS.index("u_t")
-CNR_IDX = CHANNELS.index("cnr")
+    return NormStats(channels=channels, mean=mean, std=std)
 
 
 class HistoryDataset(Dataset):
@@ -157,11 +171,22 @@ class HistoryDataset(Dataset):
         n_baseline: int = 10,
         prepend_baseline: bool = False,
         prepend_len: int = 30,
+        future_channels: list[str] | None = None,
         seed: int = 0,
     ):
         self.cnr = cnr
         self.feats = feats
         self.F = F
+        # Channel order comes off the stats, so the dataset cannot disagree with
+        # the normalization it was handed.
+        self.channels = list(stats.channels)
+        self.cnr_idx = self.channels.index("cnr")
+        self.flu_idx = self.channels.index("u_t")
+        # Known-future/decoder inputs. Always the commanded fluence; a variant may
+        # add a deterministic function of it (e.g. fluence * expression), which is
+        # equally knowable ahead of time.
+        self.future_channels = list(future_channels or ["u_t"])
+        self.fut_idx = [self.channels.index(c) for c in self.future_channels]
         self.t_min = t_min
         # Drop tracks too short to yield a full sample: a prediction point needs
         # at least t_min frames of context and a full F-length future ahead, so
@@ -199,7 +224,7 @@ class HistoryDataset(Dataset):
         if len(m) != _ndata:
             raise ValueError(
                 f"norm stats have {len(m)} channels but data has {_ndata} "
-                f"(CHANNELS={CHANNELS}); the stats are stale for the current feature set"
+                f"(channels={self.channels}); the stats are stale for this feature set"
             )
 
     def reseed(self, seed: int) -> None:
@@ -212,7 +237,7 @@ class HistoryDataset(Dataset):
         """Raw per-frame channel matrix (T, C) = [cnr, u_t, fov_density, n_cells_200px].
 
         When ``prepend_baseline`` is set, ``prepend_len`` block-bootstrapped
-        baseline-like frames are prepended (light channel ``FLU_IDX`` zeroed, all
+        baseline-like frames are prepended (the fluence channel zeroed, all
         others gathered from the same baseline indices), so the stimulation onset
         becomes predictable from a synthesised resting history.
         """
@@ -223,7 +248,7 @@ class HistoryDataset(Dataset):
             cols = prepend_channels(
                 [X[:, j] for j in range(X.shape[1])],
                 self.prepend_len,
-                zero_channels={FLU_IDX},
+                zero_channels={self.flu_idx},
                 n_baseline=self.n_baseline,
                 block_len=self.break_block_len,
                 rng=self.rng,
@@ -249,15 +274,15 @@ class HistoryDataset(Dataset):
                 nb = min(self.n_baseline, T)
                 bidx = bootstrap_baseline_indices(nb, g, self.break_block_len, rng)
                 brk = X[bidx].copy()                         # (g, C) baseline-like
-                brk[:, FLU_IDX] = 0.0                        # no light during rest
+                brk[:, self.flu_idx] = 0.0                        # no light during rest
             else:
                 brk = np.zeros((0, C), np.float32)
             # S = copy1 ++ break(g) ++ copy2; predict at copy-2 index tau.
             S = np.concatenate([X, brk, X], axis=0)
             t = T + g + tau                                  # absolute prediction point
             ctx = S[t - (T - F) : t]                         # last T-F frames; excludes copy-1's [tau:tau+F]
-            fut_flu = X[tau : tau + F, FLU_IDX]              # copy-2 future == original
-            tgt = X[tau : tau + F, CNR_IDX]
+            fut = X[tau : tau + F][:, self.fut_idx]              # copy-2 future == original
+            tgt = X[tau : tau + F, self.cnr_idx]
         else:
             # t + F <= T is guaranteed: tracks shorter than F + t_min are dropped
             # at construction (see __init__), so t_hi = T - F >= t_min and the
@@ -265,18 +290,18 @@ class HistoryDataset(Dataset):
             t_hi = T - F
             t = int(rng.integers(t_min, t_hi + 1))
             ctx = X[0:t]
-            fut_flu = X[t : t + F, FLU_IDX]
-            tgt = X[t : t + F, CNR_IDX]
+            fut = X[t : t + F][:, self.fut_idx]
+            tgt = X[t : t + F, self.cnr_idx]
 
         ctx_std = ((ctx - self.mean) / self.std).astype(np.float32)
-        fut_flu_std = ((fut_flu - self.mean[FLU_IDX]) / self.std[FLU_IDX]).astype(np.float32)
+        fut_std = ((fut - self.mean[self.fut_idx]) / self.std[self.fut_idx]).astype(np.float32)
         # Target is standardized cnr too (consistent with the standardized
         # encoder input and the decoder's autoregressive feedback). Denormalize
         # with the cnr stats to recover absolute CNR at the output boundary.
-        tgt_std = ((tgt - self.mean[CNR_IDX]) / self.std[CNR_IDX]).astype(np.float32)
+        tgt_std = ((tgt - self.mean[self.cnr_idx]) / self.std[self.cnr_idx]).astype(np.float32)
         return {
             "ctx": torch.from_numpy(ctx_std),                # (L, C)
-            "fut_flu": torch.from_numpy(fut_flu_std)[:, None],  # (F, 1)
+            "fut_flu": torch.from_numpy(fut_std),               # (F, n_future)
             "tgt": torch.from_numpy(tgt_std),                # (F,) standardized cnr
             "len": int(ctx_std.shape[0]),
         }

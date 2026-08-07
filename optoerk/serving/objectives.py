@@ -202,10 +202,26 @@ class StepTrainReference(Reference):
 
     A sine yields one blended error number. A step train decomposes into rise
     time, overshoot, hold error and fall time, which is what the diagnostics act
-    on and what maps onto the plant's known asymmetry: rises are dose-limited,
-    falls are decay-limited and not adjustable (the controller can only stop light
-    and wait for CRY2 release plus ERK decay). Transitions are **linear** ramps, so
-    "did it keep up" is a slope comparison rather than a shape fit.
+    on and what maps onto the cells' known asymmetry: rises are dose-limited,
+    falls are decay-limited. Transitions are **linear** ramps, so "did it keep up"
+    is a slope comparison rather than a shape fit.
+
+    "Decay-limited" bounds one direction only. A fall *faster* than free decay is
+    unreachable — the controller can only stop light and wait for CRY2 release plus
+    ERK decay. A fall *slower* than free decay is fully controllable: the controller
+    adds light to brake the descent. Nothing here enforces either, deliberately —
+    see the note on removed guards below.
+
+    **No feasibility guard.** This class used to carry a ``tau_decay_min`` parameter
+    and refuse references whose fall or period were short relative to it. That
+    number was hand-typed into the policy file alongside the durations it was
+    checked against, so it could only ever catch self-contradiction, and lowering it
+    legalized anything. Meanwhile ``high`` — the parameter most likely to put a
+    reference out of reach — was never checked at all. Feasibility now lives in the
+    pre-flight check, where it is argued against measured τ and reachable-ceiling
+    distributions and recorded in the policy file, rather than asserted here.
+    A reference that the cells cannot follow is therefore now expressible, which is
+    what the border-probing experiments need.
 
     This is a *reference-tracking* target: the cost kernel is evaluated pointwise
     against ``r_h``. It is not waveform matching (match frequency and amplitude,
@@ -244,7 +260,6 @@ class StepTrainReference(Reference):
         t_rise_min: float,
         t_high_min: float,
         t_fall_min: float,
-        tau_decay_min: float,
         settle_periods: float = 2.0,
         n_phase_groups: int = 4,
         frame_interval_min: float = 1.0,
@@ -255,7 +270,6 @@ class StepTrainReference(Reference):
         self.t_rise_min = float(t_rise_min)
         self.t_high_min = float(t_high_min)
         self.t_fall_min = float(t_fall_min)
-        self.tau_decay_min = float(tau_decay_min)
         self.settle_periods = float(settle_periods)
         self.n_phase_groups = int(n_phase_groups)
         self.frame_interval_min = float(frame_interval_min)
@@ -272,34 +286,12 @@ class StepTrainReference(Reference):
             raise ValueError(
                 f"step_train: high ({self.high}) must exceed low ({self.low})"
             )
-        if self.tau_decay_min <= 0:
-            raise ValueError(f"step_train: tau_decay_min must be > 0, got {tau_decay_min}")
         if self.n_phase_groups < 1:
             raise ValueError(
                 f"step_train: n_phase_groups must be >= 1, got {n_phase_groups}"
             )
         if self.frame_interval_min <= 0:
             raise ValueError("step_train: frame_interval_min must be > 0")
-
-        # The plant-side bound: a fall faster than ~1.5-2 tau demands a decay the
-        # cell cannot deliver, so every arm fails identically and the experiment
-        # separates nothing.
-        if self.t_fall_min < 1.5 * self.tau_decay_min:
-            raise PolicyViolation(
-                f"step_train: t_fall_min={self.t_fall_min} min is shorter than "
-                f"1.5 x tau_decay_min ({1.5 * self.tau_decay_min:.1f} min). Falls "
-                f"are decay-limited — the controller can only stop light and wait, "
-                f"so a fall this fast is untrackable by every arm and the arms "
-                f"cannot separate. Lengthen t_fall_min or state a smaller tau."
-            )
-        # The lower period bound, same physics seen from the whole cycle.
-        if self.period_min < 4.0 * self.tau_decay_min:
-            raise PolicyViolation(
-                f"step_train: period_min={self.period_min} min is below 4 x "
-                f"tau_decay_min ({4.0 * self.tau_decay_min:.1f} min). A period "
-                f"shorter than a few decay constants demands falls that cannot "
-                f"happen."
-            )
 
     @property
     def period_min(self) -> float:
@@ -382,31 +374,6 @@ class StepTrainReference(Reference):
             out.append({"r_t": r, "segment": seg, "phase_offset_min": off})
         return out
 
-    def validate_horizon(self, horizon_frames: int) -> None:
-        """The controller-side period bound (the plant-side ones are in __init__).
-
-        If the period substantially exceeds the planning window the controller
-        never sees an upcoming transition and degenerates into a sequence of
-        setpoint holds — precisely the regime ``constant_dose`` already tracks
-        perfectly well, which voids the entire rationale for the MPC arms.
-        """
-        horizon_min = horizon_frames * self.frame_interval_min
-        if self.period_min > 2.0 * horizon_min:
-            raise PolicyViolation(
-                f"step_train: period_min={self.period_min} min exceeds 2 x the "
-                f"control horizon ({2.0 * horizon_min:.1f} min at "
-                f"{horizon_frames} frames x {self.frame_interval_min} min). The "
-                f"controller cannot see a transition coming inside its planning "
-                f"window, so it degenerates to setpoint holds and arms 2-4 lose "
-                f"their rationale. Either shorten the period, or extend the "
-                f"horizon (needs a checkpoint with a larger future_len).\n"
-                f"NOTE: the lower bound is 4-6 x tau_decay_min "
-                f"({4.0 * self.tau_decay_min:.1f}-{6.0 * self.tau_decay_min:.1f} "
-                f"min). If that crosses the upper bound, the two constraints are "
-                f"incompatible at this horizon — escalate rather than picking a "
-                f"period."
-            )
-
     def describe(self):
         return {
             "type": self.name,
@@ -414,11 +381,200 @@ class StepTrainReference(Reference):
             "t_low_min": self.t_low_min, "t_rise_min": self.t_rise_min,
             "t_high_min": self.t_high_min, "t_fall_min": self.t_fall_min,
             "period_min": self.period_min,
-            "tau_decay_min": self.tau_decay_min,
             "settle_periods": self.settle_periods,
             "settle_min": self.settle_min,
             "n_phase_groups": self.n_phase_groups,
             "frame_interval_min": self.frame_interval_min,
+        }
+
+
+class FrequencyStaircaseReference(Reference):
+    """A step train whose period steps down block by block, then repeats.
+
+    This is the frequency-axis border probe. Each block is a
+    :class:`StepTrainReference` run for a whole number of its own cycles; the
+    blocks play in order and the whole sweep then loops for as long as the
+    acquisition lasts.
+
+    **Amplitude must shrink with period, and that is the design, not a
+    compromise.** A fall from ``high`` to ``low`` toward a resting CNR takes
+    ``tau * ln((high - rest) / (low - rest))`` of free decay, and the controller
+    cannot beat it — there is no inhibitory actuator. At a fixed amplitude every
+    period below ~50 min therefore demands an impossible fall, and the sweep would
+    break at the first step down for a reason arithmetic already predicts. Instead
+    each block demands the *largest* amplitude its own fall can deliver, so the
+    fall is never the trivial binding constraint and what the sweep measures is
+    the real thing: achieved amplitude divided by demanded amplitude, against
+    frequency. That ratio is a Bode magnitude curve and its rolloff is the
+    bandwidth. A ratio near 1 across the sweep says the first-order decay model
+    was right; a ratio that falls says the cells are slower than it.
+
+    **Blocks step in ``low`` as well as ``high``.** Raising the floor with
+    frequency is what makes the fast falls reachable at all (decay from 1.1 to
+    0.95 is far quicker than from 1.1 to 0.87), so ``low`` cannot be held fixed
+    across blocks. The cost is a step in the reference at each block boundary,
+    equal to the difference between adjacent blocks' lows. Because each block runs
+    a whole number of its own cycles, every boundary sits at the bottom of a
+    completed fall with a low hold immediately after — never mid-ramp. Going up
+    the staircase those steps are small and upward (0.02-0.03 CNR, dose-limited
+    and easy); the sweep wrap is one larger downward step back to the slowest
+    block's low, which is decay-limited and must fit inside that block's low hold.
+
+    **Phase** shifts the whole schedule rather than the position within a block,
+    so each cell sees an unbroken waveform and its blocks simply land at different
+    wall-clock times. The settle window stays common to every cell, as it is for
+    :class:`StepTrainReference`. Analysis must group on the logged
+    ``block_index`` / ``sweep_index``, never on wall-clock time.
+
+    There is no ``n_sweeps``: the reference is periodic with period ``sweep_min``
+    and the acquisition length decides how many sweeps happen. ``sweep_index`` is
+    logged so the analysis can tell them apart — comparing a period's blocks
+    between sweep 0 and sweep 1 is the drift-at-matched-frequency measurement.
+    """
+
+    name = "frequency_staircase"
+
+    def __init__(
+        self,
+        blocks: Sequence[dict[str, Any]],
+        settle_min: float = 0.0,
+        n_phase_groups: int = 4,
+        frame_interval_min: float = 1.0,
+    ):
+        if not blocks:
+            raise ValueError("frequency_staircase: needs at least one block")
+        self.settle_min = float(settle_min)
+        self.n_phase_groups = int(n_phase_groups)
+        self.frame_interval_min = float(frame_interval_min)
+        if self.settle_min < 0:
+            raise ValueError("frequency_staircase: settle_min must be >= 0")
+        if self.n_phase_groups < 1:
+            raise ValueError(
+                f"frequency_staircase: n_phase_groups must be >= 1, got "
+                f"{n_phase_groups}"
+            )
+        if self.frame_interval_min <= 0:
+            raise ValueError("frequency_staircase: frame_interval_min must be > 0")
+
+        self.n_cycles: list[int] = []
+        self.refs: list[StepTrainReference] = []
+        for i, block in enumerate(blocks):
+            spec = dict(block)
+            n = int(spec.pop("n_cycles", 1))
+            if n < 1:
+                raise ValueError(
+                    f"frequency_staircase: block {i} has n_cycles={n}; a block must "
+                    f"span a whole number of its own cycles so it starts and ends "
+                    f"on a low hold"
+                )
+            self.n_cycles.append(n)
+            # settle and phase live on the staircase, not inside a block.
+            self.refs.append(
+                StepTrainReference(
+                    settle_periods=0.0, n_phase_groups=1,
+                    frame_interval_min=self.frame_interval_min, **spec,
+                )
+            )
+
+        self.block_min = [
+            r.period_min * n for r, n in zip(self.refs, self.n_cycles)
+        ]
+        self.sweep_min = sum(self.block_min)
+        self._starts: list[float] = []
+        acc = 0.0
+        for d in self.block_min:
+            self._starts.append(acc)
+            acc += d
+
+    def phase_offset_min(self, cell) -> float:
+        """Offset of this cell's whole schedule, from its particle id.
+
+        Sized against the *first* block's period, so it is a phase of the slowest
+        waveform in the sweep and stays small next to the block durations.
+        """
+        if self.n_phase_groups <= 1:
+            return 0.0
+        group = int(getattr(cell.state, "particle", 0)) % self.n_phase_groups
+        return group * self.refs[0].period_min / self.n_phase_groups
+
+    def _locate(
+        self, t_min: float, phase_offset_min: float
+    ) -> tuple[float, str, int, int]:
+        """``(value, segment, block_index, sweep_index)`` at absolute ``t_min``.
+
+        During settle the block and sweep indices are ``-1``: the schema stays
+        fixed so the analysis never has to guess whether a key is missing or the
+        frame was pre-sweep.
+        """
+        if t_min < self.settle_min:
+            return self.refs[0].low, SETTLE, -1, -1
+        u_total = t_min - self.settle_min + phase_offset_min
+        sweep = int(u_total // self.sweep_min)
+        u = u_total % self.sweep_min
+        for i, (start, dur) in enumerate(zip(self._starts, self.block_min)):
+            if u < start + dur:
+                value, segment = self.refs[i]._eval(u - start, 0.0)
+                return value, segment, i, sweep
+        # Only reachable on a float boundary at the very end of the sweep.
+        value, segment = self.refs[-1]._eval(u - self._starts[-1], 0.0)
+        return value, segment, len(self.refs) - 1, sweep
+
+    def value_at(self, t_min: float, phase_offset_min: float = 0.0) -> float:
+        return self._locate(t_min, phase_offset_min)[0]
+
+    def segment_at(self, t_min: float, phase_offset_min: float = 0.0) -> str:
+        return self._locate(t_min, phase_offset_min)[1]
+
+    def values(self, ctx, horizon, device):
+        dt = self.frame_interval_min
+        # One row per phase group, not per cell — same hot-path reason as
+        # StepTrainReference.values.
+        rows: dict[float, list[float]] = {}
+        out = []
+        for cell in ctx.cells:
+            off = self.phase_offset_min(cell)
+            row = rows.get(off)
+            if row is None:
+                row = [
+                    self.value_at((ctx.timestep + h) * dt, off)
+                    for h in range(horizon)
+                ]
+                rows[off] = row
+            out.append(row)
+        return torch.tensor(out, dtype=torch.float32, device=device)
+
+    def annotate(self, ctx):
+        dt = self.frame_interval_min
+        out = []
+        for cell in ctx.cells:
+            off = self.phase_offset_min(cell)
+            r, seg, block, sweep = self._locate(ctx.timestep * dt, off)
+            out.append({
+                "r_t": r, "segment": seg, "phase_offset_min": off,
+                "block_index": block, "sweep_index": sweep,
+                "block_period_min": (
+                    self.refs[block].period_min if block >= 0 else None
+                ),
+            })
+        return out
+
+    def describe(self):
+        return {
+            "type": self.name,
+            "settle_min": self.settle_min,
+            "sweep_min": self.sweep_min,
+            "n_phase_groups": self.n_phase_groups,
+            "frame_interval_min": self.frame_interval_min,
+            "blocks": [
+                {
+                    "period_min": r.period_min, "n_cycles": n,
+                    "block_min": d,
+                    "low": r.low, "high": r.high, "amplitude": r.amplitude,
+                    "t_low_min": r.t_low_min, "t_rise_min": r.t_rise_min,
+                    "t_high_min": r.t_high_min, "t_fall_min": r.t_fall_min,
+                }
+                for r, n, d in zip(self.refs, self.n_cycles, self.block_min)
+            ],
         }
 
 
@@ -662,13 +818,6 @@ class Objective:
         an oscillating reference also ``segment`` and ``phase_offset_min``)."""
         return self.reference.annotate(ctx)
 
-    def validate_horizon(self, horizon_frames: int) -> None:
-        """Raise :class:`PolicyViolation` if the reference is incompatible with the
-        controller's effective horizon. Called once at engine load."""
-        check = getattr(self.reference, "validate_horizon", None)
-        if check is not None:
-            check(horizon_frames)
-
     def describe(self) -> dict[str, Any]:
         return {
             "type": self.name,
@@ -774,7 +923,6 @@ def oscillation(
     t_rise_min: float,
     t_high_min: float,
     t_fall_min: float,
-    tau_decay_min: float,
     settle_periods: float = 2.0,
     n_phase_groups: int = 4,
     frame_interval_min: float = 1.0,
@@ -784,16 +932,17 @@ def oscillation(
 ) -> Objective:
     """Track an oscillating step train; see :class:`StepTrainReference`.
 
-    The reference is a property of the *experiment*, not of an arm — every arm in
-    a comparison must configure it identically and vary only the kernel and the
-    regularizer coefficients.
+    When arms vary the *controller*, the reference is a property of the experiment
+    rather than of an arm: every arm must configure it identically and vary only
+    the kernel and the regularizer coefficients. When arms vary the *waveform* —
+    as the pattern-zoo run does — the reference is what the arm is, and the
+    controller fields are what must be held identical instead.
     """
     return Objective(
         StepTrainReference(
             low=low, high=high,
             t_low_min=t_low_min, t_rise_min=t_rise_min,
             t_high_min=t_high_min, t_fall_min=t_fall_min,
-            tau_decay_min=tau_decay_min,
             settle_periods=settle_periods,
             n_phase_groups=n_phase_groups,
             frame_interval_min=frame_interval_min,
@@ -801,6 +950,36 @@ def oscillation(
         build_kernel(kernel),
         _regularizers(lambda_move, lambda_dose),
         name="oscillation",
+    )
+
+
+@register("frequency_staircase")
+def frequency_staircase(
+    blocks: Sequence[dict[str, Any]],
+    settle_min: float = 0.0,
+    n_phase_groups: int = 4,
+    frame_interval_min: float = 1.0,
+    kernel: str | dict[str, Any] = "l2",
+    lambda_move: float = 0.0,
+    lambda_dose: float = 0.0,
+) -> Objective:
+    """Sweep the reference frequency block by block; see
+    :class:`FrequencyStaircaseReference`.
+
+    Each block sets its own ``low``/``high`` alongside its segment durations,
+    because the reachable amplitude falls with the period. Sizing those is the
+    pre-flight check's job, not this builder's.
+    """
+    return Objective(
+        FrequencyStaircaseReference(
+            blocks=blocks,
+            settle_min=settle_min,
+            n_phase_groups=n_phase_groups,
+            frame_interval_min=frame_interval_min,
+        ),
+        build_kernel(kernel),
+        _regularizers(lambda_move, lambda_dose),
+        name="frequency_staircase",
     )
 
 

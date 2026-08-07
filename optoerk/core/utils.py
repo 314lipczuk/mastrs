@@ -45,6 +45,24 @@ def results_write_path() -> str:
     return KINGSTON_RESULTS_PATH
 
 
+CLUSTER_IMAGING_ROOT = "/mnt/imaging.data"
+KINGSTON_IMAGING_ROOT = "/Volumes/imaging.data"
+
+
+def imaging_root() -> Path:
+    """Root of the shared imaging mount, where RAW experiment folders live.
+
+    Distinct from :func:`results_write_path`, which points at *our* results
+    subtree. This is the whole share, needed to read other people's acquisition
+    folders — e.g. the per-experiment ``exp_data.parquet`` that carries the
+    optoRTK mCitrine measurement. ``OPTOERK_IMAGING_ROOT`` overrides.
+    """
+    override = os.environ.get("OPTOERK_IMAGING_ROOT")
+    if override:
+        return Path(override)
+    return Path(CLUSTER_IMAGING_ROOT if running_on_cluster() else KINGSTON_IMAGING_ROOT)
+
+
 def results_read_sources(project_root: str | Path | None = None) -> dict[str, str]:
     """Dict for UI dropdowns: local + Kingston mount paths."""
     local = str(Path(project_root) / "results") if project_root else str(Path.cwd() / "results")

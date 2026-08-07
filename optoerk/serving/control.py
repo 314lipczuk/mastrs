@@ -66,7 +66,7 @@ class Controller:
     def solve(self, plant, h, c, cnr_fb, objective: Objective, ctx: GoalContext) -> torch.Tensor:
         """The commanded (N,) exposure in ms, with the objective's gate applied."""
         ms, _cost = self.plan(plant, h, c, cnr_fb, objective, ctx)
-        return self._apply_gate(ms, objective, ctx)
+        return self.apply_gate(ms, objective, ctx)
 
     def describe(self) -> dict[str, Any]:
         return {"type": self.name}
@@ -149,8 +149,13 @@ class Controller:
         return objective.cost(pred, ctx)                 # (N, S)
 
     @staticmethod
-    def _apply_gate(ms: torch.Tensor, objective: Objective, ctx: GoalContext) -> torch.Tensor:
-        """Force gated-out cells to exactly 0 ms."""
+    def apply_gate(ms: torch.Tensor, objective: Objective, ctx: GoalContext) -> torch.Tensor:
+        """Force gated-out cells to exactly 0 ms.
+
+        Public because the engine calls :meth:`plan` directly when it needs the
+        plan's cost for the log, and must then gate the result itself — the same
+        two steps :meth:`solve` bundles.
+        """
         mask = objective.allow_stim(ctx)
         if mask is None:
             return ms

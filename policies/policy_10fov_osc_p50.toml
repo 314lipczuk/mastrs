@@ -177,7 +177,14 @@ levels_ms = [0, 20, 45, 85, 150]
 # is what it is for. The two runs' post-settle windows therefore start at
 # different wall-clock offsets; align on each cell's own settle boundary, not on
 # acquisition frame 0.
-objective = { type = "oscillation", low = 0.85, high = 1.225, t_low_min = 17, t_rise_min = 3, t_high_min = 14, t_fall_min = 16, tau_decay_min = 7.3, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+#
+# 2026-08-06: tau_decay_min = 7.3 was removed from this line along with the two
+# plant-side guards and the period/horizon guard it fed. The waveform is UNCHANGED
+# — tau never entered value_at, it only gated — so this file still defines exactly
+# the run it defined before. The bounds quoted above are now checked in the
+# pre-flight (experiments/policy_preflight.py), against measured distributions
+# rather than against a hand-typed tau.
+objective = { type = "oscillation", low = 0.85, high = 1.225, t_low_min = 17, t_rise_min = 3, t_high_min = 14, t_fall_min = 16, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
 
 # Fallback for any FOV not listed below (none, here) — mirror arm 1.
 controller = { type = "constant_dose" }
@@ -218,9 +225,10 @@ lambda_move = 0.0
 # measure. It also means there is still exactly ONE arm map to keep in sync
 # instead of three.
 #
-# !! arm = (fov % 4) + 1 DOES NOT HOLD, same as the sibling file. soak.py:177
-# (`arm_of`) hardcodes it and will silently mislabel every per-arm row against
-# this file. Pass ARM_OF explicitly.
+# !! arm = (fov % 4) + 1 DOES NOT HOLD, same as the sibling file. Each [fov.N]
+# block below declares `arm = N` explicitly (2026-08-06);
+# `optoerk.serving.policy.arm_map()` is the single reader, and nothing derives an
+# arm from the FOV index any more.
 #
 #   arm 1: fov 2, 7       -> mean position 4.5   (exact)   n=2
 #   arm 2: fov 3, 6       -> mean position 4.5   (exact)   n=2
@@ -245,48 +253,58 @@ lambda_move = 0.0
 
 # --- arm 1: constant dose, L2, no move penalty ------------------------------
 [fov.2]
+arm = 1
 controller = { type = "constant_dose" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.7]
+arm = 1
 controller = { type = "constant_dose" }
 kernel = "l2"
 lambda_move = 0.0
 
 # --- arm 2: sequence MPC, L2, no move penalty -------------------------------
 [fov.3]
+arm = 2
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.0
 [fov.6]
+arm = 2
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.0
 
 # --- arm 3: sequence MPC, L2, move penalty ON -------------------------------
 [fov.0]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 [fov.4]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 [fov.8]
+arm = 3
 controller = { type = "sequence_mpc" }
 kernel = "l2"
 lambda_move = 0.6
 
 # --- arm 4: sequence MPC, band kernel, move penalty ON ----------------------
 [fov.1]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.0625 }
 lambda_move = 0.6
 [fov.5]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.0625 }
 lambda_move = 0.6
 [fov.9]
+arm = 4
 controller = { type = "sequence_mpc" }
 kernel = { type = "band", half_width = 0.0625 }
 lambda_move = 0.6

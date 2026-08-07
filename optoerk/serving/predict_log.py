@@ -3,12 +3,34 @@
 One line per record. Two event types, matching the schema the analysis notebooks
 already parse (``experiments/inference_cnrhold_tracks.py``):
 
-  * ``startup`` — ``{t, n_predict, event, engine, model_loaded, info}``
+  * ``startup`` — ``{t, n_predict, event, engine, model_loaded, info, policies,
+    optortk_expr}``
   * ``predict`` — ``{t, n_predict, event, fov, timestep, n_cells_in, n_scored,
     engine, timing:{...}, cells:[...], skipped:[...]}`` where each cell carries
     ``{particle, raw_cnr, cnr_norm, baseline, fov_density, n_cells_200px,
     u_t_in, n_frames_seen, first_seen, exposure_ms, fluence_out, dark,
-    optortk_expr}``.
+    optortk_expr, optortk_live, plan_cost, pred_cnr_h1}``, plus whatever the objective's
+    reference annotates (``r_t`` always; ``segment`` / ``phase_offset_min`` for an
+    oscillation; also ``block_index`` / ``sweep_index`` / ``block_period_min`` for
+    a frequency staircase).
+
+``plan_cost`` and ``pred_cnr_h1`` record what the controller *believed* about the
+plan it chose: the winning plan's cost, and the predictive mean one step ahead
+under the dose it commanded. Without them a saturated cell and a mispredicted
+cell are indistinguishable in the log — both just show a dose and a CNR — and
+telling them apart needs a full replay. ``pred_cnr_h1`` also makes every frame a
+one-step model-error measurement: the drift of achieved-delta over predicted-delta
+is a per-cell sensitivity readout. Both are ``None`` on the stub engine, and
+``pred_cnr_h1`` is ``None`` for a dark-window cell, whose commanded dose is
+overridden to zero after the prediction was made.
+
+``optortk_expr`` is the value fed on the optoRTK-expression channel, and
+``optortk_live`` says which regime produced it: ``true`` for a real per-cell
+session rank (``--live-optortk-expr``), ``false`` for a constant — either the
+operator's ``--optortk-expr-value`` or the channel's training population mean.
+The regime is also recorded once, whole, in the ``startup`` record under
+``optortk_expr``. It changes what the controller can condition on, so two runs
+are only comparable when it matches.
 
 ``t`` is the *completion* timestamp; ``timing`` decomposes how the latency to
 that point was spent: ``recv_epoch`` (wall-clock the request entered the

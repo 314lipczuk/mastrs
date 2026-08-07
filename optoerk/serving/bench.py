@@ -172,7 +172,7 @@ def arm_sweep(
     levels = np.asarray(levels_ms, dtype=np.float64)
 
     osc = dict(type="oscillation", low=0.85, high=1.15, t_low_min=8,
-               t_rise_min=2, t_high_min=15, t_fall_min=15, tau_decay_min=7.3,
+               t_rise_min=2, t_high_min=15, t_fall_min=15,
                settle_periods=2, n_phase_groups=4, frame_interval_min=1.0)
     arms = [
         (1, "constant_dose", ConstantDoseSearch(levels), "l2", 0.0),

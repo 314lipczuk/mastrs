@@ -59,6 +59,23 @@ class HistoryConfig(BaseModel):
     encoder_type: str = "lstm"               # swappable: "lstm" (SSM/transformer later)
     head_type: str = "mdn"                   # "mdn" | "gaussian"
     film: str = "none"                       # "none" | "output" | "hidden"
+    # What conditions the FiLM modulation.
+    #   "fluence"  the commanded dose at this step (the historical behaviour)
+    #   "expr"     the cell's static optoRTK expression rank
+    # optoRTK expression is physically a GAIN on the dose-response, and FiLM is a
+    # per-cell multiplicative modulation — which is exactly that shape. Under
+    # "fluence" the expression covariate has to travel as a constant input channel
+    # through the encoder and survive in the hidden state across the whole
+    # rollout; under "expr" it modulates the decoder directly at every step. The
+    # value is read out of the context window (the channel is constant per cell),
+    # so nothing extra has to be plumbed through the DataLoader.
+    film_cond: str = "fluence"                # "fluence" | "expr"
+    # Which channels are fed to the decoder as known-future inputs. Fluence
+    # always; the interaction variant adds `u_t_x_expr`, which is a deterministic
+    # function of the commanded fluence and a static per-cell value and is
+    # therefore equally knowable ahead of time. Carried on the config so the
+    # training loop, eval and serving all build the decoder input the same way.
+    future_channels: list[str] = Field(default_factory=lambda: ["u_t"])
     sigma_step_bias: bool = False            # learnable per-forecast-step log-sigma bias
     data_source: str = "real_plus_bo"
     variant: str = "seq2scalar_history"
@@ -82,6 +99,29 @@ class HistoryConfig(BaseModel):
             raise ValueError(f"head_type must be mdn|gaussian, got {self.head_type!r}")
         if self.film not in ("none", "output", "hidden"):
             raise ValueError(f"film must be none|output|hidden, got {self.film!r}")
+        if self.film_cond not in ("fluence", "expr"):
+            raise ValueError(f"film_cond must be fluence|expr, got {self.film_cond!r}")
+        if len(self.future_channels) != self.stim_dim:
+            raise ValueError(
+                f"stim_dim={self.stim_dim} must equal len(future_channels)="
+                f"{len(self.future_channels)} ({self.future_channels}) — the "
+                f"decoder input width IS the number of known-future channels"
+            )
+        if self.norm_channels:
+            unknown = [c for c in self.future_channels if c not in self.norm_channels]
+            if unknown:
+                raise ValueError(
+                    f"future_channels {unknown} are not among norm_channels "
+                    f"{self.norm_channels}"
+                )
+        if self.film_cond == "expr":
+            if self.film == "none":
+                raise ValueError("film_cond='expr' has no effect with film='none'")
+            if "optortk_expr" not in self.norm_channels:
+                raise ValueError(
+                    "film_cond='expr' needs 'optortk_expr' among norm_channels; "
+                    f"got {self.norm_channels}"
+                )
         if self.encoder_type not in ("lstm",):
             raise ValueError(f"encoder_type must be lstm (for now), got {self.encoder_type!r}")
         if self.head_type == "gaussian":
@@ -204,7 +244,15 @@ class Seq2ScalarHistory(nn.Module):
             GaussianHead(cfg.mlp_hidden) if cfg.head_type == "gaussian"
             else MDNHead(cfg.mlp_hidden, cfg.n_gaussians)
         )
-        self.film_layer = FiLMLayer(cfg.stim_dim, cfg.hidden_dim) if cfg.film != "none" else None
+        # Index of the expression channel, when FiLM conditions on it. Resolved by
+        # NAME off the frozen channel list rather than hardcoded, so it survives
+        # the feature set growing or reordering.
+        self.expr_idx = (
+            cfg.norm_channels.index("optortk_expr")
+            if cfg.film_cond == "expr" else None
+        )
+        film_cond_dim = 1 if cfg.film_cond == "expr" else cfg.stim_dim
+        self.film_layer = FiLMLayer(film_cond_dim, cfg.hidden_dim) if cfg.film != "none" else None
         # per-step sigma bias sized to the max horizon (future_len); valid for any
         # F <= future_len used at train (multi-length) or eval.
         self.sigma_step_bias_param = (
@@ -237,7 +285,17 @@ class Seq2ScalarHistory(nn.Module):
 
         # initial feedback = cnr at the last real context frame (standardized)
         last_idx = (lengths - 1).clamp(min=0)
-        cnr_fb = ctx[torch.arange(B, device=ctx.device), last_idx, CNR_CHANNEL:CNR_CHANNEL + 1]
+        rows = torch.arange(B, device=ctx.device)
+        cnr_fb = ctx[rows, last_idx, CNR_CHANNEL:CNR_CHANNEL + 1]
+
+        # The static per-cell covariate, read off the context. The channel is
+        # constant over the cell's whole trajectory, so any real frame carries it;
+        # the last one is used because it is guaranteed to be inside `lengths`
+        # (earlier positions may be left-padding).
+        expr = (
+            ctx[rows, last_idx, self.expr_idx : self.expr_idx + 1]
+            if self.expr_idx is not None else None
+        )
 
         pis, mus, sigmas = [], [], []
         for i in range(n_f):
@@ -247,7 +305,7 @@ class Seq2ScalarHistory(nn.Module):
             h_step = out[:, -1, :]
 
             if self.film_layer is not None:
-                gamma, beta = self.film_layer(flu_i)
+                gamma, beta = self.film_layer(expr if expr is not None else flu_i)
                 if cfg.film == "output":
                     h_step = gamma * h_step + beta
                 else:  # hidden
@@ -306,12 +364,14 @@ class Seq2ScalarHistory(nn.Module):
             F=mcfg.future_len, p_concat=tcfg.p_concat,
             break_min=tcfg.break_min, break_max=tcfg.break_max,
             prepend_baseline=tcfg.prepend_baseline, prepend_len=tcfg.prepend_len,
+            future_channels=mcfg.future_channels,
             seed=tcfg.seed,
         )
         val_ds = HistoryDataset(  # clean val: no concat augmentation, but same prepend
             cnr_va, feats_va, np.arange(len(cnr_va)), stats,
             F=mcfg.future_len, p_concat=0.0,
             prepend_baseline=tcfg.prepend_baseline, prepend_len=tcfg.prepend_len,
+            future_channels=mcfg.future_channels,
             seed=tcfg.seed + 1,
         )
 

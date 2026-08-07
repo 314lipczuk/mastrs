@@ -193,6 +193,43 @@ to the power faro actually drives the DMD at.
 
 ## Deltas to the faro contract (things to confirm)
 
+0. **optoRTK expression — needed a faro change, made 2026-08-07.**
+   `--live-optortk-expr` needs **`ref_mean_intensity`** (or the older
+   `optocheck_mean_intensity`) per cell: the **mCitrine** measurement from the
+   reference/optocheck acquisition. That is a different fluorescence channel from
+   the timelapse's `miRFP` (C0) and `mScarlet3` (C1, which `cnr_median` comes
+   from), and it is what `preprocessing.add_optortk_expression` ranks offline.
+
+   **It is NOT the C0 channels.** An earlier revision of this section claimed C0
+   was the right input and was already being sent. Both halves were wrong: C0 is a
+   surrogate that reaches only Spearman 0.60–0.71 against the real measurement and
+   misplaces 27–30% of cells across a high/low split.
+
+   **Three things blocked the real value from ever reaching `/predict`**, all
+   cleared by `InferenceServerStim._carry_forward` in faro:
+
+   1. it is produced by `feature_extractor_ref`, not the stimulator's own
+      `feature_extractor`, so `_current_cells`' `keep` filter dropped it;
+   2. the live pipeline computes the stim mask **before** feature extraction
+      (deliberately — a FE crash must not stall the controller), so on the
+      reference frame itself it is not on `tracks` yet;
+   3. `FeatureExtractorRef` defaults to `multi_timepoint=True`, writing the value
+      into the reference frame's rows only, so every later frame carries NaN.
+
+   faro now carries each cell's last non-null reference value forward from
+   whichever frame produced it. Frames *before* the first reference acquisition
+   still have nothing to send — correct, and why the server ranks nobody until
+   `optortk_cohort_frames` closes. Set that above the run's first optocheck frame.
+
+   **Failure mode to watch:** if no cell ever supplies a value, the cohort seals
+   empty and the server aborts (`_check_optortk_coverage`) rather than feeding
+   every cell the population mean, which would look exactly like a successful run.
+   Individual cells the reference missed arrive as null, go neutral, and are
+   counted in `n_optortk_values_seen`.
+
+   Without the flag none of this is read and the channel is a constant, which is
+   what every run so far has done.
+
 1. **CNR — one scalar per cell, and which convention:** faro sends a single
    **`cnr_median`** per cell per frame — the ratio `median_intensity_C1_ring /
    median_intensity_C1_nuc` (channel C1 only; the per-region pixel reduction

@@ -106,6 +106,12 @@ def build_service(args) -> InferenceService:
     if args.optortk_expr_value is not None:
         cfg.optortk_expr_value = args.optortk_expr_value
         cfg.override_optortk_expr = True  # a value implies the override is on
+    if args.live_optortk_expr is not None:
+        cfg.live_optortk_expr = args.live_optortk_expr
+    if args.optortk_baseline_frames is not None:
+        cfg.optortk_baseline_frames = args.optortk_baseline_frames
+    if args.optortk_cohort_frames is not None:
+        cfg.optortk_cohort_frames = args.optortk_cohort_frames
     if args.predict_log is not None:
         cfg.predict_log_path = args.predict_log or None
     if args.policy_file is not None:
@@ -131,6 +137,22 @@ def main():
                    default=None, help="feed a fixed optoRTK-expr value for every cell")
     p.add_argument("--optortk-expr-value", dest="optortk_expr_value", type=float, default=None,
                    help="raw optoRTK-expr value to feed (implies --override-optortk-expr)")
+    p.add_argument("--live-optortk-expr", dest="live_optortk_expr",
+                   action=argparse.BooleanOptionalAction, default=None,
+                   help="reconstruct the real per-cell optoRTK-expr rank from the "
+                        "payload's mCitrine optocheck measurement instead of a "
+                        "constant. Needs ref_mean_intensity in /predict; aborts "
+                        "if the cohort seals with nobody in it. CHANGES THE "
+                        "EXPERIMENTAL CONDITION — a run with this on is not "
+                        "comparable to one without.")
+    p.add_argument("--optortk-baseline-frames", dest="optortk_baseline_frames",
+                   type=int, default=None,
+                   help="optocheck samples to median before freezing a rank "
+                        "(default 1 — one optocheck per run is the normal case)")
+    p.add_argument("--optortk-cohort-frames", dest="optortk_cohort_frames",
+                   type=int, default=None,
+                   help="when the session expression cohort closes; must span the "
+                        "run's FIRST optocheck (default 10)")
     p.add_argument("--predict-log", dest="predict_log", default=None,
                    help="path to append a per-prediction JSONL log (off by default)")
     p.add_argument("--policy-file", dest="policy_file", default=None,

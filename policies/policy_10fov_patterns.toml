@@ -1,0 +1,457 @@
+# 10-FOV PATTERN ZOO — the reference is the arm.
+#
+# The two previous 10-FOV runs (policy_10fov_osc.toml, policy_10fov_osc_p50.toml)
+# held the reference FIXED across arms and varied the CONTROLLER: constant_dose vs
+# sequence_mpc, L2 vs band kernel, move penalty on vs off. They answered "which
+# controller tracks best".
+#
+# This run inverts that. One controller on every FOV; the WAVEFORM is what varies.
+# You cannot have both contrasts at 10 FOVs, and the controller contrast is the one
+# dropped. What that buys is four questions the previous design structurally could
+# not ask:
+#
+#   1. can the model drive genuinely different dynamics, not just one waveform?
+#   2. do different cells need entirely different steering to reach the same goal?
+#   3. where are the borders of controllability — in amplitude, and in frequency?
+#   4. does sensitivity drift, and does the drift depend on the pattern?
+#
+#   arm 1  frequency staircase   the FREQUENCY border   n=3   fov 0, 5, 9
+#   arm 2  ramp-up past ceiling  the AMPLITUDE border   n=3   fov 1, 4, 8
+#   arm 3  slow fall / braking   the DOWNWARD border    n=2   fov 2, 7
+#   arm 4  constant hold         the DRIFT NULL         n=2   fov 3, 6
+#
+# Run (NOTE --live-optortk-expr; the control file omits exactly that flag):
+#   uv run python -m optoerk.serving.app --port 8080 --device cuda \
+#       --policy-file policies/policy_10fov_patterns.toml \
+#       --live-optortk-expr --optortk-cohort-frames 10 \
+#       --stim-power 10 --predict-log run.jsonl
+#
+# Soak:
+#   uv run python -m optoerk.serving.soak --policy-file policies/policy_10fov_patterns.toml \
+#       --allow-placeholders --device cuda --n-fovs 10 --cycles 20 --cycle-seconds 60
+
+
+# --- WHAT REPLACED THE STARTUP GUARDS ---------------------------------------
+# The two previous files quoted three bounds checked at startup: t_fall >= 1.5*tau,
+# period >= 4*tau, period <= 2*horizon. All three are GONE as of 2026-08-06, and
+# the reason matters for reading this file.
+#
+# tau_decay_min was typed into the policy by hand, on the same line as the
+# durations it was checked against. It could only ever catch a self-contradiction,
+# and lowering it legalized anything (a test did exactly that). Meanwhile `high` —
+# the parameter most likely to put a reference out of reach — was never checked at
+# all, which is why policy_10fov_osc_p50.toml had to gate high = 1.225 in prose.
+# The period/horizon bound was mis-parameterized too: warning time before a
+# transition is H, always, because the plan re-solves and advances one frame at a
+# time, so period never entered it.
+#
+# THIS RUN MEASURES THE NUMBERS THOSE GUARDS ASSUMED. Arm 2 measures the per-cell
+# reachable ceiling; arm 1 measures the frequency at which the decay model stops
+# holding. Letting the assumption veto the measurement designed to test it would
+# have been backwards. Feasibility now lives in experiments/policy_preflight.py,
+# argued against measured distributions and pasted into this file below.
+#
+# Consequence to be aware of: an unreachable reference is now expressible, and two
+# of the four arms use one deliberately. A cell failing to track arm 2 is the
+# result, not a misconfiguration.
+
+
+# --- PARAMETER PROVENANCE ---------------------------------------------------
+# Working constants used to size everything below: resting CNR ~ 0.82 (the
+# checkpoint's own z-score mean), tau ~ 7.3 min (D6 median, EXPECTED TO RISE on
+# refit), 1 frame = 1 min. Free-decay time from `high` to `low`:
+#
+#     t_free = tau * ln((high - rest) / (low - rest))
+#
+# ASSUMED, inherited unchanged from policy_10fov_osc.toml's gate (opened
+# 2026-07-31, none since replaced by measurement):
+#   levels_ms          <- Niesen hold-strata analysis (rebinned ladder); cf. D2
+#   rest ~ 0.82        <- checkpoint z-score mean
+#   tau ~ 7.3          <- D6 refit
+#
+# NEW and NOT covered by that gate — each must land in the pre-flight before this
+# file may serve:
+#   arm 1 per-block (low, high)  <- must sit at the largest amplitude each block's
+#     fall can deliver. Derived below from tau; if the D6 refit moves tau, EVERY
+#     block's amplitude moves with it and this table is stale.
+#   arm 2 high = 1.35            <- deliberately out of reach. Needs the per-cell
+#     reachable-ceiling distribution only to confirm it is ABOVE essentially every
+#     cell's ceiling; if a material fraction of cells can actually reach 1.35 the
+#     arm measures nothing and `high` must go up.
+#   arm 4 target_cnr = 1.034     <- arm 1's duration-weighted sweep mean. MUST be
+#     recomputed if arm 1's block table changes, or the dynamic-vs-static contrast
+#     silently stops being mean-matched.
+#   LIVE optoRTK expression      <- this run enables --live-optortk-expr, so the
+#     controller sees each cell's real expression rank instead of a constant. See
+#     the arm 4 block for what that costs and the control file that pairs with it.
+#
+# PRE-FLIGHT RESULTS (paste here, then flip the gate):
+#   tau        declared 7.3   | D6 p50 ____  p90 ____   n=____
+#   ceiling    arm 2 high 1.35 | frac cells reaching >= 1.35: ____%
+#              arm 1 block highs 1.17/1.15/1.12/1.095: ____/____/____/____%
+#   dry run    per-arm tracking RMSE ____ ; frac frames pinned at 150 ms ____
+#              arm 1 predicted break period: ____ min
+#
+# The dry run is simulate_closed_loop, which scores the controller against the
+# model's own beliefs using the same model the controller uses. It is not ground
+# truth and must not be read as a feasibility verdict. It is the model's PREDICTION
+# of where the borders are, recorded before the run so the run can falsify it.
+placeholders_resolved = false
+
+
+[default]
+
+# CHANGED 2026-08-07 from seq2scal_history_raw_cnr_f30_2026-07-27_20.18.46.
+# VERIFIED: future_len = 30, cnr_mode = "raw", 3 mixture components, multi-length
+# training (F ~ U[3,30]) with the per-step sigma bias, cnr z-score mean 0.8220 /
+# std 0.3322 — i.e. every property the previous checkpoint had.
+#
+# WHY THE SWAP. The old checkpoint's optoRTK-expression channel was built from a
+# SURROGATE: whole-cell C0 (miRFP) from the timelapse, standing in for the real
+# mCitrine optocheck measurement. Measured against the real thing on the same
+# cells it reaches only Spearman 0.60-0.71 and puts 27-30% of cells in the wrong
+# half of a high/low split. This checkpoint is trained on the real measurement
+# (dataset_all_mcitrine.parquet, 98.9% coverage).
+#
+# It also drops `fov_density`, which is identical for every cell in a frame and
+# therefore cannot be a per-cell feature; the drop was free (paired against the
+# same model with it, dNLL +0.00126, t = +0.70, p = 0.48, n = 7237) and
+# `nuc_area`'s own importance rose once it left (0.0095 -> 0.0118).
+#
+#   channels: [cnr, u_t, n_cells_200px, optortk_expr, nuc_area]
+#
+# SERVING NOTE: `nuc_area` needs the payload's `area_nuc` (faro's FE_ErkKtr
+# renames skimage's `area`). The two names differ across the wire and serving
+# did not know either until 2026-08-07 — before that fix this channel would have
+# been fed its population mean, silently, on the second most important input.
+checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
+
+# 30 frames = 30 min = the checkpoint's future_len, so it is not clamped. No longer
+# constrains the period — the plan advances one frame at a time, so a transition
+# enters the window 30 frames ahead whatever the period. This is a hard cap from
+# the checkpoint (rolling past future_len is untrained), not an experiment choice.
+control_horizon = 30
+
+# Unchanged from both previous runs — MUST be. Waveforms searched over different
+# dose ladders are not comparable, and holding the ladder fixed is what keeps this
+# run's dose numbers on the same scale as the two before it.
+#
+# NOTE the ramp arms lean on this ladder harder than any previous run did. A 28-min
+# rise over 0.48 CNR is 0.017 CNR/min, well below what one rung delivers, so the
+# controller must dither between rungs to track it. That is the intended test of
+# dose resolution — but see the dmd_quantum note under RISKS.
+levels_ms = [0, 20, 45, 85, 150]
+
+# THE FIXED CONTROLLER. Identical on all ten FOVs, which is what makes waveform the
+# only varying factor.
+#
+# lambda_move = 0 (not 0.6 as in the previous runs) for two reasons. It drops a
+# parameter that was never measured, only screened offline. And a move penalty
+# actively fights the rung-to-rung dithering that fine ramp tracking needs — with
+# it on, arms 2 and 3 would look worse for a reason that is about the penalty
+# rather than about the waveform.
+#
+# COST, recorded because it is not recoverable later: no arm here is byte-identical
+# to any previously run condition, so nothing in this run anchors it against the
+# two earlier ones. Deliberate — four fresh waveforms was the choice — but it means
+# every cross-run comparison is uncalibrated against plate, batch and instrument
+# drift. The 700-minute run length and the unchanged ladder/checkpoint/horizon are
+# the only things holding the runs on a common footing.
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.0
+
+# Fallback objective for any FOV not listed below (none, here) — mirror arm 4.
+objective = { type = "hold", target_cnr = 1.034 }
+
+
+# --- RUN LENGTH -------------------------------------------------------------
+# 100 min settle + 600 min = 700 min (11.7 h), the same as
+# policy_10fov_osc_p50.toml. Arms 2, 3 and 4 land on 700 exactly; arm 1's sweep is
+# 299 min so it reaches 698 and its final cycle is truncated — drop that cycle
+# rather than counting a partial one.
+#
+# Arms 2 and 3 get 12 cycles each, so per-cell ceiling and per-cell braking error
+# are each estimated twelve times across the run. That is what makes the drift OF
+# the border measurable, not just the border.
+
+
+# ---------------------------------------------------------------------------
+# ARM 1 — FREQUENCY STAIRCASE (fov 0, 5, 9)
+#
+# Period steps down block by block, then the sweep repeats. Two sweeps fit in the
+# run, and comparing a period's blocks between sweep 0 and sweep 1 is the
+# drift-at-matched-frequency measurement.
+#
+# WHY THE AMPLITUDE SHRINKS WITH THE PERIOD. A fixed-amplitude frequency sweep
+# measures nothing here. Fall time scales with period (~0.36 x P at these segment
+# fractions) while free decay from 1.15 to 0.85 takes 17.5 min, so every period
+# below ~49 min has an impossible fall and the sweep would break at the first step
+# down — for a reason arithmetic already predicts. Instead each block demands the
+# LARGEST amplitude its own fall can deliver, from t_free above. Every block then
+# sits at 0.79-1.00 of its own decay limit, the fall is never the trivially binding
+# constraint, and what the sweep measures is the real thing.
+#
+#   P    segments (low/rise/high/fall)   low -> high      A      t_free   tau_max
+#                                                                        / 7.3
+#   50   12 /  2 / 18 / 18               0.87  -> 1.17    0.30   14.2     1.27
+#   35    8 /  2 / 13 / 12               0.89  -> 1.15    0.26   11.3     1.06
+#   25    6 /  2 /  8 /  9               0.92  -> 1.12    0.20    8.0     1.12
+#   18    4 /  2 /  6 /  6               0.945 -> 1.095   0.15    5.8     1.04
+#
+# t_rise is pinned at 2 min in every block rather than scaled: the rise is
+# dose-limited, so it should be as fast as the cells allow regardless of period.
+# The remaining time splits t_low : t_high : t_fall = 1 : 1.5 : 1.5.
+#
+# WHAT IT MEASURES. Achieved amplitude divided by demanded amplitude, against
+# frequency, is a Bode magnitude curve; its rolloff is each cell's bandwidth. A
+# ratio near 1 across the sweep says the first-order decay model the deleted guards
+# encoded was right. A ratio that falls says the cells are slower than it — and
+# where it falls is the frequency border.
+#
+# DESIGNED PROPERTY: block time-means are 1.038 / 1.039 / 1.028 / 1.028, flat to
+# +/-0.005. The sweep varies frequency at constant mean, so a drift difference
+# between blocks cannot be an exposure difference. If the block table is retuned,
+# CHECK THIS AGAIN — it is not automatic, it was solved for.
+#
+# OPEN — RAISED BY THE PRE-FLIGHT, NOT YET SETTLED. The `tau_max` column above is
+# the largest tau at which each block's fall is still free-decay reachable:
+# 9.25 / 7.74 / 8.19 / 7.61 min. They cluster. At tau = 7.3 every block is
+# (barely) feasible, so the tau-model PREDICTS A FLAT Bode curve and the sweep
+# detects a border only if the model is wrong — a real test, but a weak one, and
+# a tau even slightly above 7.3 takes three of the four blocks out at once rather
+# than in sequence.
+#
+# A stronger sweep spreads the crossings across the plausible tau range instead of
+# stacking them, e.g. tau_max ~ 13 / 10.5 / 8.5 / 6.8, so that a cell's own tau
+# determines HOW MANY blocks it loses and the per-cell bandwidth is read off the
+# count. Sizing that needs the measured tau DISTRIBUTION, which is exactly what
+# section 2 of the pre-flight produces and what does not exist yet.
+#
+# So: run the pre-flight, then decide. The block table as written is defensible
+# and will not fail to run; it is simply less informative than it could be. This
+# is one of the reasons placeholders_resolved is false.
+#
+# Cycles per block 2 / 2 / 3 / 3 -> sweep = 100 + 70 + 75 + 54 = 299 min. More
+# cycles at the fast periods because they are cheap and their per-cell estimates
+# are noisier.
+#
+# KNOWN CONFOUND: block order within a sweep is confounded with period. Sweep 1 is
+# kept identical to sweep 0 rather than reversed, so every period has the same
+# 299-min separation between its two measurements and the DRIFT estimate stays
+# clean; the confound affects only level-across-period comparisons.
+#
+# Block boundaries step in `low` as well as `high`, so the reference jumps by
+# 0.02-0.03 CNR between adjacent blocks (upward, dose-limited, trivial) and by
+# 0.075 downward at the sweep wrap. Every one lands at the bottom of a completed
+# fall with a low hold after it. The wrap needs tau*ln(0.125/0.05) = 6.7 min of
+# free decay and block 0's low hold is 12 min, so it is absorbed.
+# ---------------------------------------------------------------------------
+
+[fov.0]
+arm = 1
+objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, frame_interval_min = 1.0, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
+
+[fov.5]
+arm = 1
+objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, frame_interval_min = 1.0, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
+
+[fov.9]
+arm = 1
+objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, frame_interval_min = 1.0, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
+
+
+# ---------------------------------------------------------------------------
+# ARM 2 — RAMP-UP PAST THE CEILING (fov 1, 4, 8)
+#
+# low 0.87 -> high 1.35, t_low 2 / t_rise 28 / t_high 2 / t_fall 18, period 50,
+# 12 cycles after settle.
+#
+# `high` is DELIBERATELY out of reach. The 28-min rise walks the setpoint upward at
+# 0.017 CNR/min and every cell departs from it somewhere; the departure point —
+# where tracking error diverges AND exposure pins at 150 ms — is that cell's
+# reachable ceiling. Twelve cycles give twelve per-cell estimates, so the drift of
+# the ceiling is measurable, not just the ceiling.
+#
+# This also retires the open question in policy_10fov_osc_p50.toml, whose
+# high = 1.225 was extrapolated 0.075 CNR past anything checked and whose failure
+# mode that file recorded as silent.
+#
+# The fall is not the measurement here and is sized not to interfere:
+# t_free(1.35 -> 0.87) = 7.3 * ln(0.53/0.05) = 17.2 min <= 18. Cells that saturated
+# below 1.35 begin their fall lower and so have an easier one still.
+#
+# NOT MEAN-MATCHED: reference mean is 1.11 against ~1.04 for arms 1, 3 and 4. A
+# saturating arm cannot be mean-matched — accepted. It is why the drift analysis
+# must covary on ACHIEVED cumulative CNR and DELIVERED cumulative fluence rather
+# than on the reference's mean.
+#
+# plan_cost and pred_cnr_h1 in the predict log carry this arm: at the ceiling, a
+# cell that saturated and a cell the model mispredicted look identical if all the
+# log records is a dose and a CNR.
+# ---------------------------------------------------------------------------
+
+[fov.1]
+arm = 2
+objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+
+[fov.4]
+arm = 2
+objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+
+[fov.8]
+arm = 2
+objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+
+
+# ---------------------------------------------------------------------------
+# ARM 3 — SLOW FALL / ACTIVE BRAKING (fov 2, 7)
+#
+# low 0.87 -> high 1.17, t_low 1 / t_rise 3 / t_high 8 / t_fall 38, period 50,
+# 12 cycles after settle. Mean 1.041.
+#
+# Deliberately the SAME endpoints and the SAME period as arm 1's slowest block,
+# with the fall stretched from 18 min to 38 — 2.7x SLOWER than free decay (14.2
+# min). Arm 3 vs arm 1's P=50 block is therefore a clean one-factor contrast.
+#
+# This is the direction the codebase's own doctrine had written off. "Falls are
+# decay-limited and not adjustable" conflates two different claims: a fall FASTER
+# than free decay is unreachable, because the controller can only stop light and
+# wait — but a fall SLOWER than free decay is fully controllable, and requires the
+# controller to add light throughout the descent to brake it. That has never been
+# tested. The descent slope here is 0.30/38 = 0.008 CNR/min, which is finer than
+# one ladder rung delivers, so tracking it means dithering — which is precisely why
+# lambda_move is 0 in this run.
+# ---------------------------------------------------------------------------
+
+[fov.2]
+arm = 3
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 1, t_rise_min = 3, t_high_min = 8, t_fall_min = 38, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+
+[fov.7]
+arm = 3
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 1, t_rise_min = 3, t_high_min = 8, t_fall_min = 38, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+
+
+# ---------------------------------------------------------------------------
+# ARM 4 — CONSTANT HOLD (fov 3, 6)
+#
+# target_cnr = 1.034 — arm 1's DURATION-WEIGHTED sweep mean (1.03388: block means
+# 1.0380 / 1.0386 / 1.0280 / 1.0283 weighted by 100 / 70 / 75 / 54 min). So arm 1
+# vs arm 4 is a dynamic-vs-static contrast at matched reference mean. Weighted, not
+# a plain average of the four, because the blocks are not equally long.
+#
+# This arm is the ZERO POINT for question 4. With a constant setpoint, any upward
+# trend in the dose needed to hold it is desensitization with no waveform to
+# explain it away. Without it, "does drift depend on the pattern" has nothing to be
+# measured against.
+#
+# It also answers question 2 most directly. Every cell has an identical goal and an
+# identical reference, so per-cell dose trajectories are comparable with nothing
+# else varying.
+#
+# !! THIS ARM'S MEANING DEPENDS ON --live-optortk-expr, AND THIS RUN TURNS IT ON.
+#
+# WITH it (this file), the controller sees each cell's real optoRTK expression
+# rank and can steer on it up front instead of discovering responsiveness through
+# feedback. That is the more capable system, and it is what the main experiment
+# is testing. The cost is that question 2 becomes compound: per-cell divergence in
+# steering is then part covariate, part feedback, and this arm alone cannot
+# separate them.
+#
+# That is what policies/policy_10fov_patterns_control.toml is for — the identical
+# file with live expression off. Run as a control, the pair separates what the
+# expression covariate contributes from what feedback contributes, which neither
+# file can do alone.
+#
+# TEMPER THE EXPECTATION. Live coverage is NOT the 98.9% the model was trained
+# with. A reference acquisition only measures the particle ids alive when it runs,
+# and over a 12 h run trackpy issues far more ids than there are cells — measured
+# on 2026-07-15: ~50 cells present per frame but 220 distinct ids, median track
+# lifetime 39 of 721 frames. So 28-53% of ids ever carry a real rank (median ~37%)
+# and the rest get the neutral population mean, which is exactly what training
+# gives an unmeasured cell (offline fillna(0.5) vs 0.499677 fed online — 0.001
+# sigma apart). Masking the trained model to that coverage recovers about 39% of
+# the benefit: test NLL 0.0272 at 37% coverage, against 0.0085 fully covered and
+# 0.0390 with the constant. Real, but a third of what the offline feature is worth.
+#
+# The gain relationship itself is coverage-independent (Spearman ~0.38 at every
+# level), so the cells that DO carry a rank get the full effect; there are simply
+# fewer of them.
+#
+# Worth knowing while reading the per-cell dose trajectories: the fraction of cells
+# on the neutral value is logged per run (`n_optortk_values_seen`, and per cell
+# `optortk_live` in the predict log), so the split is recoverable after the fact
+# rather than assumed.
+#
+# There is no settle concept on a `hold` objective. Drop the first 100 min in
+# analysis to match the other arms rather than expecting a `settle` label.
+# ---------------------------------------------------------------------------
+
+[fov.3]
+arm = 4
+objective = { type = "hold", target_cnr = 1.034 }
+
+[fov.6]
+arm = 4
+objective = { type = "hold", target_cnr = 1.034 }
+
+
+# ---------------------------------------------------------------------------
+# FOV LAYOUT
+#
+#   FOV  0 1 2 3 4 5 6 7 8 9
+#   arm  1 2 3 4 2 1 4 3 2 1
+#
+# Interleaved, not blocked: FOV index follows stage position, so blocking would
+# align each arm with a contiguous plate region and maximally confound arm with any
+# spatial gradient in illumination, temperature or media depth.
+#
+#   arm 1  fov 0, 5, 9   n=3   mean position 4.67
+#   arm 2  fov 1, 4, 8   n=3   mean position 4.33
+#   arm 3  fov 2, 7      n=2   mean position 4.50  (exact)
+#   arm 4  fov 3, 6      n=2   mean position 4.50  (exact)
+#
+# Grand mean is 4.5; arms 1 and 2 sit +/-0.17 either side and balance each other.
+# The two border arms get n=3.
+#
+# `arm` is DECLARED on every block above and read by
+# optoerk.serving.policy.arm_map(). Nothing derives an arm from the FOV index.
+#
+# RESIDUAL CONFOUND: with waveform as the arm, arm is confounded with FOV position
+# and there is no within-run defence — the previous pair could at least pair by
+# position across two runs of the same waveform. What saves the primary results is
+# that they are all WITHIN-arm and per-cell: each cell's ceiling, each cell's
+# bandwidth, each cell's drift across its own cycles. Only BETWEEN-arm comparisons
+# carry the confound.
+# ---------------------------------------------------------------------------
+
+
+# --- ANALYSIS CONSTRAINT ----------------------------------------------------
+# The arms deliver different total light, and desensitization is likely
+# dose-dependent, so the primary curve is per-cell gain against CUMULATIVE
+# DELIVERED FLUENCE, with gain-against-time secondary. The between-arm question is
+# "is there a pattern effect BEYOND cumulative dose" — asking it against time alone
+# will find a pattern effect that is really a dose effect.
+#
+# Reference means are matched for arms 1, 3 and 4 but ACHIEVED means will not be,
+# wherever cells saturate. Use achieved cumulative CNR, never the reference's. This
+# is the same trap policy_10fov_osc_p50.toml flagged for its integral match.
+#
+# pred_cnr_h1 gives a second, finer drift readout that needs no rolling regression:
+# the model predicts a one-step change, the cell delivers one, and the drift of
+# their ratio is a per-cell per-frame sensitivity trace on EVERY arm including the
+# hold.
+
+
+# --- RISKS ------------------------------------------------------------------
+# dmd_quantum_ms = 25 is documented on the config and NEVER ENFORCED, and none of
+# [20, 45, 85, 150] is a multiple of 25. Both ramp arms depend on fine dose
+# resolution, so this matters more here than in any previous run. Verify with the
+# microscope what is actually delivered for each rung. Do NOT rebin the ladder to
+# fix it — that would break comparability with both previous runs, which is most of
+# what this file still has.
+#
+# If the D6 refit raises tau, arm 1's whole block table is stale: every block's
+# amplitude was solved from t_free at tau = 7.3, and a larger tau shrinks every
+# reachable amplitude. Recompute the table rather than running it as written.
