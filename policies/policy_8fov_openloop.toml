@@ -1,0 +1,367 @@
+# 8-FOV CLOSED LOOP vs OPEN LOOP — feedback is the arm.
+#
+# Every previous run compared controllers to each other (constant_dose vs
+# sequence_mpc vs staggered) or waveforms to each other (policy_10fov_patterns).
+# All of them had feedback. None of them can answer the question the thesis
+# actually rests on: DOES CLOSED-LOOP SINGLE-CELL CONTROL BEAT SIMPLY DELIVERING
+# LIGHT? Without an open-loop arm, every tracking number in this project is
+# unfalsifiable — a well-tracked reference and a well-chosen light schedule look
+# identical in the data.
+#
+# This run adds that arm. `open_loop` commands a predetermined dose to every cell
+# on every frame, with no feedback of any kind, against the same reference, the
+# same ladder, the same checkpoint and the same horizon. One variable differs.
+#
+#   arm 1  hold          closed loop (sequence_mpc)   n=2   fov 0, 7
+#   arm 2  hold          OPEN LOOP                    n=2   fov 1, 6
+#   arm 3  oscillation   closed loop (sequence_mpc)   n=2   fov 2, 5
+#   arm 4  oscillation   OPEN LOOP                    n=2   fov 3, 4
+#
+# The 2x2 is deliberate: a single pattern could not distinguish "feedback helps"
+# from "feedback helps on THIS waveform". A hold is the easiest thing feedback can
+# do (reject drift around a fixed point); an oscillation is the hardest (follow a
+# moving target). If closed loop wins on both, the claim is general. If it wins only
+# on the oscillation, that is a more interesting result than a single arm could have
+# produced, and it is still a result.
+#
+# Run (dark_baseline OFF — see RISKS):
+#   uv run python -m optoerk.serving.app --port 8080 --device cuda \
+#       --policy-file policies/policy_8fov_openloop.toml \
+#       --live-optortk-expr --optortk-cohort-frames 10 \
+#       --no-dark-baseline --frame-interval-min 1.0 \
+#       --stim-power 10 --predict-log run.jsonl
+#
+# Soak (MUST pass before the rig is booked — rho < 0.7 at the hour-12 cell count):
+#   uv run python -m optoerk.serving.soak --policy-file policies/policy_8fov_openloop.toml \
+#       --allow-placeholders --device cuda --n-fovs 8 --cycles 20 --cycle-seconds 60
+
+
+# --- WHAT AN OPEN-LOOP ARM MUST BE, AND WHAT IT MUST NOT BE -----------------
+# A weak open-loop arm makes the whole experiment worthless: beating a badly chosen
+# fixed pattern says nothing. So `sequence_ms` below is not hand-picked. It is
+# computed by experiments/open_loop_design.py, which optimises a fixed schedule
+# against THE SAME model and THE SAME objective over an ensemble of nominal cells —
+# i.e. the best open-loop schedule this model can produce. That is the strongest
+# fair opponent, and it is the comparison a control-theory reader expects.
+#
+# Two consequences, both of which must be stated in the write-up rather than buried:
+#
+#   * The open-loop schedule INHERITS THE MODEL'S ERROR. If the model is wrong, the
+#     open-loop arm suffers more than the closed-loop one, because feedback is what
+#     corrects model error. That is not a flaw in the comparison — it is the
+#     mechanism being measured — but it means the result is "feedback beats the best
+#     open-loop schedule THIS MODEL can design", not "feedback beats open loop".
+#   * DOSE IS NOT MATCHED BY CONSTRUCTION. The optimiser is free to spend more or
+#     less light than the closed-loop arms do. Cumulative delivered fluence per arm
+#     must be reported alongside tracking error; if the arms differ materially in
+#     dose, part of any tracking difference is a dose difference.
+#
+# The model still runs on the open-loop FOVs even though nothing is chosen. Wasted
+# compute, kept on purpose: it keeps `plan_cost` on the same scale across arms, and
+# it turns every open-loop frame into a one-step model-error measurement under a
+# KNOWN dose — the cleanest such measurement anywhere in the run, because the input
+# is not confounded with the controller's reaction to the output.
+
+
+# --- WHY n_phase_groups = 1 EVERYWHERE --------------------------------------
+# Every previous oscillation run offset cells by a quarter cycle (n_phase_groups=4)
+# so the population was four interleaved copies of the waveform. That is impossible
+# here and would rig the result: an open-loop arm sends ONE command to every cell,
+# so it physically cannot give two cells different references. Leaving phase groups
+# on would guarantee the open-loop arm fails, for a structural reason that has
+# nothing to do with feedback.
+#
+# COST, recorded because it is not recoverable later: this run's oscillation arms
+# are therefore NOT byte-comparable with the phase-grouped oscillation arms of
+# policy_10fov_osc.toml / _p50 / _patterns. Accepted — a fair open-loop arm is worth
+# more than continuity with runs that could not ask this question.
+
+
+# --- PARAMETER PROVENANCE ---------------------------------------------------
+# Working constants: resting CNR ~ 0.82 (checkpoint z-score mean), tau ~ 7.3 min
+# (D6 median), 1 frame = 1 min.
+#
+# ASSUMED, inherited unchanged from policy_10fov_patterns.toml:
+#   checkpoint         <- enc_e_area_lean, real mCitrine expression channel
+#   levels_ms          <- Niesen hold-strata analysis (rebinned ladder)
+#   control_horizon 30 <- the checkpoint's future_len, so it is not clamped
+#   arm 3/4 waveform   <- block 0 of the frequency staircase that ran in v12
+#
+# NEW and NOT covered by any previous gate — each must land in the pre-flight
+# before this file may serve:
+#   arm 1/2 target_cnr = 1.034   <- must be REACHABLE by most cells, unlike the
+#     deliberately-unreachable arms of the pattern zoo. This experiment measures how
+#     well each control mode tracks, so a target beyond the population's ceiling
+#     would saturate both arms and measure nothing. v12 sat at 1.13x resting and
+#     saturated at the top rung 63% of the time — but that run's cadence had slipped
+#     3.4x and its biosensor had bleached to half of resting, so its saturation is
+#     not evidence about this target. It must be re-checked.
+#   sequence_ms (arms 2, 4)      <- DESIGNED 2026-08-11, see below. Both come from
+#     an exhaustive enumeration of pulse-train shapes scored against this
+#     checkpoint and these objectives (experiments/open_loop_design.py). They are
+#     stale if the target or the waveform moves.
+#
+# PRE-FLIGHT RESULTS (paste here, then flip the gate):
+#   tau          declared 7.3   | D6 p50 ____  p90 ____   n=____
+#   ceiling      arm 1/2 target 1.034 | frac cells reaching >= 1.034: ____%
+#                arm 3/4 high 1.17    | frac cells reaching >= 1.17:  ____%
+#   open loop    arm 2 mean dose 85.0 ms (constant)     model cost 0.01436
+#                arm 4 mean dose 43.2 ms (45 ms, 48/50) model cost 0.04669
+#                enumeration: 2500 pulse-train shapes, ensemble n=24, scored over
+#                one full period after settle + one warm-up period
+#                closed-loop dry-run mean dose ____ ms  (dose match: ____)
+#   dry run      per-arm tracking RMSE ____ ; frac frames pinned at 150 ms ____
+#   CADENCE      measured round time at 8 FOVs ____ s  (GATE: <= 45 s, see RISKS)
+#   soak         rho at hour-12 cell count ____  (GATE: < 0.7)
+#
+# The dry run scores the controller against the model's own beliefs using the same
+# model the controller uses. It is not ground truth and must not be read as a
+# feasibility verdict — it is the model's PREDICTION, recorded before the run so the
+# run can falsify it.
+placeholders_resolved = false
+
+
+[default]
+
+# Unchanged from policy_10fov_patterns.toml. Real mCitrine expression channel,
+# future_len 30, cnr_mode "raw", 3 mixture components.
+#   channels: [cnr, u_t, n_cells_200px, optortk_expr, nuc_area]
+checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
+
+# The checkpoint's future_len, so it is not clamped. Applies to the closed-loop arms
+# only in any meaningful sense — the open-loop arms score their committed schedule
+# over the same horizon so plan_cost stays comparable, but never search it.
+control_horizon = 30
+
+# Unchanged, and MUST be: arms searching different ladders are not comparable, and
+# the open-loop schedule is constrained to the same rungs so the two control modes
+# are choosing from the same dose set.
+levels_ms = [0, 20, 45, 85, 150]
+
+# lambda_move = 0. A move penalty would handicap the closed-loop arms specifically
+# — the open-loop schedule pays no move cost it did not choose — and this run is not
+# about smoothness.
+kernel = "l2"
+lambda_move = 0.0
+
+# THE DEFAULT PATTERN — hold. Inherited byte-identically by arms 1 and 2, which is
+# the point: `objective` is replaced wholesale per [fov.N] (policy.py:115-118), so
+# putting the hold reference here is what GUARANTEES the two hold arms track the
+# same thing. Arms 3 and 4 must repeat their oscillation verbatim in each block;
+# the pre-flight asserts those four copies are identical.
+objective = { type = "hold", target_cnr = 1.034 }
+
+# Fallback controller for anything not listed below (none, here).
+controller = { type = "sequence_mpc" }
+
+
+# --- RUN LENGTH -------------------------------------------------------------
+# 100 min settle + 12 cycles x 50 min = 700 min (11.7 h), the house length.
+#
+# The hold arms have no settle of their own — a constant reference is at its target
+# from frame 0. Their first 100 frames are dropped ANYWAY in analysis, to keep the
+# comparison window identical across patterns. See ANALYSIS CONSTRAINT.
+#
+# 700 frames is close to the 758 over which v12's biosensor fell to half of resting.
+# That decay hits all four arms equally so the arm contrast survives it, but the
+# final third will be degraded and must be reported as such rather than pooled.
+
+
+# ---------------------------------------------------------------------------
+# ARM 1 — HOLD, CLOSED LOOP (fov 0, 7)
+#
+# The reference case: per-cell MPC holding a constant setpoint. Every cell gets its
+# own dose from its own state, every frame.
+#
+# This is the arm that should show the LEAST advantage over open loop, and that is
+# why it is here. Rejecting drift around a fixed point is the easiest thing feedback
+# can do, and a fixed schedule can hold a constant setpoint reasonably well by
+# construction. If closed loop cannot beat open loop here, the oscillation result
+# needs a much more careful reading.
+# ---------------------------------------------------------------------------
+
+[fov.0]
+arm = 1
+controller = { type = "sequence_mpc" }
+
+[fov.7]
+arm = 1
+controller = { type = "sequence_mpc" }
+
+
+# ---------------------------------------------------------------------------
+# ARM 2 — HOLD, OPEN LOOP (fov 1, 6)
+#
+# Same setpoint, no feedback. `sequence_ms` is the fixed schedule that best holds
+# 1.034 for an ensemble of nominal cells, per the offline optimiser.
+#
+# DESIGNED: a constant 85 ms, the argmin over the four non-zero rungs.
+#
+# The ladder is scored exhaustively — for a constant reference the shape has one
+# free parameter, so there is no search, no optimiser to tune, and nothing to
+# dither. Worth recording that 45 ms scored 0.01437 against 85 ms's 0.01436: the
+# two are tied to within 0.1%, so the model has essentially no preference between
+# them and the argmin was taken on principle rather than on a real margin. 20 ms
+# and 150 ms are clearly worse (0.0164 both), so the ladder does discriminate — the
+# tie is between the two middle rungs specifically.
+#
+# CONSEQUENCE for reading the run: if arm 2 tracks materially worse than arm 1, it
+# is not because the schedule was badly chosen. There was no better constant.
+# ---------------------------------------------------------------------------
+
+[fov.1]
+arm = 2
+controller = { type = "open_loop", sequence_ms = [85.0], repeat = true }
+
+[fov.6]
+arm = 2
+controller = { type = "open_loop", sequence_ms = [85.0], repeat = true }
+
+
+# ---------------------------------------------------------------------------
+# ARM 3 — OSCILLATION, CLOSED LOOP (fov 2, 5)
+#
+# low 0.87 -> high 1.17, t_low 12 / t_rise 2 / t_high 18 / t_fall 18, period 50.
+# Block 0 of v12's frequency staircase, reused so the waveform itself is not a new
+# unknown — but with n_phase_groups = 1, so every cell tracks the same curve.
+#
+# The fall is free decay and is sized for it:
+#   t_free(1.17 -> 0.87) = 7.3 * ln(0.35/0.05) = 14.2 min <= 18. Reachable.
+#
+# This is where feedback should earn its keep. A moving target means the right dose
+# depends on where the cell currently is, which is exactly the information an open
+# loop does not have.
+# ---------------------------------------------------------------------------
+
+[fov.2]
+arm = 3
+controller = { type = "sequence_mpc" }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+
+[fov.5]
+arm = 3
+controller = { type = "sequence_mpc" }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+
+
+# ---------------------------------------------------------------------------
+# ARM 4 — OSCILLATION, OPEN LOOP (fov 3, 4)
+#
+# The same waveform, verbatim, driven by a fixed 50-frame schedule that repeats once
+# per period. The period of the schedule MUST equal the period of the reference
+# (50 frames) or the arm drifts out of phase over 12 cycles and measures nothing.
+#
+# The schedule is indexed on the CONTROL FRAME, not on faro's timestep, so an
+# acquisition that ran earlier phases cannot slide it against the reference.
+#
+# DESIGNED: 45 ms for 48 frames of the 50-frame cycle, dark for the last 2.
+# Mean 43.2 ms. Cost 0.04669 against 0.15671 for the hand-drawn schedule this
+# replaces — a 70% improvement, which is the measure of how bad a plausible-looking
+# guess actually was, and why this arm could not have shipped with one.
+#
+# THE ANSWER IS NEARLY CONSTANT, AND THAT IS THE INTERESTING PART. The enumeration
+# was free to put the light anywhere in the cycle, at any of four amplitudes, for
+# any duration. It chose to sit at a middle rung essentially the whole time —
+# i.e. the best thing an open loop can do with this waveform is hold its mean, not
+# chase it. If that survives contact with real cells, the arm contrast becomes very
+# legible: closed loop tracks the oscillation, open loop holds a line through it.
+#
+# NOT FULLY SETTLED, and it does not need to be for this run. The enumeration used
+# a coarse grid (every 2nd start offset and duration, 2500 of the 10000 possible
+# shapes), so a narrowly-phased modulated schedule could in principle have been
+# stepped over. The winner sits at duration 48/50, nowhere near a grid boundary,
+# which argues against it — but "open loop cannot track this waveform" is a claim
+# the DATA should settle, not the optimiser. Treat the near-constant schedule as
+# the best available opponent, not as proof that no better one exists.
+# ---------------------------------------------------------------------------
+
+[fov.3]
+arm = 4
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+controller = { type = "open_loop", repeat = true, sequence_ms = [
+  45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+  45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+  45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+  0, 0,
+] }
+
+[fov.4]
+arm = 4
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+controller = { type = "open_loop", repeat = true, sequence_ms = [
+  45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+  45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+  45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+  0, 0,
+] }
+
+
+# --- FOV LAYOUT -------------------------------------------------------------
+#   fov   0  1  2  3  4  5  6  7
+#   arm   1  2  3  4  4  3  2  1
+#
+# Mirrored, not blocked and not cycled. Every arm's mean field index is 3.5, so arm
+# is not confounded with position on the plate — which matters more here than in any
+# previous run, because the contrast is between two fields per arm rather than
+# three, and a single edge field would be a third of one arm's data.
+#
+# RESIDUAL CONFOUND, stated because it cannot be designed away at n=2: pattern is
+# blocked toward the centre (arms 3 and 4 occupy fov 2-5) while control mode is
+# mirrored. Any radial gradient in illumination or temperature therefore aliases
+# onto PATTERN, not onto control mode. That is the right way round — control mode is
+# the claim; pattern is the secondary factor.
+
+
+# --- ANALYSIS CONSTRAINT ----------------------------------------------------
+# 1. THE UNIT OF REPLICATION IS THE FIELD, n = 2 PER ARM. Cells inside a field share
+#    its arm, its illumination and its position, so a per-cell p-value computed as
+#    if cells were independent is wrong by roughly the number of cells per field.
+#    Report per-field values individually, per-cell distributions with field
+#    identity visible, and a mixed model with field as a random effect. State the
+#    n = 2 limit rather than quoting a per-cell test.
+# 2. DROP THE FIRST 100 FRAMES OF EVERY ARM, including the hold arms which have no
+#    settle of their own. The comparison window must be identical across patterns.
+# 3. REPORT CUMULATIVE DELIVERED FLUENCE PER ARM next to every tracking number. Dose
+#    is not matched by construction; a tracking difference at a different dose is a
+#    different claim.
+# 4. Tracking error is against each cell's own logged `r_t`, never a scalar target —
+#    the oscillation arms would otherwise reward cells that failed to track.
+# 5. The primary heterogeneity read-out is the SPREAD of achieved CNR across cells
+#    over time, per arm. That is the quantity closed-loop control is supposed to
+#    reduce and open loop cannot.
+
+
+# --- RISKS ------------------------------------------------------------------
+# 1. CADENCE — THE BIGGEST ONE. 8 fields x 60 s = 7.5 s per field including
+#    inference. v11 achieved 6.9 s/field (8% headroom); v12 achieved 19.9 s/field,
+#    which would take 159 s and fail by 2.7x. The regression from 5.6 to 17.3 s of
+#    non-inference work per field is UNEXPLAINED and soak cannot see it — soak
+#    measures the server only. GATE: measure the real round time on the rig at 8
+#    fields; <= 45 s (25% headroom) or do not run. If it misses, the pre-committed
+#    fallback is to cut to 4 fields = one pattern x 2 arms x 2 repeats, never to cut
+#    repeats to 1.
+#    The server now flags this itself: `--frame-interval-min 1.0` makes it compare
+#    the delivered cadence against the declared one and stamp `cadence_degraded` on
+#    every record. That is a smoke alarm, not a fire suppressant.
+# 2. PHOTOBLEACHING over 700 frames. v12 lost half its resting CNR. It hits all arms
+#    equally so the contrast survives, but the final third of the run will be
+#    degraded and must not be pooled with the first.
+# 3. THE SCHEDULES ARE DESIGNED AGAINST THE MODEL, and the model is not good. On
+#    the last run it scored 10% WORSE than "predict no change" one step ahead. An
+#    open-loop schedule chosen with it can therefore be optimal in simulation and
+#    mediocre on real cells — and that failure biases this experiment in the
+#    direction the hypothesis wants, because closed loop corrects model error and
+#    open loop cannot.
+#    Constraining the search to pulse-train shapes rather than free per-frame slots
+#    removes the room to exploit model quirks (a free search found a dithery
+#    schedule scoring ~2x better, most of which is not believable). What remains is
+#    checked after the fact: the `model error by arm` panel in
+#    experiments/inference_cnrhold_tracks.py compares achieved against predicted per
+#    arm. If arms 2 and 4 show a larger bias than 1 and 3, discount the contrast by
+#    roughly that much and say so.
+# 4. dmd_quantum_ms = 25 is documented upstream but never enforced, and 45 ms is not
+#    a multiple of it. Inherited from every previous run; noted, not fixed.
+# 5. dark_baseline must be OFF. The dark window forces 0 ms for the first
+#    baseline_frames (service.py:298-307), which would break "identical dose every
+#    frame" precisely at the start of the open-loop arms. A cnr_mode="raw" checkpoint
+#    ignores it anyway, so this is belt and braces.

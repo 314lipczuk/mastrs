@@ -109,26 +109,33 @@ The hold target must be reachable by most cells. If it is not, both arms saturat
 and the experiment measures nothing — which is different from the pattern-zoo runs,
 where an unreachable target was the point.
 
-## Gate 6 — design the open-loop schedules
+## Gate 6 — the open-loop schedules (ALREADY DESIGNED — just check)
 
-The policy ships with **naive placeholder schedules**. They are not the experiment.
-Shipping them turns the control arms into a strawman and wastes the run.
+**These are done.** Designed 2026-08-11 against this checkpoint and these
+objectives, and already in the policy:
+
+| arm | fields | schedule | mean dose |
+|---|---|---|---|
+| 2 (hold) | 1, 6 | constant 85 ms | 85.0 ms |
+| 4 (oscillation) | 3, 4 | 45 ms for 48 of 50 frames, dark for 2 | 43.2 ms |
+
+Do **not** redesign them unless Gate 5 moved the target — they are optimised against
+`target_cnr = 1.034` and the 0.87→1.17 waveform, and are stale if either changes.
+If Gate 5 does move a reference:
 
 ```powershell
 python -m marimo edit experiments/open_loop_design.py
 ```
 
-Run it once per open-loop FOV (1 and 3 — their repeats, 6 and 4, share the answer).
-Paste the resulting `sequence_ms` into **both** FOVs of that arm, and the mean dose
-into the provenance block.
+Run once per open-loop FOV (1 and 3; their repeats 6 and 4 share the answer), paste
+`sequence_ms` into **both** fields of that arm, and update the provenance block.
 
-Sanity checks on the output:
+Either way, check:
 
-- the oscillation schedule must have **exactly 50 entries** (the reference period)
-- every value must be on the ladder `[0, 20, 45, 85, 150]`
-- the mean dose should be within roughly 2× of the closed-loop arms' dry-run mean —
-  a wild mismatch means the arms are not comparable on dose, which has to be
-  recorded, not silently accepted
+- the oscillation schedule has **exactly 50 entries** (the reference period)
+- every value is on the ladder `[0, 20, 45, 85, 150]`
+- the mean dose is within roughly 2× of the closed-loop arms' dry-run mean. A wild
+  mismatch means the arms are not comparable on dose — record it, do not ignore it
 
 ## Gate 7 — flip the gate
 

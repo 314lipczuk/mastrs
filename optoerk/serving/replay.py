@@ -458,3 +458,55 @@ def score_open_loop(engine, objective, cnr: np.ndarray, start_frame: int) -> np.
     )
     cost = objective.cost(pred, ctx)                            # (N, 1)
     return cost.view(C, ens).mean(dim=1).cpu().numpy()
+
+
+def pulse_train_candidates(
+    period: int,
+    levels_ms,
+    offset_step: int = 1,
+    duration_step: int = 1,
+    off_levels=(0.0,),
+) -> tuple[np.ndarray, list[dict]]:
+    """Every schedule of the shape "dose A for D frames from offset S, else B".
+
+    Returns ``(schedules (C, period), params)`` — the candidate set for an
+    open-loop arm, enumerated exhaustively rather than searched.
+
+    **Why a shape and not free slots.** Optimising all ``period`` slots
+    independently lets the search dither between rungs frame by frame, and a
+    dithered schedule is where an open-loop arm goes wrong twice over: it exploits
+    whatever the model is locally wrong about, so it beats its rivals in simulation
+    and underperforms on the rig — which biases the closed-loop comparison in the
+    direction the experimenter is hoping for. And it cannot be stated in a thesis
+    except as a table of numbers.
+
+    Constraining to a pulse train removes both problems. The space is small enough
+    to enumerate, so the result is deterministic and reproducible with no optimiser
+    to tune, and the answer is one sentence: this dose, for this long, starting
+    here in each cycle.
+
+    ``duration == period`` is a constant schedule, so a constant reference (which
+    wants exactly that) is covered by the same enumeration with ``period = 1``.
+    """
+    levels = np.asarray(levels_ms, dtype=np.float32)
+    P = int(period)
+    if P < 1:
+        raise ValueError(f"period must be >= 1, got {period}")
+    on_levels = [float(v) for v in levels if v > 0] or [float(levels[0])]
+
+    rows, params = [], []
+    for off in (float(v) for v in off_levels):
+        for amp in on_levels:
+            if amp == off:
+                continue
+            for start in range(0, P, max(1, int(offset_step))):
+                for dur in range(max(1, int(duration_step)), P + 1, max(1, int(duration_step))):
+                    seq = np.full(P, off, dtype=np.float32)
+                    idx = (np.arange(dur) + start) % P
+                    seq[idx] = amp
+                    rows.append(seq)
+                    params.append({"amp_ms": amp, "off_ms": off,
+                                   "start": start, "duration": dur})
+                    if dur == P:
+                        break            # a full-period pulse is offset-invariant
+    return np.stack(rows), params
