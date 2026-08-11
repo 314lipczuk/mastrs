@@ -304,3 +304,157 @@ def simulate_closed_loop(
     finally:
         service.close()
     return pl.DataFrame(rows)
+
+
+def open_loop_ensemble(engine, ens: int, seed: int = 0) -> dict[str, np.ndarray]:
+    """Per-cell covariates for an ensemble of ``ens`` nominal cells.
+
+    Only the channels the model actually conditions on per cell are varied; the
+    rest are left to their population mean, which is what serving feeds when the
+    payload omits them.
+
+    Split out from :func:`simulate_open_loop` so the ensemble is an explicit,
+    inspectable input rather than a hidden RNG draw. A schedule is only as good as
+    the population it was optimised for, so that population belongs in the record.
+    """
+    rng = np.random.default_rng(seed)
+    chans = list(engine.channels)
+    out: dict[str, np.ndarray] = {}
+    if "optortk_expr" in chans:
+        # A session rank in (0, 1] — the range the live feature can produce.
+        out["optortk_expr"] = rng.uniform(0.05, 0.95, ens).astype(np.float32)
+    if "nuc_area" in chans:
+        _m = float(engine.mean_np[chans.index("nuc_area")])
+        out["nuc_area"] = (_m * rng.uniform(0.7, 1.3, ens)).astype(np.float32)
+    return out
+
+
+def simulate_open_loop(
+    engine,
+    seq_ms: np.ndarray,
+    n_frames: int,
+    ens: int,
+    seed: int = 0,
+    static: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Roll fixed dose schedules through the model, with no feedback anywhere.
+
+    ``seq_ms`` is ``(C, P)``: ``C`` candidate schedules of ``P`` frames each, tiled
+    to ``n_frames``. Returns predicted CNR of shape ``(C, ens, n_frames)``.
+
+    This is what designs an open-loop control arm. Unlike
+    :func:`simulate_closed_loop` no controller is consulted — the dose at frame
+    ``t`` is ``seq_ms[:, t % P]`` whatever the cells are doing, which is precisely
+    the property the arm exists to embody.
+
+    **All ``C`` schedules are simulated in one pass**, as ``C * ens`` pseudo-cells,
+    so an optimiser evaluating hundreds of candidates costs one sweep of encoder
+    steps rather than one sweep per candidate.
+
+    The ensemble varies the per-cell covariates the model conditions on, so a
+    schedule is optimised for a POPULATION. Tuning one to the median cell would
+    produce a weaker opponent and flatter any heterogeneity result the closed-loop
+    arm is meant to show.
+
+    Same standing warning as :func:`simulate_closed_loop`: the cells here are the
+    model's own decoder, so this predicts what the model believes a schedule will
+    do. It is the hypothesis the real run exists to falsify, never evidence.
+    """
+    import torch
+
+    dev = engine.device
+    seq_ms = np.asarray(seq_ms, dtype=np.float32)
+    if seq_ms.ndim != 2:
+        raise ValueError(f"seq_ms must be (C, P); got shape {seq_ms.shape}")
+    if not hasattr(engine, "rollout"):
+        raise TypeError(
+            "open-loop simulation needs a RealModelEngine (a checkpoint); the stub "
+            "has no forward model to roll"
+        )
+    C, P = seq_ms.shape
+    N = C * ens
+    chans = list(engine.channels)
+    mean_np = engine.mean_np
+
+    # Per-cell covariates, tiled so every candidate sees the SAME population — two
+    # schedules must differ by the schedule alone, never by which cells they drew.
+    per_cell = open_loop_ensemble(engine, ens, seed) if static is None else static
+    tiled = {}
+    for name, vals in per_cell.items():
+        vals = np.asarray(vals, dtype=np.float32)
+        if vals.shape != (ens,):
+            raise ValueError(f"static[{name!r}] must have shape ({ens},), got {vals.shape}")
+        tiled[name] = np.tile(vals, C)
+
+    cnr = np.full(N, float(mean_np[chans.index("cnr")]), dtype=np.float32)
+    last_flu = np.zeros(N, dtype=np.float32)
+    h = torch.zeros(engine.num_layers, N, engine.hidden, device=dev)
+    c = torch.zeros(engine.num_layers, N, engine.hidden, device=dev)
+    doses = np.repeat(seq_ms, ens, axis=0)                     # (N, P)
+    out = np.empty((N, n_frames), dtype=np.float32)
+
+    with torch.no_grad():
+        for t in range(n_frames):
+            # Channel assembly by NAME, mirroring RealModelEngine.decide: a channel
+            # the ensemble does not vary gets its population mean, which is exactly
+            # what serving feeds when the payload omits it.
+            raw = np.empty((N, len(chans)), dtype=np.float32)
+            for j, name in enumerate(chans):
+                if name == "cnr":
+                    raw[:, j] = cnr
+                elif name == "u_t":
+                    raw[:, j] = last_flu
+                elif name in tiled:
+                    raw[:, j] = tiled[name]
+                else:
+                    raw[:, j] = mean_np[j]
+            xs = (torch.tensor(raw, device=dev) - engine.mean) / engine.std
+            _, (h, c) = engine.model.encoder.lstm(xs.unsqueeze(1), (h, c))
+
+            ms = torch.tensor(doses[:, t % P], dtype=torch.float32, device=dev)
+            fb = xs[:, chans.index("cnr")].reshape(N, 1)
+            fut = engine.std_fluence(ms).view(N, 1, 1)
+            pred = engine.rollout(h, c, fb, fut)                # (N, 1) standardized
+            cnr = engine.denorm_cnr(pred[:, 0]).cpu().numpy()
+            # RAW fluence, not standardized: this is the `u_t` channel value, and
+            # the channel block above standardizes it along with everything else.
+            # It is what `decide` writes to `state.last_fluence`
+            # (calib.ms_to_fluence == ms * fluence_per_ms).
+            last_flu = doses[:, t % P] * float(engine._flu_per_ms)
+            out[:, t] = cnr
+    return out.reshape(C, ens, n_frames)
+
+
+def score_open_loop(engine, objective, cnr: np.ndarray, start_frame: int) -> np.ndarray:
+    """Each candidate's cost under the objective's OWN cost function.
+
+    ``cnr`` is ``(C, ens, T)`` from :func:`simulate_open_loop`. Returns ``(C,)``, the
+    cost averaged over the ensemble.
+
+    Deliberately calls :meth:`Objective.cost` rather than computing an L2 by hand:
+    the open-loop schedule has to be optimised against exactly what the closed-loop
+    arms minimise, kernel and regularizers included. A hand-rolled score would let
+    the two arms drift apart silently, and the whole comparison rests on them
+    optimising the same thing.
+    """
+    import torch
+
+    from optoerk.serving.objectives import GoalContext, Prediction
+    from optoerk.serving.runtime import CellFrame
+    from optoerk.serving.state import CellState
+
+    C, ens, T = cnr.shape
+    N = C * ens
+    cells = []
+    for i in range(N):
+        st = CellState()
+        st.particle = i
+        cells.append(CellFrame(state=st, cnr_norm=1.0, fov_density=float(ens),
+                               n_cells_200px=5.0, x=0.0, y=0.0))
+    ctx = GoalContext(fov=0, timestep=start_frame, cells=cells,
+                      control_frame=start_frame)
+    pred = Prediction(
+        cnr=torch.tensor(cnr.reshape(N, 1, T), dtype=torch.float32, device=engine.device)
+    )
+    cost = objective.cost(pred, ctx)                            # (N, 1)
+    return cost.view(C, ens).mean(dim=1).cpu().numpy()

@@ -24,11 +24,11 @@ from optoerk.serving.objectives import (
     BandKernel,
     ConstantReference,
     DosePenalty,
+    FrequencyStaircaseReference,
     GoalContext,
     L2Kernel,
     MovePenalty,
     Objective,
-    PolicyViolation,
     Prediction,
     StepTrainReference,
     build_kernel,
@@ -703,7 +703,7 @@ def _osc(**kw):
     params = dict(
         low=0.85, high=1.15,
         t_low_min=8.0, t_rise_min=2.0, t_high_min=15.0, t_fall_min=15.0,
-        tau_decay_min=7.3, settle_periods=2.0, n_phase_groups=1,
+        settle_periods=2.0, n_phase_groups=1,
     )
     params.update(kw)
     return StepTrainReference(**params)
@@ -759,31 +759,30 @@ def test_step_train_is_periodic():
             ref.value_at(s + t + ref.period_min))
 
 
-def test_step_train_rejects_a_fall_faster_than_the_plant_can_decay():
-    with pytest.raises(PolicyViolation, match="1.5 x tau_decay_min"):
-        _osc(t_fall_min=5.0, t_high_min=25.0, tau_decay_min=7.3)
+def test_step_train_accepts_a_fall_the_cells_cannot_follow():
+    """Deliberately-unreachable references are expressible, by design.
+
+    The border-probing arms demand exactly this: a reference the cells fail to
+    track is the measurement, and where they depart from it is the answer. The
+    old tau-based guards refused these, comparing one hand-typed number against
+    another; feasibility is now argued in the pre-flight check instead.
+    """
+    ref = _osc(t_fall_min=1.0, t_high_min=29.0)
+    assert ref.period_min == 40.0
+    assert ref.value_at(ref.settle_min + 39.5) == pytest.approx(1.00)
 
 
-def test_step_train_rejects_a_period_below_four_tau():
-    with pytest.raises(PolicyViolation, match="below 4 x"):
-        _osc(t_low_min=2.0, t_rise_min=1.0, t_high_min=2.0, t_fall_min=6.0,
-             tau_decay_min=3.0)
-
-
-def test_step_train_rejects_a_period_the_horizon_cannot_see():
-    """The controller-side bound: period > 2H means no transition is ever inside
-    the planning window and arms 2-4 lose their rationale."""
-    ref = _osc()  # period 40 min
-    ref.validate_horizon(30)   # 2 x 30 min = 60 >= 40, fine
-    ref.validate_horizon(20)   # 2 x 20 min = 40 >= 40, exactly on the bound
-    with pytest.raises(PolicyViolation, match="exceeds 2 x the control horizon"):
-        ref.validate_horizon(15)
-
-
-def test_step_train_horizon_bound_uses_the_frame_interval():
-    ref = _osc(frame_interval_min=0.5)
-    with pytest.raises(PolicyViolation, match="exceeds 2 x the control horizon"):
-        ref.validate_horizon(30)  # 30 frames x 0.5 min = 15 min; 2H = 30 < 40
+def test_step_train_accepts_a_fall_slower_than_free_decay():
+    """The other direction, which is genuinely controllable: the descent is
+    stretched well past free decay, so the controller must add light to brake it."""
+    ref = _osc(t_low_min=1.0, t_rise_min=3.0, t_high_min=8.0, t_fall_min=38.0)
+    assert ref.period_min == 50.0
+    s = ref.settle_min
+    # fall spans [12, 50): 38 min to shed 0.30 CNR, vs ~17.5 min of free decay
+    assert ref.segment_at(s + 12.0) == "fall"
+    assert ref.value_at(s + 12.0) == pytest.approx(1.15)
+    assert ref.value_at(s + 31.0) == pytest.approx(1.00)  # halfway down
+    assert ref.segment_at(s + 49.9) == "fall"
 
 
 def test_step_train_rejects_high_below_low():
@@ -841,7 +840,7 @@ def test_step_train_rows_are_shared_across_cells_in_the_same_phase_group():
 def test_oscillation_reference_is_per_cell_over_the_horizon():
     obj = oscillation(
         low=0.85, high=1.15, t_low_min=8.0, t_rise_min=2.0,
-        t_high_min=15.0, t_fall_min=15.0, tau_decay_min=7.3,
+        t_high_min=15.0, t_fall_min=15.0,
         settle_periods=2.0, n_phase_groups=4,
     )
     cells = _cells(4)
@@ -857,7 +856,7 @@ def test_oscillation_reference_is_per_cell_over_the_horizon():
 def test_oscillation_annotations_carry_the_logging_contract():
     obj = oscillation(
         low=0.85, high=1.15, t_low_min=8.0, t_rise_min=2.0,
-        t_high_min=15.0, t_fall_min=15.0, tau_decay_min=7.3,
+        t_high_min=15.0, t_fall_min=15.0,
         settle_periods=2.0, n_phase_groups=4,
     )
     cells = _cells(2)
@@ -873,20 +872,201 @@ def test_oscillation_annotations_carry_the_logging_contract():
     assert [n["segment"] for n in early] == ["settle", "settle"]
 
 
-def test_hold_and_schedule_have_no_horizon_constraint():
-    """Only the oscillating reference binds against the horizon."""
-    hold(1.2).validate_horizon(1)
-    schedule([[0, 1.0]]).validate_horizon(1)
+# ---------------------------------------------------------------------------
+# frequency staircase
+# ---------------------------------------------------------------------------
+
+# The shipped sweep: at each period the amplitude is the largest that period's
+# fall can deliver, so every block sits near its own decay limit and the fall is
+# never the trivially binding constraint.
+STAIRCASE_BLOCKS = [
+    {"period": 50, "low": 0.87, "high": 1.17,
+     "t_low_min": 12.0, "t_rise_min": 2.0, "t_high_min": 18.0, "t_fall_min": 18.0,
+     "n_cycles": 2},
+    {"period": 35, "low": 0.89, "high": 1.15,
+     "t_low_min": 8.0, "t_rise_min": 2.0, "t_high_min": 13.0, "t_fall_min": 12.0,
+     "n_cycles": 2},
+    {"period": 25, "low": 0.92, "high": 1.12,
+     "t_low_min": 6.0, "t_rise_min": 2.0, "t_high_min": 9.0, "t_fall_min": 8.0,
+     "n_cycles": 3},
+    {"period": 18, "low": 0.945, "high": 1.095,
+     "t_low_min": 4.0, "t_rise_min": 2.0, "t_high_min": 6.0, "t_fall_min": 6.0,
+     "n_cycles": 3},
+]
 
 
-def test_oscillation_validate_horizon_reaches_the_reference():
+def _stair(**kw):
+    blocks = [{k: v for k, v in b.items() if k != "period"}
+              for b in STAIRCASE_BLOCKS]
+    params = dict(blocks=blocks, settle_min=100.0, n_phase_groups=1)
+    params.update(kw)
+    return FrequencyStaircaseReference(**params)
+
+
+def test_staircase_block_and_sweep_durations():
+    ref = _stair()
+    assert [r.period_min for r in ref.refs] == [50.0, 35.0, 25.0, 18.0]
+    assert ref.block_min == [100.0, 70.0, 75.0, 54.0]
+    assert ref.sweep_min == 299.0
+
+
+def test_staircase_amplitude_shrinks_but_the_mean_does_not():
+    """The sweep varies frequency at (near) constant time-mean CNR, so a drift
+    difference between blocks cannot be an exposure difference.
+
+    Mean of a trapezoid over one period is ``low + A * X / period`` where
+    ``X = t_high + (t_rise + t_fall) / 2`` — a linear ramp contributes its
+    midpoint.
+    """
+    ref = _stair()
+    amps = [r.amplitude for r in ref.refs]
+    assert amps == pytest.approx([0.30, 0.26, 0.20, 0.15])
+    assert amps == sorted(amps, reverse=True), "amplitude must fall with period"
+
+    means = []
+    for r in ref.refs:
+        x = r.t_high_min + (r.t_rise_min + r.t_fall_min) / 2
+        means.append(r.low + r.amplitude * x / r.period_min)
+    assert means == pytest.approx([1.038, 1.039, 1.032, 1.028], abs=5e-4)
+    assert max(means) - min(means) < 0.012
+
+
+def test_staircase_holds_low_through_settle_then_starts_the_first_block():
+    ref = _stair()
+    for t in range(0, 100):
+        assert ref.segment_at(t) == "settle"
+        assert ref.value_at(t) == pytest.approx(0.87)
+    assert ref._locate(100.0, 0.0) == (pytest.approx(0.87), "low_hold", 0, 0)
+
+
+def test_staircase_blocks_end_on_a_completed_fall():
+    """Each block spans a whole number of its own cycles, so every boundary sits at
+    the bottom of a fall with a low hold immediately after — never mid-ramp, and
+    never mid-high-hold."""
+    ref = _stair()
+    for start in ref._starts[1:] + [ref.sweep_min]:
+        before = ref._locate(100.0 + start - 0.01, 0.0)
+        after = ref._locate(100.0 + start + 0.01, 0.0)
+        assert before[1] == "fall", f"boundary at {start} is mid-{before[1]}"
+        assert after[1] == "low_hold"
+        # the fall has run to completion, so `before` is already at that block's low
+        assert before[0] == pytest.approx(ref.refs[before[2]].low, abs=1e-3)
+
+
+def test_staircase_boundary_steps_are_small():
+    """The price of stepping `low` with the period: the reference jumps by the
+    difference between adjacent blocks' lows. Going up the staircase these are
+    small upward steps; the sweep wrap is one larger downward step."""
+    ref = _stair()
+    lows = [r.low for r in ref.refs]
+    steps = [b - a for a, b in zip(lows, lows[1:])]
+    assert steps == pytest.approx([0.02, 0.03, 0.025])
+    assert all(s > 0 for s in steps), "low rises as the period shortens"
+
+    wrap = lows[0] - lows[-1]
+    assert wrap == pytest.approx(-0.075)
+    # the wrap is downward and must be absorbed inside the first block's low hold:
+    # free decay 0.945 -> 0.87 toward rest 0.82 is tau * ln(0.125/0.05) = 6.7 min
+    assert ref.refs[0].t_low_min >= 6.7
+
+
+def test_staircase_repeats_and_counts_sweeps():
+    ref = _stair()
+    for t in np.linspace(0, ref.sweep_min, 61):
+        assert ref.value_at(100.0 + t) == pytest.approx(
+            ref.value_at(100.0 + t + ref.sweep_min))
+    assert ref._locate(100.0 + 10.0, 0.0)[3] == 0
+    assert ref._locate(100.0 + ref.sweep_min + 10.0, 0.0)[3] == 1
+    assert ref._locate(100.0 + 2 * ref.sweep_min + 10.0, 0.0)[3] == 2
+
+
+def test_staircase_phase_shifts_the_whole_schedule():
+    """Offsetting moves where a cell is in the *sweep*, not just within a block,
+    so the waveform each cell sees is unbroken and its blocks land at different
+    wall-clock times."""
+    ref = _stair(n_phase_groups=4)
+    offsets = []
+    for particle in range(8):
+        st = CellState()
+        st.particle = particle
+        offsets.append(ref.phase_offset_min(types.SimpleNamespace(state=st)))
+    assert offsets == [0.0, 12.5, 25.0, 37.5] * 2
+
+    # a cell offset by 100 min is a whole block ahead: at sweep time 0 it is in
+    # block 1 while the unoffset cell is still starting block 0
+    assert ref._locate(100.0, 0.0)[2] == 0
+    assert ref._locate(100.0, 100.0)[2] == 1
+    # and the settle window is common — the offset does not shorten it
+    assert ref.segment_at(99.0, 37.5) == "settle"
+
+
+def test_staircase_annotations_carry_the_block_contract():
+    obj = build_objective({
+        "type": "frequency_staircase",
+        "blocks": [{k: v for k, v in b.items() if k != "period"}
+                   for b in STAIRCASE_BLOCKS],
+        "settle_min": 100.0, "n_phase_groups": 1,
+    })
+    cells = _cells(1)
+    notes = obj.annotate(GoalContext(0, 100, cells))
+    assert notes[0] == {
+        "r_t": pytest.approx(0.87), "segment": "low_hold", "phase_offset_min": 0.0,
+        "block_index": 0, "sweep_index": 0, "block_period_min": 50.0,
+    }
+    # block starts within a sweep are [0, 100, 170, 245]; 130 is inside block 1
+    late = obj.annotate(GoalContext(0, 100 + 130, cells))
+    assert late[0]["block_index"] == 1
+    assert late[0]["block_period_min"] == 35.0
+    # settle keeps the schema, with sentinel indices
+    early = obj.annotate(GoalContext(0, 3, cells))
+    assert early[0]["segment"] == "settle"
+    assert early[0]["block_index"] == -1
+    assert early[0]["block_period_min"] is None
+
+
+def test_staircase_rejects_a_fractional_block():
+    with pytest.raises(ValueError, match="whole number of its own cycles"):
+        _stair(blocks=[{"low": 0.87, "high": 1.17, "t_low_min": 12.0,
+                        "t_rise_min": 2.0, "t_high_min": 18.0, "t_fall_min": 18.0,
+                        "n_cycles": 0}])
+
+
+def test_staircase_reference_is_per_cell_over_the_horizon():
+    obj = build_objective({
+        "type": "frequency_staircase",
+        "blocks": [{k: v for k, v in b.items() if k != "period"}
+                   for b in STAIRCASE_BLOCKS],
+        "settle_min": 100.0, "n_phase_groups": 4,
+    })
+    cells = _cells(4)
+    for i, f in enumerate(cells):
+        f.state.particle = i
+    tgt = obj.targets(GoalContext(0, 100, cells), horizon=30,
+                      device=torch.device("cpu"))
+    assert tgt.shape == (4, 30)
+    assert tgt[0, 0] == pytest.approx(0.87)          # phase 0: block 0 low hold
+    assert not torch.equal(tgt[0], tgt[2])           # phases really differ
+
+
+def test_a_period_longer_than_the_horizon_is_allowed():
+    """No reference binds against the control horizon any more.
+
+    The old bound refused ``period > 2H`` on the grounds that the controller
+    could never see a transition coming. It cannot: warning time before a
+    transition is H, always — a transition at T enters the window at t = T - H
+    whatever the period — because the plan re-solves and advances one frame at a
+    time. The surviving constraint is the hard cap H <= future_len, in runtime.
+    """
     obj = oscillation(
         low=0.85, high=1.15, t_low_min=8.0, t_rise_min=2.0,
-        t_high_min=15.0, t_fall_min=15.0, tau_decay_min=7.3,
+        t_high_min=15.0, t_fall_min=15.0,
     )
-    obj.validate_horizon(30)
-    with pytest.raises(PolicyViolation):
-        obj.validate_horizon(10)
+    cells = _cells(1)
+    tgt = obj.targets(GoalContext(0, 80, cells), horizon=4,
+                      device=torch.device("cpu"))
+    assert tgt.shape == (1, 4)
+    assert not hasattr(obj, "validate_horizon")
+    assert not hasattr(obj.reference, "validate_horizon")
 
 
 # ---------------------------------------------------------------------------
@@ -1008,3 +1188,98 @@ def test_build_staggered_from_spec():
     assert ctrl.k == 4 and ctrl.n_samples == 64
     assert ctrl.describe()["type"] == "staggered_mpc"
     assert ctrl.describe()["k"] == 4
+
+
+# ---------------------------------------------------------------------------
+# open_loop — the control arm
+# ---------------------------------------------------------------------------
+
+
+def test_open_loop_commands_the_identical_dose_to_every_cell():
+    """The whole point of the arm. Cells here have wildly different feedback, which
+    every other controller turns into different doses; this one must not."""
+    plant = LeakyPlant(horizon=4)
+    ctrl = build_controller(
+        {"type": "open_loop", "sequence_ms": [0.0, 200.0, 800.0, 400.0]}, LEVELS
+    )
+    cells = _cells(6)
+    h, c, _ = _state_for(cells, plant)
+    cnr_fb = torch.tensor([[0.1], [0.9], [0.5], [0.2], [1.4], [0.7]])
+
+    ms = ctrl.solve(plant, h, c, cnr_fb, hold(0.5), GoalContext(0, 0, cells))
+    assert ms.tolist() == [0.0] * 6, "frame 0 of the sequence, for everyone"
+
+    ms = ctrl.solve(plant, h, c, cnr_fb, hold(0.5), GoalContext(0, 2, cells))
+    assert ms.tolist() == [800.0] * 6
+    assert len(set(ms.tolist())) == 1, "feedback must not reach the dose"
+
+
+def test_open_loop_follows_the_control_clock_not_faros_timestep():
+    """The sequence has to line up with the reference waveform, and the waveform is
+    clocked from the first controlled frame. An acquisition that ran earlier phases
+    hands the server timestep 40 on its first controlled frame — reading that as the
+    schedule index would slide the arm against the reference it was designed for."""
+    plant = ToyPlant(horizon=2)
+    ctrl = build_controller(
+        {"type": "open_loop", "sequence_ms": [0.0, 200.0, 400.0, 600.0]}, LEVELS
+    )
+    cells = _cells(3)
+    args = (plant, *_state_for(cells, plant), hold(0.5))
+
+    for offset in (0, 40, 1000):
+        got = [
+            ctrl.solve(*args, GoalContext(0, offset + i, cells, control_frame=i))[0].item()
+            for i in range(6)
+        ]
+        assert got == [0.0, 200.0, 400.0, 600.0, 0.0, 200.0], f"offset {offset}"
+
+
+def test_open_loop_scores_the_plan_it_is_committed_to():
+    """It never searches, but it must still report what the model believed would
+    happen — that is what keeps plan_cost comparable with the closed-loop arms, and
+    it makes every frame a model-error measurement under a known dose."""
+    plant = ToyPlant(horizon=2)
+    cells = _cells(2)
+    args = (plant, *_state_for(cells, plant), hold(0.5), GoalContext(0, 0, cells))
+
+    # ToyPlant: predicted cnr == dose/800. A sequence sitting exactly on the target
+    # costs nothing; one sitting away from it costs the squared miss.
+    on_target = build_controller({"type": "open_loop", "sequence_ms": [400.0]}, LEVELS)
+    _ms, cost = on_target.plan(*args)
+    assert cost.shape == (2,)
+    assert cost.tolist() == pytest.approx([0.0, 0.0], abs=1e-6)
+
+    off_target = build_controller({"type": "open_loop", "sequence_ms": [800.0]}, LEVELS)
+    _ms, cost_off = off_target.plan(*args)
+    assert cost_off.tolist() == pytest.approx([0.25, 0.25], abs=1e-6)
+
+
+def test_open_loop_describes_its_whole_schedule():
+    """The arm IS its schedule. A run whose log only names the controller cannot be
+    reconstructed afterwards."""
+    ctrl = build_controller(
+        {"type": "open_loop", "sequence_ms": [0.0, 0.0, 600.0, 200.0]}, LEVELS
+    )
+    d = ctrl.describe()
+    assert d["type"] == "open_loop"
+    assert d["sequence_ms"] == [0.0, 0.0, 600.0, 200.0]
+    assert d["period_frames"] == 4
+    assert d["mean_ms"] == pytest.approx(200.0)
+    assert d["repeat"] is True
+
+
+def test_open_loop_rejects_an_empty_or_negative_schedule():
+    with pytest.raises(ValueError, match="non-empty"):
+        build_controller({"type": "open_loop", "sequence_ms": []}, LEVELS)
+    with pytest.raises(ValueError, match="negative"):
+        build_controller({"type": "open_loop", "sequence_ms": [200.0, -1.0]}, LEVELS)
+
+
+def test_open_loop_without_repeat_holds_its_last_dose():
+    """Outrunning a designed sequence must degrade to a constant, not go dark —
+    silently stopping stimulation partway through a 12 h run would look like a
+    control result."""
+    ctrl = build_controller(
+        {"type": "open_loop", "sequence_ms": [200.0, 600.0], "repeat": False}, LEVELS
+    )
+    assert [ctrl.dose_at(i) for i in range(5)] == [200.0, 600.0, 600.0, 600.0, 600.0]

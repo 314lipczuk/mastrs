@@ -19,8 +19,10 @@ Three things differ online, and getting them wrong is silent.
 **The cohort must be complete before anyone is ranked.** The obvious streaming
 design — rank each cell the moment its own window fills — is wrong: the first cell
 to finish would be ranked against a cohort of one and score 1.0. This module
-instead runs an explicit **cohort window**: every cell's measurement is accumulated over
-frames ``timestep < cohort_frames`` and nobody is ranked at all until the window
+instead runs an explicit **cohort window**: every cell's measurement is accumulated
+until each field has been observed for ``cohort_frames`` frames — counted from that
+field's OWN first frame, never from faro's timestep, which starts wherever the
+acquisition's earlier phases left off — and nobody is ranked at all until the window
 closes, at which point the cohort is *sealed* and every cell in it is ranked
 against the whole thing at once. That is the offline computation, performed at the
 earliest moment the data for it exists. Before the seal there is no rank and
@@ -84,8 +86,10 @@ from dataclasses import dataclass, field
 class ExpressionCohort:
     """The session's mCitrine cohort, sealed at ``cohort_frames``, and its ranks.
 
-    ``cohort_frames`` is when the cohort closes. It must be long enough to span
-    the experiment's first optocheck, since before that no cell has a value at all.
+    ``cohort_frames`` is how many frames each field is observed for before the
+    cohort closes, counted from that field's own first frame. faro attaches a
+    cell's optocheck value to every payload for that cell, so a field's first frame
+    already carries all of its measurements — this is a margin, not a wait.
     ``baseline_frames`` bounds how many optocheck samples one cell contributes
     before its rank is frozen; with a single optocheck per run it is reached on the
     first value.
@@ -107,9 +111,11 @@ class ExpressionCohort:
     _frozen: dict[tuple[int, int], float] = field(default_factory=dict)
     # Post-seal arrivals still filling their own window.
     _late: dict[tuple[int, int], list[float]] = field(default_factory=dict)
-    # Highest timestep seen per FOV, so the seal waits for EVERY reporting field
-    # rather than firing on whichever one crosses the threshold first.
-    _fov_clock: dict[int, int] = field(default_factory=dict)
+    # Per FOV, the FIRST and the latest timestep this cohort has seen. The window
+    # is measured as the difference — frames THIS COHORT has observed — never as
+    # the absolute timestep. See `ready_to_seal`.
+    _fov_first: dict[int, int] = field(default_factory=dict)
+    _fov_seen: dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.baseline_frames < 1:
@@ -150,27 +156,49 @@ class ExpressionCohort:
         self._building.clear()
 
     def ready_to_seal(self, fov: int, timestep: int) -> bool:
-        """Has every reporting FOV reached the cohort window's end?
+        """Has every reporting FOV been observed for the whole cohort window?
 
-        Sealing on the first payload past ``cohort_frames`` is wrong when the
-        fields are skewed: whichever FOV runs ahead closes the cohort, and every
-        field behind it is then ranked against a partial population. faro
-        interleaves FOVs tightly within a cycle so the skew is normally under one
-        frame, but "normally" is not a guarantee and the failure is silent — the
-        late field's cells simply get ranks drawn from a fraction of the session.
+        **The window is counted in frames THIS COHORT HAS OBSERVED, never in
+        faro's timestep numbers.** Those are not the same quantity and confusing
+        them is a live failure: an experiment that runs an optocheck phase first
+        hands the server its first controlled frame already numbered `timestep=40`,
+        and a window expressed in absolute timesteps is then long past before a
+        single measurement has been folded in — the cohort seals empty on frame
+        one, every cell scores 1.0 against nothing, and the run continues on a
+        constant. Anchoring on each field's own first frame makes the cohort
+        indifferent to where faro starts numbering, and to restarts and resumes.
 
-        The backstop bounds the wait: if any FOV reaches twice the window, seal
-        regardless, so one stalled or withdrawn field cannot hold the cohort open
-        forever and leave every cell on the neutral value for the whole run.
+        Sealing on the first payload past the window is wrong when the fields are
+        skewed: whichever FOV runs ahead closes the cohort, and every field behind
+        it is then ranked against a partial population. faro interleaves FOVs
+        tightly within a cycle so the skew is normally under one frame, but
+        "normally" is not a guarantee and the failure is silent — the late field's
+        cells simply get ranks drawn from a fraction of the session.
+
+        The backstop bounds the wait: if any FOV has been observed for twice the
+        window, seal regardless, so one stalled or withdrawn field cannot hold the
+        cohort open forever and leave every cell on the neutral value for the whole
+        run. Because it too is measured in observed frames, it now fires only for a
+        field that really is absent.
+
+        Called once per cell, so it must be idempotent within a frame — hence a
+        max/first pair rather than a counter.
         """
-        self._fov_clock[int(fov)] = max(self._fov_clock.get(int(fov), -1), int(timestep))
+        key = int(fov)
+        ts = int(timestep)
+        self._fov_first.setdefault(key, ts)
+        self._fov_seen[key] = max(self._fov_seen.get(key, ts), ts)
         end = int(self.cohort_frames)
-        if max(self._fov_clock.values()) >= 2 * end:
+
+        def _observed(f: int) -> int:
+            return self._fov_seen[f] - self._fov_first[f]
+
+        if max(_observed(f) for f in self._fov_seen) >= 2 * end:
             return True
         if self.expected_fovs is not None:
-            if not self.expected_fovs <= set(self._fov_clock):
+            if not self.expected_fovs <= set(self._fov_seen):
                 return False        # a declared field has not reported at all yet
-        return min(self._fov_clock.values()) >= end
+        return min(_observed(f) for f in self._fov_seen) >= end
 
     def observe(self, fov: int, state, value: float | None, timestep: int) -> float | None:
         """Fold in this frame's measurement (if any); return the rank, or None.
@@ -213,6 +241,18 @@ class ExpressionCohort:
         state.optortk_rank = rank
         return rank
 
+    def spread(self) -> dict:
+        """Size and quantiles of the sealed cohort — the distribution every rank
+        in the run is measured against, recorded once so a degenerate one is
+        visible in the log instead of only in the ranks it produces."""
+        n = len(self._sorted_c0)
+        if n == 0:
+            return {"n": 0}
+        def _q(p: float) -> float:
+            return float(self._sorted_c0[min(n - 1, max(0, int(round(p * (n - 1)))))])
+        return {"n": n, "min": float(self._sorted_c0[0]), "p25": _q(0.25),
+                "median": _q(0.5), "p75": _q(0.75), "max": float(self._sorted_c0[-1])}
+
     def describe(self) -> dict:
         return {
             "baseline_frames": self.baseline_frames,
@@ -222,7 +262,12 @@ class ExpressionCohort:
             "n_frozen": len(self._frozen),
             "expected_fovs": (None if self.expected_fovs is None
                               else sorted(self.expected_fovs)),
-            "fov_clock": dict(sorted(self._fov_clock.items())),
+            # Frames observed per FOV, not raw timesteps — the quantity the seal
+            # actually depends on (see `ready_to_seal`).
+            "fov_frames_observed": {
+                f: self._fov_seen[f] - self._fov_first[f]
+                for f in sorted(self._fov_seen)
+            },
         }
 
 

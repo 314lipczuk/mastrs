@@ -140,17 +140,27 @@ class ServerConfig:
     # keeps only identity columns plus the columns ITS OWN feature extractor
     # produced — and the ref extractor is a different one — so it has to be let
     # through explicitly on the faro side. If nothing ever arrives the server
-    # aborts once the cohort seals empty (`_check_optortk_coverage`) rather than
-    # quietly feeding the constant, because a silent fallback looks exactly like a
-    # successful run and produces a whole experiment of median-expresser
-    # predictions.
+    # warns loudly and stamps every predict record when the cohort seals too thin
+    # to rank against (`_check_optortk_coverage`), because a silent fallback looks
+    # exactly like a successful run and produces a whole experiment of
+    # median-expresser predictions.
     live_optortk_expr: bool = False
     # How many optocheck samples one cell contributes before its rank freezes. One
     # optocheck per run is the normal case, so 1 is the sensible default.
     optortk_baseline_frames: int = 1
-    # When the session cohort closes. Must be long enough to span the FIRST
-    # optocheck of the run — nobody can be ranked before the population exists.
+    # How many frames each field is observed for before the session cohort closes,
+    # counted from that field's OWN first frame — not from faro's timestep, which
+    # starts wherever the acquisition's earlier phases left off.
+    #
+    # faro attaches a cell's optocheck value to every payload for that cell, so a
+    # field's first frame already carries all of its measurements and this does not
+    # have to span anything. It is a margin, not a wait.
     optortk_cohort_frames: int = 10
+    # Fewest cells the sealed cohort may contain and still produce a meaningful
+    # rank. A percentile against one cell is 1.0 for everybody; against a handful
+    # it is noise. Below this the run continues on the neutral value, but says so
+    # on every frame — see `InferenceService._check_optortk_coverage`.
+    optortk_min_cohort_cells: int = 20
 
     # --- prediction logging -----------------------------------------------
     # When set, the server appends a structured JSONL record per prediction
@@ -183,6 +193,43 @@ class ServerConfig:
     # the observed startup jam). No effect off CUDA.
     warmup: bool = True
 
+    # --- inference batch bucketing ----------------------------------------
+    # Round the per-frame cell count UP to a multiple of this before inference,
+    # then drop the padded rows from the result.
+    #
+    # Every tensor in `decide` is shaped by the live cell count, and under a
+    # sampling controller that count enters multiplied by (n_samples x horizon).
+    # A cell count that drifts upward all run — which is what a dividing
+    # population does — therefore asks for a block size the CUDA caching
+    # allocator has never seen, on every single frame. Each miss cudaMallocs a
+    # fresh segment and strands the whole previous cache: too small to reuse,
+    # never freed. Observed: `memory_reserved` climbing 1.2 GB -> 81 GB against a
+    # flat ~19 MB of live tensors, until the card capped and every allocation
+    # started paying a synchronizing cudaFree/cudaMalloc round trip (inference
+    # 1.5 s -> 5.1 s).
+    #
+    # Bucketing bounds the number of distinct shapes to a handful, so after the
+    # first few frames every allocation is a cache hit and `memory_reserved`
+    # plateaus. The cost is inference on up to `batch_bucket - 1` padding cells.
+    #
+    # ON REPRODUCIBILITY. Padding is appended and the CEM draws its plans
+    # row-by-row from a CPU generator, so the sampled plans are unchanged. The
+    # rollout is not bit-identical, though: batched matmul reassociates with the
+    # batch size, which moves the predicted cost by float32 round-off (measured
+    # max |dcost| ~5e-6). The controller then picks argmin over a DISCRETE dose
+    # ladder, so a cell whose top two levels are tied to within that can come out
+    # on the other one — in ~10% of frames, for cells the controller was by
+    # definition indifferent about.
+    #
+    # This makes runs MORE reproducible, not less. Without bucketing the batch
+    # size is the live cell count, so it is a different number on essentially
+    # every frame and the same reassociation happens continuously and
+    # unrepeatably; with it, a handful of shapes recur all run. What it does mean
+    # is that a bucketed run will not bit-match an unbucketed replay of itself.
+    #
+    # 0 or 1 disables it.
+    batch_bucket: int = 32
+
     # --- GPU telemetry sampler --------------------------------------------
     # When the predict log is enabled and the engine is on CUDA, a background
     # thread samples NVML GPU telemetry every this many seconds and appends
@@ -191,6 +238,30 @@ class ServerConfig:
     # prediction path, so it keeps recording through a stall. Requires
     # ``nvidia-ml-py``. 0 disables it.
     gpu_sample_interval_s: float = 5.0
+
+    # --- acquisition cadence ----------------------------------------------
+    # The frame interval the rig is SUPPOSED to deliver, in minutes. The server
+    # cannot enforce it — it only answers requests — but it can see it, because it
+    # timestamps every one. Set it to the acquisition's programmed interval.
+    #
+    # This is a contract, not a measurement to adapt to. The checkpoint was trained
+    # at a fixed interval and every objective converts its waveform from minutes to
+    # frames at a declared rate, so a rig running slower does not stretch the
+    # experiment, it invalidates it: a 50-minute reference period delivered at 3.4
+    # minutes per frame is really a 170-minute period, and the model is being asked
+    # to extrapolate dynamics on a timescale it never saw. That happened for a whole
+    # 12 h run and was only found afterwards, from the parquet timestamps.
+    #
+    # So: measure the real interval, compare, and shout in the first few minutes
+    # while the run is still cheap to abort. Never quietly redefine the experiment
+    # to match what the hardware managed.
+    frame_interval_min: float = 1.0
+    # Fractional slip tolerated before the run is flagged. 0.25 = the median
+    # observed interval may exceed the declared one by 25%.
+    cadence_tolerance: float = 0.25
+    # Per-FOV intervals to collect before judging. Small enough to fire early,
+    # large enough that one slow frame does not.
+    cadence_min_samples: int = 10
 
     # --- crowding features -------------------------------------------------
     crowd_radius_px: float = 200.0   # n_cells_200px neighbourhood radius

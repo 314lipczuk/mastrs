@@ -15,9 +15,8 @@ with app.setup:
         Seq2ScalarHistory,
     )
     from optoerk.core.utils import materials_path
-    from optoerk.data.history_data import load_history_tracks
+    from optoerk.data.history_data import load_history_tracks, resolve_feature_set
     from optoerk.data.history_dataset import (
-        CHANNELS,
         NormStats,
         compute_norm_stats,
         make_split,
@@ -87,13 +86,17 @@ def _(mo):
 
 
 @app.cell
-def _(CNR_MODE, MODE, mo):
+def _(CNR_MODE, FEATURES, MODE, mo):
     # Training bundle to load (parquet in materials/). Default = the full `all`
     # bundle; jobs override via --dataset (e.g. dataset_niesen.parquet).
-    DATASET = mo.cli_args().get("dataset", "dataset_all.parquet")
+    # Default bundle carries the REAL mCitrine optoRTK measurement (built by
+    # experiments/build_mcitrine_dataset.py). The older dataset_all.parquet has
+    # no `mcitrine` column and will now fail loudly rather than fall back to the
+    # C0 surrogate it used to use.
+    DATASET = mo.cli_args().get("dataset", "dataset_all_mcitrine.parquet")
     if MODE == "train":
         hist_cnr, hist_feats, hist_cond, _hist_meta = load_history_tracks(
-            materials_path(DATASET), cnr_mode=CNR_MODE
+            materials_path(DATASET), cnr_mode=CNR_MODE, features=FEATURES
         )
         hist_split = make_split(hist_cond, seed=0)
     else:
@@ -102,12 +105,14 @@ def _(CNR_MODE, MODE, mo):
 
 
 @app.cell
-def _(CNR_MODE, MODE, hist_cnr, hist_feats, hist_split):
+def _(CNR_MODE, FEATURES, MODE, hist_cnr, hist_feats, hist_split):
     # Standardization computed from THIS bundle's train split (not a frozen file),
     # so stats always match the loaded data/features. Stamped onto the model
     # config for eval/serving. Load mode: values unused (config comes from bundle).
     if MODE == "train":
-        norm_stats = compute_norm_stats(hist_cnr, hist_feats, hist_split["train"])
+        norm_stats = compute_norm_stats(
+            hist_cnr, hist_feats, hist_split["train"], features=FEATURES
+        )
     else:
         norm_stats = NormStats.load(cnr_mode=CNR_MODE)
     return (norm_stats,)
@@ -123,6 +128,13 @@ def _(mo, parse_bool):
     # "raw" = absolute cnr_median. Stamped onto the model config so eval/serving
     # know whether to online-normalize and which frozen z-score stats to load.
     CNR_MODE = mo.cli_args().get("cnr_mode", "norm")
+    # Which input channels the model gets, and what conditions FiLM. These are
+    # the axes of the encoding comparison (see optoerk.data.history_data
+    # FEATURE_SETS and HistoryConfig.film_cond); everything else is held fixed
+    # across the runs so the comparison is one-factor.
+    FEATURE_SET = mo.cli_args().get("feature_set", "base")
+    FILM_COND = mo.cli_args().get("film_cond", "fluence")
+    FEATURES, FUTURE_CHANNELS = resolve_feature_set(FEATURE_SET)
 
     if MODE not in ("train", "load"):
         raise ValueError(f"--mode must be 'train' or 'load', got {MODE!r}")
@@ -131,9 +143,21 @@ def _(mo, parse_bool):
 
     mo.md(
         f"**Mode:** `{MODE}` · **CNR:** `{CNR_MODE}` · **Headless:** `{IS_HEADLESS}` · "
-        f"**Experiment:** `{EXPERIMENT_NAME}` · **Dry run:** `{DRY_RUN}`"
+        f"**Experiment:** `{EXPERIMENT_NAME}` · **Dry run:** `{DRY_RUN}`\n\n"
+        f"**Feature set:** `{FEATURE_SET}` → `{FEATURES}` · "
+        f"**FiLM conditioned on:** `{FILM_COND}`"
     )
-    return CNR_MODE, DRY_RUN, EXPERIMENT_NAME, IS_HEADLESS, MODE
+    return (
+        CNR_MODE,
+        DRY_RUN,
+        EXPERIMENT_NAME,
+        FEATURES,
+        FEATURE_SET,
+        FILM_COND,
+        FUTURE_CHANNELS,
+        IS_HEADLESS,
+        MODE,
+    )
 
 
 @app.cell
@@ -214,6 +238,8 @@ def _(
     CNR_MODE,
     DRY_RUN,
     EXPERIMENT_NAME,
+    FILM_COND,
+    FUTURE_CHANNELS,
     IS_HEADLESS,
     MODE,
     form,
@@ -229,7 +255,10 @@ def _(
         config_classes={"m": HistoryConfig, "t": HistoryTrainingConfig},
         always={
             "m": {
-                "input_dim": len(CHANNELS),
+                "input_dim": len(norm_stats.channels),
+                "stim_dim": len(FUTURE_CHANNELS),
+                "future_channels": FUTURE_CHANNELS,
+                "film_cond": FILM_COND,
                 "cnr_mode": CNR_MODE,
                 "norm_channels": norm_stats.channels,
                 "norm_mean": norm_stats.mean,
@@ -347,7 +376,140 @@ def _(history, mo, pl, qplot):
 
 @app.cell
 def _(
+    FEATURES,
+    FEATURE_SET,
+    FILM_COND,
+    MODE,
     artifacts,
+    hist_cnr,
+    hist_feats,
+    hist_split,
+    mo,
+    norm_stats,
+):
+    # --- ENCODING COMPARISON METRICS ---------------------------------------
+    # Computed on the TEST split, which no run ever trains or early-stops on, and
+    # with the same seed everywhere — so the four variants are scored on the same
+    # samples in the same order and the comparison notebook can pair them.
+    #
+    # NLL alone cannot decide this. A covariate can shave the average loss while
+    # being used for the wrong thing, so three further readouts are recorded:
+    #   gain_spearman   does the model's believed dose effect rise with the cell's
+    #                   expression? optoRTK expression IS a gain, so this is the
+    #                   question the encoding variants exist to answer.
+    #   perm_delta_nll  shuffle a channel across cells; a channel whose shuffle is
+    #                   free is a channel the model ignores. This is what decides
+    #                   whether `nuc_area` earns its place.
+    #   decile_mae      error by expression decile. Helping on average while
+    #                   leaving the high expressers just as wrong is not success.
+    mo.stop(MODE != "train" or artifacts is None, mo.md("_No metrics — not a training run._"))
+
+    from torch.utils.data import DataLoader
+
+    from optoerk.data.history_dataset import HistoryDataset, collate_history
+    from optoerk.eval.encoding_metrics import (
+        dose_effect,
+        evaluate,
+        permutation_importance,
+        stratified_error,
+    )
+
+    _model = artifacts.model.eval()
+    _mcfg = _model.cfg
+    _te = hist_split["test"]
+    _ds = HistoryDataset(
+        hist_cnr[_te], hist_feats[_te], np.arange(len(_te)), norm_stats,
+        F=_mcfg.future_len, t_min=10, p_concat=0.0,
+        future_channels=_mcfg.future_channels, seed=0,
+    )
+    _dl = DataLoader(_ds, batch_size=256, shuffle=False, collate_fn=collate_history)
+
+    _ev = evaluate(_model, _dl)
+    _de = dose_effect(_model, _dl)
+    _st = stratified_error(_ev["abs_err_per_sample"], _de["expr_std"])
+    _scored = [_c for _c in norm_stats.channels if _c != "cnr"]   # cnr is the target
+    _perm = {
+        _c: permutation_importance(_model, _dl, _c)["delta_nll"] for _c in _scored
+    }
+    # ...and the same shuffles with each channel moved ALONE. Not a valid input
+    # state, so not an importance — a decomposition. Without it the interaction
+    # variant is unreadable: linked, its `optortk_expr` scores ~9x every other
+    # run, which looks like the encoding made the model use expression harder.
+    # Decomposed, that number is almost entirely `u_t_x_expr` acting as a second
+    # dose channel, and expression alone is used LESS than in the baseline.
+    _perm_solo = {
+        _c: permutation_importance(_model, _dl, _c, linked=False)["delta_nll"]
+        for _c in _scored
+    }
+
+    encoding_metrics = {
+        "feature_set": FEATURE_SET,
+        "film_cond": FILM_COND,
+        "features": FEATURES,
+        "channels": list(norm_stats.channels),
+        "n_test_samples": int(len(_ev["nll"])),
+        "test_nll": float(_ev["nll"].mean()),
+        "test_mae": _ev["mae"],
+        "test_rmse": _ev["rmse"],
+        "mae_per_step": [float(x) for x in _ev["mae_per_step"]],
+        "rmse_per_step": [float(x) for x in _ev["rmse_per_step"]],
+        "cov68": _ev["cov68"],
+        "cov95": _ev["cov95"],
+        "z_std": _ev["z_std"],
+        "gain_spearman": _de["gain_spearman"],
+        "mean_dose_effect": _de["mean_effect"],
+        "perm_delta_nll": {k: float(v) for k, v in _perm.items()},
+        "perm_delta_nll_solo": {k: float(v) for k, v in _perm_solo.items()},
+        "decile_mae": [float(x) for x in _st["decile_mae"]],
+        "decile_mae_spread": _st["spread"],
+        # per-sample, for paired tests in the comparison notebook
+        "_per_sample_nll": [float(x) for x in _ev["nll"]],
+        "_per_sample_abs_err": [float(x) for x in _ev["abs_err_per_sample"]],
+    }
+
+    _rows = "\n".join(
+        f"| `{_k}` | {_v:+.4f} | {encoding_metrics['perm_delta_nll_solo'][_k]:+.4f} |"
+        for _k, _v in sorted(
+            encoding_metrics["perm_delta_nll"].items(), key=lambda kv: -kv[1])
+    )
+    mo.md(
+        f"""
+    ### Encoding metrics — `{FEATURE_SET}` / FiLM on `{FILM_COND}`
+
+    **{encoding_metrics['n_test_samples']}** test samples ·
+    NLL **{encoding_metrics['test_nll']:.4f}** ·
+    MAE **{encoding_metrics['test_mae']:.4f}** ·
+    RMSE **{encoding_metrics['test_rmse']:.4f}**
+
+    Calibration: 68% interval covers **{encoding_metrics['cov68']:.1%}**,
+    95% covers **{encoding_metrics['cov95']:.1%}** (nominal 68 / 95).
+
+    **Gain test:** Spearman(expression, believed dose effect) =
+    **{encoding_metrics['gain_spearman']:+.3f}**. Positive means the model
+    predicts a larger light effect for higher expressers, which is what optoRTK
+    expression physically is.
+
+    **Permutation importance** (NLL increase when the channel is shuffled across
+    cells; ~0 means unused):
+
+    | channel | Δ NLL (linked) | Δ NLL (alone) |
+    |---|---|---|
+    {_rows}
+
+    *linked* moves a channel with anything derived from it, which is the causal
+    importance; *alone* is the decomposition that says which of the linked group
+    the effect actually came from.
+
+    Error by expression decile spans **{encoding_metrics['decile_mae_spread']:.4f}** CNR.
+    """
+    )
+    return (encoding_metrics,)
+
+
+@app.cell
+def _(
+    artifacts,
+    encoding_metrics,
     fig_loss,
     hostname,
     is_cluster,
@@ -361,7 +523,14 @@ def _(
         is_headless="name" in mo.cli_args(),
         artifacts=artifacts,
         figures={"loss": fig_loss} if not isinstance(fig_loss, type(mo.md(""))) else {},
-        metrics={"final_val_loss": (artifacts.history["val_loss"][-1] if artifacts.history["val_loss"] else None)},
+        metrics={
+            "final_val_loss": (
+                artifacts.history["val_loss"][-1] if artifacts.history["val_loss"] else None
+            ),
+            # The whole point of the four-run comparison travels in the bundle,
+            # so experiments/encoding_comparison.py needs nothing but the bundles.
+            "encoding": encoding_metrics,
+        },
         n_train=n_train,
         n_val=n_val,
         hostname=hostname,

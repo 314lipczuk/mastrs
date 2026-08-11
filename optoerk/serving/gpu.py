@@ -18,6 +18,7 @@ Two pieces, both **best-effort** — a telemetry failure must never break servin
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any, Callable
@@ -39,18 +40,103 @@ def cuda_mem_mb(device) -> dict[str, float]:
         return {}
 
 
+def _torch_device_uuid(index: int) -> str:
+    """The CUDA device's hardware UUID as torch sees it, or ``""``.
+
+    This is the only identifier that means the same thing on both sides of the
+    NVML/CUDA divide — see :func:`resolve_nvml_handle`.
+    """
+    try:
+        import torch
+
+        return str(getattr(torch.cuda.get_device_properties(index), "uuid", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _norm_uuid(u) -> str:
+    if isinstance(u, bytes):
+        u = u.decode("ascii", "replace")
+    return str(u).strip().lower().removeprefix("gpu-")
+
+
+def resolve_nvml_handle(pynvml, index: int) -> tuple[Any, dict[str, Any]]:
+    """NVML handle for the physical GPU that torch device ``cuda:index`` runs on.
+
+    **NVML does not honour ``CUDA_VISIBLE_DEVICES``.** Its indices enumerate the
+    machine's physical GPUs; torch's enumerate only the visible subset, in the
+    order that variable lists them. So on any shared or scheduled box the two
+    disagree, and ``nvmlDeviceGetHandleByIndex(torch_index)`` silently samples a
+    DIFFERENT CARD than the one running the model — telemetry that looks healthy
+    because it is describing somebody else's GPU. (That is not hypothetical: it
+    is how a run reported a 21 GB device at 2% utilisation while torch reserved
+    81 GB on the real one.)
+
+    Resolution, most trustworthy first, with how it was resolved returned so the
+    log records whether the numbers can be believed:
+
+      1. **uuid** — match torch's device UUID against every NVML device. Correct
+         under any remapping, and the only strategy that actually verifies.
+      2. **visible-devices** — index into ``CUDA_VISIBLE_DEVICES`` ourselves.
+         Right whenever that variable is what did the remapping.
+      3. **index-unverified** — the old behaviour. Kept so telemetry still flows
+         on a driver too old for the above, but labelled so nothing downstream
+         treats it as confirmed.
+    """
+    meta: dict[str, Any] = {"torch_index": index}
+    uuid = _torch_device_uuid(index)
+    if uuid:
+        meta["torch_uuid"] = uuid
+        try:
+            for i in range(pynvml.nvmlDeviceGetCount()):
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                if _norm_uuid(pynvml.nvmlDeviceGetUUID(h)) == _norm_uuid(uuid):
+                    meta.update(nvml_index=i, resolved_by="uuid", verified=True)
+                    return h, meta
+        except Exception as e:  # noqa: BLE001
+            meta["uuid_lookup_error"] = repr(e)
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        meta["cuda_visible_devices"] = visible
+        entries = [e.strip() for e in visible.split(",") if e.strip()]
+        if index < len(entries):
+            entry = entries[index]
+            try:
+                if entry.startswith(("GPU-", "MIG-")):
+                    h = pynvml.nvmlDeviceGetHandleByUUID(entry.encode())
+                    meta.update(resolved_by="visible-devices", verified=True)
+                    return h, meta
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(entry))
+                meta.update(nvml_index=int(entry), resolved_by="visible-devices",
+                            verified=True)
+                return h, meta
+            except Exception as e:  # noqa: BLE001
+                meta["visible_devices_error"] = repr(e)
+
+    meta.update(nvml_index=index, resolved_by="index-unverified", verified=False)
+    return pynvml.nvmlDeviceGetHandleByIndex(index), meta
+
+
 class GpuSampler(threading.Thread):
-    """Daemon thread emitting periodic ``gpu`` telemetry records via ``write``."""
+    """Daemon thread emitting periodic ``gpu`` telemetry records via ``write``.
+
+    ``device`` is the **torch device the model is on**, not an NVML index — the
+    two are not interchangeable (see :func:`resolve_nvml_handle`). One
+    ``gpu_device`` record is emitted before sampling starts, naming the card that
+    was resolved and how, so a reader can tell whether the ``gpu`` stream
+    describes the model's GPU or an unverified guess at it.
+    """
 
     def __init__(
         self,
         write: Callable[[dict[str, Any]], None],
-        device_index: int,
+        device,
         interval_s: float,
     ):
         super().__init__(daemon=True, name="gpu-sampler")
         self._write = write
-        self._device_index = device_index
+        self._device_index = 0 if getattr(device, "index", None) is None else device.index
         self._interval_s = interval_s
         self._stop = threading.Event()
 
@@ -63,11 +149,24 @@ class GpuSampler(threading.Thread):
             return
         try:
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(self._device_index)
+            handle, meta = resolve_nvml_handle(pynvml, self._device_index)
         except Exception as e:  # noqa: BLE001
             self._write({"t": time.time(), "event": "gpu",
                          "error": f"nvml init failed: {e!r}"})
             return
+        # Identify the card once, up front: name and total memory make the
+        # per-sample `mem_used_mb` interpretable, and `verified` says whether
+        # this is the model's GPU or only assumed to be.
+        try:
+            name = pynvml.nvmlDeviceGetName(handle)
+            meta["nvml_name"] = name.decode() if isinstance(name, bytes) else str(name)
+            meta["nvml_uuid"] = _norm_uuid(pynvml.nvmlDeviceGetUUID(handle))
+            meta["mem_total_mb"] = round(
+                pynvml.nvmlDeviceGetMemoryInfo(handle).total / 1e6, 1
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._write({"t": time.time(), "event": "gpu_device", **meta})
         try:
             while True:
                 self._write(self._sample(pynvml, handle))

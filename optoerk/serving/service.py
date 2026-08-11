@@ -62,6 +62,14 @@ class InferenceService:
         # not.
         self._n_optortk_seen = 0
         self._optortk_checked = False
+        # Set once if the cohort seals too thin to rank against, and never
+        # cleared: from then on every predict record carries it.
+        self.optortk_degraded = False
+        # Same treatment for the acquisition cadence — see `_check_cadence`.
+        self.cadence_degraded = False
+        self._cadence_checked = False
+        self._fov_last_recv: dict[int, float] = {}
+        self._cadence_samples: list[float] = []
         self.cohort: ExpressionCohort | None = (
             ExpressionCohort(
                 baseline_frames=self.cfg.optortk_baseline_frames,
@@ -109,8 +117,11 @@ class InferenceService:
             # so it keeps sampling through a stall. See optoerk.serving.gpu.
             dev = getattr(self.engine, "device", None)
             if self.cfg.gpu_sample_interval_s > 0 and getattr(dev, "type", None) == "cuda":
+                # The torch device, NOT an index: NVML enumerates physical GPUs
+                # and ignores CUDA_VISIBLE_DEVICES, so an index handed straight
+                # across can name a different card (see gpu.resolve_nvml_handle).
                 self._gpu_sampler = GpuSampler(
-                    self._logger.write, dev.index or 0, self.cfg.gpu_sample_interval_s
+                    self._logger.write, dev, self.cfg.gpu_sample_interval_s
                 )
                 self._gpu_sampler.start()
 
@@ -138,17 +149,95 @@ class InferenceService:
         if not self.cohort.sealed or self._optortk_checked:
             return
         self._optortk_checked = True
-        if self.cohort.n_cells > 0:
+
+        spread = self.cohort.spread()
+        if self._logger:
+            self._logger.write({
+                "t": time.time(), "event": "optortk_cohort",
+                "fov": fov, "timestep": timestep, "spread": spread,
+                "degraded": spread["n"] < self.cfg.optortk_min_cohort_cells,
+            })
+        if spread["n"] >= self.cfg.optortk_min_cohort_cells:
+            print(f"[serving] optoRTK cohort sealed: {spread['n']} cells, "
+                  f"median {spread['median']:.1f}")
             return
-        raise ValueError(
-            f"live_optortk_expr is on but the expression cohort sealed EMPTY at "
-            f"fov {fov} timestep {timestep}: no cell supplied any of {OPTORTK_KEYS} "
-            f"in the first {self.cohort.cohort_frames} frames. Either the "
-            f"acquisition has no optocheck/reference channel, or faro is not "
-            f"forwarding it — `RefFE` writes `ref_mean_intensity` into the tracks, "
-            f"but InferenceServerStim keeps only its own feature extractor's "
-            f"columns, so it has to be let through explicitly. Raise "
-            f"optortk_cohort_frames if the first optocheck lands later than that."
+
+        # Too thin to rank against — with one cell everybody scores 1.0 — but NOT
+        # a reason to stop. A false alarm here would kill a run that was fine,
+        # whereas a run that continues on the neutral value is still a run, as
+        # long as nobody can later mistake it for one that had the feature. So:
+        # shout once, and mark every subsequent frame (`optortk_degraded` on each
+        # predict record) so the log carries it rather than the operator's memory.
+        #
+        # This deliberately no longer raises. It used to — once — and then
+        # disarmed itself, which killed a single frame and let 40 h of run
+        # continue in exactly the state it existed to prevent.
+        self.optortk_degraded = True
+        print(
+            f"\n[serving] *** optoRTK EXPRESSION DEGRADED ***\n"
+            f"[serving] The cohort sealed with {spread['n']} cell(s) at fov {fov} "
+            f"timestep {timestep} — fewer than the {self.cfg.optortk_min_cohort_cells} "
+            f"needed to rank against.\n"
+            f"[serving] Every cell will be fed the neutral population value, and "
+            f"every predict record is stamped `optortk_degraded`.\n"
+            f"[serving] Expected one of {OPTORTK_KEYS} on the cells faro tracked "
+            f"through the optocheck. If the acquisition has no optocheck/reference "
+            f"channel this is the cause; otherwise check that the run's fields all "
+            f"reported before the window closed.\n",
+            file=sys.stderr, flush=True,
+        )
+
+    def _check_cadence(self, fov: int, timestep: int, recv_epoch: float) -> None:
+        """Compare the cadence the rig is actually delivering against the declared one.
+
+        Measured PER FOV — the fields are imaged sequentially within a round, so
+        consecutive requests across fields are separated by a slot, not by a frame.
+        Only the gap between two successive frames of the SAME field is the frame
+        interval.
+
+        Judged on the median so one slow frame cannot trip it, and reported once.
+        This is deliberately advisory: the server cannot fix the acquisition, and
+        halting a run over a transient would be worse than the thing it guards
+        against. What it must not do is let a 3.4x slip go unremarked for 12 hours,
+        which is exactly what happened before this existed.
+        """
+        prev = self._fov_last_recv.get(fov)
+        self._fov_last_recv[fov] = recv_epoch
+        if prev is None or self._cadence_checked:
+            return
+        self._cadence_samples.append(recv_epoch - prev)
+        if len(self._cadence_samples) < self.cfg.cadence_min_samples:
+            return
+
+        self._cadence_checked = True
+        declared_s = float(self.cfg.frame_interval_min) * 60.0
+        observed_s = float(sorted(self._cadence_samples)[len(self._cadence_samples) // 2])
+        ratio = observed_s / declared_s if declared_s > 0 else float("inf")
+        if self._logger:
+            self._logger.write({
+                "t": time.time(), "event": "cadence",
+                "fov": fov, "timestep": timestep,
+                "declared_s": declared_s, "observed_s": round(observed_s, 2),
+                "ratio": round(ratio, 3), "n_samples": len(self._cadence_samples),
+                "degraded": ratio > 1.0 + self.cfg.cadence_tolerance,
+            })
+        if ratio <= 1.0 + self.cfg.cadence_tolerance:
+            print(f"[serving] cadence OK: {observed_s:.1f}s per frame vs "
+                  f"{declared_s:.0f}s declared ({ratio:.2f}x)")
+            return
+
+        self.cadence_degraded = True
+        print(
+            f"\n[serving] *** CADENCE SLIP ***\n"
+            f"[serving] The rig is delivering a frame every {observed_s:.1f}s, but "
+            f"this run declares {declared_s:.0f}s ({ratio:.2f}x slower).\n"
+            f"[serving] Every reference waveform converts minutes to frames at the "
+            f"declared rate, so a {ratio:.2f}x slip multiplies every period by "
+            f"{ratio:.2f} in real time, and the checkpoint is being asked for "
+            f"dynamics at an interval it was not trained on.\n"
+            f"[serving] The run is NOT what the policy describes. Abort now if you "
+            f"can — every predict record from here carries `cadence_degraded`.\n",
+            file=sys.stderr, flush=True,
         )
 
     def optortk_expr_mode(self) -> dict:
@@ -386,9 +475,18 @@ class InferenceService:
 
         if self.cohort is not None:
             self._check_optortk_coverage(fov, timestep, n_with_optortk)
+        self._check_cadence(fov, timestep, recv_epoch)
 
         engine = self.router.engine_for(fov)
-        goal_ctx = GoalContext(fov=fov, timestep=timestep, cells=frames)
+        # `window_start` is this FOV's FIRST controlled frame, so `control_frame`
+        # is frames since control began — the clock an objective's settle, periods
+        # and block boundaries are written against. Distinct from `timestep`,
+        # which is faro's label and starts wherever the acquisition's earlier
+        # phases left off.
+        goal_ctx = GoalContext(
+            fov=fov, timestep=timestep, cells=frames,
+            control_frame=timestep - window_start,
+        )
         t_infer = time.perf_counter()
         ms_list = engine.decide(frames, goal_ctx)
         infer_s = time.perf_counter() - t_infer
@@ -443,12 +541,24 @@ class InferenceService:
                 rec["fluence_out"] = float(f.state.last_fluence)
                 # Per-cell when the live feature is on, the engine-wide constant
                 # otherwise. Same key either way, so the analysis reads one column
-                # and `optortk_live` next to it says which it is.
+                # and `optortk_source` next to it says where the number came from:
+                #   "measured" — this cell's own optocheck value, ranked
+                #   "fallback" — never measured, so the middle of the percentile
+                #                scale (the channel's training mean, which
+                #                standardizes to exactly 0 — the model's own
+                #                definition of "no information here")
+                # Without this the two are indistinguishable in the log, which is
+                # how a whole run can be read as having had a feature it did not.
                 rec["optortk_expr"] = (
                     float(f.optortk_expr) if f.optortk_expr is not None
                     else (None if optortk is None else float(optortk))
                 )
-                rec["optortk_live"] = f.optortk_expr is not None
+                rec["optortk_source"] = "measured" if f.optortk_expr is not None else "fallback"
+                # The model's `nuc_area` channel takes the same silent fallback
+                # when the payload omits it, and used to be recorded nowhere at
+                # all — so a run could not be audited for whether the model got a
+                # real area or a constant. None here means the fallback was fed.
+                rec["nuc_area"] = None if f.nuc_area is None else float(f.nuc_area)
                 rec["plan_cost"] = None if cost is None else float(cost)
                 # decide() predicted under the dose it commanded; a dark cell is
                 # forced to 0 ms afterwards, so that prediction is for a dose that
@@ -467,6 +577,14 @@ class InferenceService:
                     "n_cells_in": len(cells),
                     "n_scored": len(frames),
                     "engine": type(engine).__name__,
+                    # Sticky once the cohort sealed too thin to rank against, so
+                    # the condition is carried by every frame of the log rather
+                    # than by one startup message nobody reads afterwards.
+                    "optortk_degraded": self.optortk_degraded,
+                    # Likewise for the acquisition running slower than declared:
+                    # it invalidates every waveform period, so it belongs on every
+                    # frame the analysis will later read.
+                    "cadence_degraded": self.cadence_degraded,
                     "timing": {
                         "recv_epoch": recv_epoch,
                         "lock_wait_s": round(lock_wait_s, 4),

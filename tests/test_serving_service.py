@@ -4,10 +4,12 @@ Runs entirely on the stub engine plus a fake checkpoint, so no cluster mount and
 no trained model are needed.
 """
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.nn as nn
 
 from optoerk.serving.config import ServerConfig
@@ -188,7 +190,7 @@ def test_arm_overrides_compose_onto_the_shared_reference(tmp_path):
         "[default]\ncontrol_horizon = 30\n"
         'objective = { type = "oscillation", low = 0.85, high = 1.15, '
         "t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15, "
-        "tau_decay_min = 7.3, n_phase_groups = 4 }\n"
+        "n_phase_groups = 4 }\n"
         '[fov.1]\nkernel = "l2"\nlambda_move = 0.0\n'
         '[fov.2]\nkernel = "l2"\nlambda_move = 0.6\n'
         '[fov.3]\nkernel = { type = "band", half_width = 0.05 }\nlambda_move = 0.6\n'
@@ -248,18 +250,17 @@ def test_shipped_12fov_policy_encodes_the_nested_arms():
         assert pf.fov[f].control_horizon == 30
 
 
-def test_oscillation_policy_refuses_a_period_the_horizon_cannot_see(tmp_path):
-    """A misconfigured experiment stops the server; it does not quietly degrade
-    that FOV to the stub and run for twelve hours measuring nothing."""
+def test_a_period_longer_than_the_horizon_still_serves(tmp_path):
+    """The period/horizon bound is gone: the plan re-solves every frame, so a
+    transition enters the window H frames ahead however long the period is."""
     p = tmp_path / "policies.toml"
     p.write_text(
         "[default]\ncontrol_horizon = 10\n"
         'objective = { type = "oscillation", low = 0.85, high = 1.15, '
-        "t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15, "
-        "tau_decay_min = 7.3 }\n"
+        "t_low_min = 8, t_rise_min = 2, t_high_min = 15, t_fall_min = 15 }\n"
     )
-    with pytest.raises(PolicyViolation, match="exceeds 2 x the control horizon"):
-        PolicyRouter(_cfg(), load_policy_file(p))
+    router = PolicyRouter(_cfg(), load_policy_file(p))
+    assert router.default_info["objective"]["reference"]["period_min"] == 40.0
 
 
 def test_per_fov_objective_reaches_the_engine(tmp_path):
@@ -421,3 +422,596 @@ def test_reset_clears_state_for_one_fov_only():
     assert svc.store.get(0, 0) is None
     assert svc.store.get(1, 0) is not None
     svc.close()
+
+
+# ---------------------------------------------------------------------------
+# what the controller believed: plan_cost / pred_cnr_h1
+# ---------------------------------------------------------------------------
+
+
+def _real_engine(objective, controller):
+    """A RealModelEngine on an untrained model of the production shape — enough to
+    exercise the decide() path without a checkpoint or a mount."""
+    from optoerk.serving.bench import synthetic_handle
+    from optoerk.serving.calibration import FluenceCalibration
+
+    cfg = ServerConfig(warmup=False, control_horizon=5, gpu_sample_interval_s=0)
+    handle = synthetic_handle(future_len=5, device=torch.device("cpu"))
+    calib = FluenceCalibration(cfg.instrument, cfg.stim_power_pct)
+    return RealModelEngine(handle, calib, cfg, objective, controller)
+
+
+def _frames(n):
+    from optoerk.serving.runtime import CellFrame
+    from optoerk.serving.state import CellState
+
+    out = []
+    for i in range(n):
+        st = CellState()
+        st.particle = i
+        out.append(CellFrame(state=st, cnr_norm=1.0, fov_density=float(n),
+                             n_cells_200px=5.0, x=float(i), y=0.0))
+    return out
+
+
+def test_decide_records_the_plan_cost_and_the_one_step_prediction():
+    from optoerk.serving.control import ConstantDoseSearch, dose_levels
+    from optoerk.serving.objectives import GoalContext, hold
+
+    levels = dose_levels(0.0, 150.0, 5)
+    engine = _real_engine(hold(1.2), ConstantDoseSearch(levels))
+    frames = _frames(4)
+    ms = engine.decide(frames, GoalContext(fov=0, timestep=3, cells=frames))
+
+    assert len(engine.last_plan_cost) == 4
+    assert len(engine.last_pred_cnr_h1) == 4
+    assert all(c >= 0 for c in engine.last_plan_cost), "an l2 cost cannot be negative"
+    # the prediction is in absolute CNR, not z-scores
+    assert all(0.0 < p < 5.0 for p in engine.last_pred_cnr_h1)
+    assert len(ms) == 4
+
+
+def test_decide_clears_the_diagnostics_on_an_empty_frame():
+    """Otherwise an empty FOV silently relogs the previous frame's beliefs."""
+    from optoerk.serving.control import ConstantDoseSearch, dose_levels
+    from optoerk.serving.objectives import GoalContext, hold
+
+    engine = _real_engine(hold(1.2), ConstantDoseSearch(dose_levels(0.0, 150.0, 5)))
+    frames = _frames(2)
+    engine.decide(frames, GoalContext(fov=0, timestep=1, cells=frames))
+    assert engine.last_plan_cost is not None
+    engine.decide([], GoalContext(fov=0, timestep=2, cells=[]))
+    assert engine.last_plan_cost is None
+    assert engine.last_pred_cnr_h1 is None
+
+
+def test_prediction_is_the_rollout_under_the_commanded_dose():
+    """pred_cnr_h1 must follow the *gated* command, not the plan's raw pick.
+
+    Asserted as the identity it is — the model's own one-step rollout, from the
+    post-advance encoder state, under exactly the ms that decide() returned —
+    rather than by hoping an untrained model prefers to dose.
+    """
+    from optoerk.serving.control import ConstantDoseSearch, dose_levels
+    from optoerk.serving.objectives import GoalContext, gated
+    from optoerk.serving.runtime import CNR
+
+    levels = dose_levels(0.0, 150.0, 5)
+    # after_t=1000 gates every cell out at timestep 3
+    engine = _real_engine(gated(target_cnr=2.5, after_t=1000),
+                          ConstantDoseSearch(levels))
+    frames = _frames(3)
+    ms = engine.decide(frames, GoalContext(fov=0, timestep=3, cells=frames))
+    assert ms == [0.0, 0.0, 0.0], "the gate forces exactly zero"
+
+    # decide() leaves the post-advance encoder state on each cell
+    h = torch.cat([f.state.h for f in frames], dim=1)
+    c = torch.cat([f.state.c for f in frames], dim=1)
+    cnr_fb = torch.tensor(
+        [[(f.cnr_norm - float(engine.mean[CNR])) / float(engine.std[CNR])]
+         for f in frames], dtype=torch.float32,
+    )
+
+    def rollout1(doses):
+        fut = engine.std_fluence(torch.tensor(doses, dtype=torch.float32).reshape(-1, 1, 1))
+        return engine.denorm_cnr(engine.rollout(h, c, cnr_fb, fut))[:, 0].tolist()
+
+    assert engine.last_pred_cnr_h1 == pytest.approx(rollout1(ms))
+    # and the prediction really does depend on the dose, so the check above has teeth
+    assert engine.last_pred_cnr_h1 != pytest.approx(rollout1([150.0] * 3))
+
+
+def test_predict_log_carries_the_controller_beliefs(tmp_path):
+    """End-to-end through the service. The stub has no forward model, so both
+    fields are null rather than absent — the schema stays fixed either way."""
+    log = tmp_path / "run.jsonl"
+    cfg = _cfg()
+    cfg.predict_log_path = str(log)
+    svc = InferenceService(cfg)
+    svc.predict({"fov": 0, "timestep": 1, "cells": _cells()})
+    svc.close()
+
+    recs = [json.loads(ln) for ln in log.read_text().splitlines()]
+    cells = [c for r in recs if r["event"] == "predict" for c in r["cells"]]
+    assert cells
+    for c in cells:
+        assert "plan_cost" in c and "pred_cnr_h1" in c
+        assert c["plan_cost"] is None      # stub engine
+        assert c["pred_cnr_h1"] is None
+
+
+# ---------------------------------------------------------------------------
+# arm labels derived from the policy file
+# ---------------------------------------------------------------------------
+
+
+def test_arm_map_groups_fovs_by_identical_policy():
+    """The shipped 10-FOV layout is interleaved to balance stage position against
+    arm, so `fov % 4 + 1` is wrong for it. Reading the grouping off the file
+    cannot drift from the file."""
+    from optoerk.serving.policy import arm_map
+
+    pf = load_policy_file(
+        Path(__file__).parent.parent / "policies" / "policy_10fov_osc.toml")
+    arms = arm_map(pf)
+    assert arms == {0: 3, 1: 4, 2: 1, 3: 2, 4: 3, 5: 4, 6: 2, 7: 1, 8: 3, 9: 4}
+    assert arms != {f: f % 4 + 1 for f in range(10)}, "the formula must not hold"
+
+    by_arm = {}
+    for fov, arm in arms.items():
+        by_arm.setdefault(arm, []).append(fov)
+    assert sorted(by_arm) == [1, 2, 3, 4]
+    assert [len(v) for _, v in sorted(by_arm.items())] == [2, 2, 3, 3]
+
+
+def test_arm_map_holds_for_the_blocked_12fov_layout():
+    """The one file the old formula was right about must still come out right."""
+    from optoerk.serving.policy import arm_map
+
+    pf = load_policy_file(
+        Path(__file__).parent.parent / "policies" / "policy_12fov_osc.toml")
+    assert arm_map(pf) == {f: f % 4 + 1 for f in range(12)}
+
+
+def test_arm_map_separates_arms_that_differ_only_in_objective(tmp_path):
+    """The pattern-zoo case: same controller everywhere, waveform is the arm."""
+    from optoerk.serving.policy import arm_map
+
+    p = tmp_path / "policies.toml"
+    p.write_text(
+        '[default]\ncontroller = { type = "constant_dose" }\nkernel = "l2"\n'
+        '[fov.0]\nobjective = { type = "hold", target_cnr = 1.0 }\n'
+        '[fov.1]\nobjective = { type = "hold", target_cnr = 2.0 }\n'
+        '[fov.2]\nobjective = { type = "hold", target_cnr = 1.0 }\n'
+    )
+    assert arm_map(load_policy_file(p)) == {0: 1, 1: 2, 2: 1}
+
+
+def test_arm_map_rejects_a_half_declared_file(tmp_path):
+    """Mixing declared ids with derived ones is the exact failure the declaration
+    exists to remove, so a partial labelling is an error rather than a guess."""
+    from optoerk.serving.policy import arm_map
+
+    p = tmp_path / "policies.toml"
+    p.write_text(
+        '[default]\nobjective = { type = "hold", target_cnr = 1.0 }\n'
+        '[fov.0]\narm = 1\ncontroller = { type = "constant_dose" }\n'
+        '[fov.1]\ncontroller = { type = "sequence_mpc" }\n'
+    )
+    with pytest.raises(PolicyViolation, match="Declare it for every FOV or for none"):
+        arm_map(load_policy_file(p))
+
+
+def test_shipped_pattern_zoo_policy_varies_waveform_and_nothing_else():
+    """The pattern-zoo run inverts the previous design: the reference is the arm.
+
+    Checked as a unit because the whole experiment rests on it — if the controller
+    varies too, waveform and controller are confounded and no arm means anything.
+    """
+    from optoerk.serving.policy import arm_map
+
+    pf = load_policy_file(
+        Path(__file__).parent.parent / "policies" / "policy_10fov_patterns.toml")
+    assert pf.placeholders_resolved is False, "must not ship ready-to-run"
+    assert set(pf.fov) == set(range(10))
+
+    assert arm_map(pf) == {0: 1, 1: 2, 2: 3, 3: 4, 4: 2, 5: 1, 6: 4, 7: 3, 8: 2, 9: 1}
+
+    # ONE controller on every FOV, so waveform is the only varying factor
+    for f in range(10):
+        spec = pf.fov[f]
+        assert spec.controller == {"type": "sequence_mpc"}, f"fov {f}"
+        assert spec.kernel == "l2", f"fov {f}"
+        assert spec.lambda_move == 0.0, f"fov {f}"
+        assert spec.levels_ms == [0, 20, 45, 85, 150], f"fov {f}"
+        assert spec.control_horizon == 30, f"fov {f}"
+
+    # ...and every arm really does differ in reference
+    refs = {}
+    for f in range(10):
+        refs.setdefault(json.dumps(pf.fov[f].objective, sort_keys=True), set()).add(f)
+    assert len(refs) == 4, "four distinct waveforms"
+    assert sorted(len(v) for v in refs.values()) == [2, 2, 3, 3]
+
+    # arm 3 is arm 1's slowest block with the fall stretched: same endpoints, same
+    # period, fall 18 -> 38. That one-factor contrast is the point of the arm.
+    stair = pf.fov[0].objective["blocks"][0]
+    brake = pf.fov[2].objective
+    assert (brake["low"], brake["high"]) == (stair["low"], stair["high"])
+    assert sum(brake[k] for k in
+               ("t_low_min", "t_rise_min", "t_high_min", "t_fall_min")) == 50
+    assert brake["t_fall_min"] > stair["t_fall_min"]
+
+
+def test_pattern_zoo_arms_are_mean_matched_where_they_claim_to_be():
+    """Arms 1, 3 and 4 share a reference mean by construction, so a drift
+    difference between them is not an exposure difference. The staircase's blocks
+    are mean-matched to each other too. Neither is automatic — both were solved
+    for, and a retuned block table silently breaks them.
+    """
+    from optoerk.serving.objectives import build_objective
+
+    pf = load_policy_file(
+        Path(__file__).parent.parent / "policies" / "policy_10fov_patterns.toml")
+
+    def trapezoid_mean(r):
+        x = r["t_high_min"] + (r["t_rise_min"] + r["t_fall_min"]) / 2
+        period = sum(r[k] for k in
+                     ("t_low_min", "t_rise_min", "t_high_min", "t_fall_min"))
+        return r["low"] + (r["high"] - r["low"]) * x / period
+
+    blocks = pf.fov[0].objective["blocks"]
+    block_means = [trapezoid_mean(b) for b in blocks]
+    assert max(block_means) - min(block_means) < 0.012, "staircase varies f at fixed mean"
+
+    # duration-weighted sweep mean == the hold arm's target
+    durations = [
+        b["n_cycles"] * sum(b[k] for k in
+                            ("t_low_min", "t_rise_min", "t_high_min", "t_fall_min"))
+        for b in blocks
+    ]
+    sweep_mean = sum(d * m for d, m in zip(durations, block_means)) / sum(durations)
+    assert sweep_mean == pytest.approx(pf.fov[3].objective["target_cnr"], abs=0.002)
+    # ...and arm 3 sits on it too
+    assert trapezoid_mean(pf.fov[2].objective) == pytest.approx(sweep_mean, abs=0.01)
+
+    # every FOV's objective actually builds
+    for f in range(10):
+        spec = pf.fov[f]
+        build_objective({**spec.objective, "kernel": spec.kernel,
+                         "lambda_move": spec.lambda_move})
+
+
+def test_the_control_policy_differs_from_the_main_one_ONLY_by_the_server_flag():
+    """The pattern-zoo pair separates "what the expression covariate contributes"
+    from "what feedback contributes". That only works if the two files are
+    otherwise identical — any drift between them lands squarely in the contrast
+    and neither run can be attributed.
+
+    The difference is a launch flag (`--live-optortk-expr`), deliberately NOT a
+    field in the policy: the policy describes the experiment, the flag describes
+    what the server is allowed to condition on.
+    """
+    from optoerk.serving.policy import arm_map
+
+    root = Path(__file__).parent.parent / "policies"
+    main = load_policy_file(root / "policy_10fov_patterns.toml")
+    ctrl = load_policy_file(root / "policy_10fov_patterns_control.toml")
+
+    assert arm_map(main) == arm_map(ctrl)
+    assert main.placeholders_resolved == ctrl.placeholders_resolved is False
+    assert main.default.model_dump() == ctrl.default.model_dump()
+    assert set(main.fov) == set(ctrl.fov) == set(range(10))
+    for f in sorted(main.fov):
+        assert main.fov[f].model_dump() == ctrl.fov[f].model_dump(), f"fov {f} drifted"
+
+
+def test_the_pattern_zoo_checkpoint_is_servable():
+    """Every channel the checkpoint declares must be one serving can actually
+    supply. A channel it cannot supply is silently fed the population mean — which
+    is how `nuc_area` would have gone out as a constant on the second most
+    important input."""
+    import inspect
+    import re
+
+    from optoerk.serving.runtime import RealModelEngine
+
+    src = inspect.getsource(RealModelEngine.decide)
+    suppliable = set(re.findall(r'"(\w+)"\s*[]:]\s*=?\s*\(?\s*lambda', src)) | {
+        "cnr", "optortk_expr", "nuc_area",
+    }
+    # the channels the pattern-zoo checkpoint was trained on
+    needed = ["cnr", "u_t", "n_cells_200px", "optortk_expr", "nuc_area"]
+    missing = [c for c in needed if c not in suppliable]
+    assert not missing, f"serving cannot supply {missing}"
+
+
+def test_an_unavailable_device_fails_loudly_instead_of_degrading_to_the_stub():
+    """`--device cuda` on a CPU-only torch used to blow up inside load_model, get
+    caught by the degrade-to-stub handler, and surface as
+    `checkpoint load failed ('Torch not compiled with CUDA enabled')` — blaming the
+    checkpoint for an install problem, while every FOV silently became a stub and
+    the server came up "working" with no model at all.
+
+    A device the process cannot use is a configuration error for the whole server.
+    """
+    from optoerk.serving.runtime import _resolve_device
+
+    if torch.cuda.is_available():
+        pytest.skip("this machine has CUDA; the failure path cannot be exercised")
+    with pytest.raises(RuntimeError, match="cannot use CUDA"):
+        _resolve_device("cuda")
+    # the message has to say what to do, not just what happened
+    try:
+        _resolve_device("cuda")
+    except RuntimeError as e:
+        msg = str(e)
+        assert "--device cpu" in msg
+        assert "nvidia-smi" in msg
+
+    # auto never raises — it is the "use what is here" request
+    assert _resolve_device("auto").type in ("cpu", "cuda", "mps")
+    assert _resolve_device("cpu").type == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# inference batch bucketing (ServerConfig.batch_bucket)
+# ---------------------------------------------------------------------------
+
+
+def test_bucket_to_rounds_up_to_a_multiple():
+    from optoerk.serving.runtime import _bucket_to
+
+    assert _bucket_to(1, 32) == 32
+    assert _bucket_to(32, 32) == 32, "an exact multiple must not grow a whole bucket"
+    assert _bucket_to(33, 32) == 64
+    assert _bucket_to(207, 32) == 224
+    # 0 and 1 disable it; the count must pass through untouched
+    assert _bucket_to(207, 1) == 207
+    assert _bucket_to(207, 0) == 207
+
+
+def test_padding_frame_cannot_write_back_to_the_cell_it_copied():
+    """The padding cell shares a batch with real ones and is thrown away after.
+    If it shared their state object, its discarded encoder state and dose would
+    land on a real cell."""
+    from optoerk.serving.runtime import _padding_frame
+
+    proto = _frames(1)[0]
+    proto.state.baseline_samples.append(1.0)
+    proto.state.h = torch.ones(1, 1, 4)
+
+    pad = _padding_frame(proto)
+    assert pad.state is not proto.state
+    assert pad.state.h is None and pad.state.c is None, "must start from zeros"
+    # scalars are carried over, so the padding row is in-distribution
+    assert pad.cnr_norm == proto.cnr_norm
+    assert pad.x == proto.x
+
+    pad.state.baseline_samples.append(99.0)
+    pad.state.last_applied_ms = 123.0
+    assert proto.state.baseline_samples == [1.0], "mutable state must not be shared"
+    assert proto.state.last_applied_ms != 123.0
+
+
+def _doses(engine, bucket, n_cells):
+    from optoerk.serving.objectives import GoalContext
+
+    engine.cfg = replace(engine.cfg, batch_bucket=bucket)
+    frames = _frames(n_cells)
+    ms = engine.decide(frames, GoalContext(fov=0, timestep=3, cells=frames))
+    return ms, list(engine.last_plan_cost), list(engine.last_pred_cnr_h1)
+
+
+@pytest.mark.parametrize("n_cells", [32, 64])
+def test_bucketing_is_a_no_op_when_no_padding_is_needed(n_cells):
+    """A cell count already on a bucket boundary must take the identical path."""
+    from optoerk.serving.control import SequenceMPC, dose_levels
+    from optoerk.serving.objectives import hold
+
+    # ONE engine for both runs: `synthetic_handle` draws random weights, so a
+    # second engine would differ for reasons unrelated to padding.
+    engine = _real_engine(
+        hold(1.2), SequenceMPC(dose_levels(0.0, 150.0, 5), n_samples=64, n_iters=2)
+    )
+    off = _doses(engine, 0, n_cells)
+    on = _doses(engine, 32, n_cells)
+    assert on == off
+
+
+@pytest.mark.parametrize("n_cells", [1, 7, 33])
+def test_bucketing_perturbs_the_cost_only_by_float_roundoff(n_cells):
+    """Padding must not change what the controller *believes*, only the batch it
+    computes it in.
+
+    It is deliberately NOT asserted that the doses are identical. Batched matmul
+    reassociates with the batch size, so the predicted cost moves by float32
+    round-off, and argmin over a discrete dose ladder can land on the other side
+    of a near-tie. The contract is that the cost itself stays within round-off —
+    if padding ever changed it materially, a padding cell would be influencing a
+    real one.
+    """
+    from optoerk.serving.control import SequenceMPC, dose_levels
+    from optoerk.serving.objectives import hold
+
+    engine = _real_engine(
+        hold(1.2), SequenceMPC(dose_levels(0.0, 150.0, 5), n_samples=64, n_iters=2)
+    )
+    _, off_cost, off_pred = _doses(engine, 0, n_cells)
+    _, on_cost, on_pred = _doses(engine, 32, n_cells)
+
+    assert max(abs(a - b) for a, b in zip(on_cost, off_cost)) < 1e-4
+    assert max(abs(a - b) for a, b in zip(on_pred, off_pred)) < 1e-4
+
+
+def test_bucketing_returns_one_dose_per_real_cell_only():
+    """The padded rows must never reach the caller — faro maps the returned list
+    positionally onto the cells it sent."""
+    from optoerk.serving.control import ConstantDoseSearch, dose_levels
+    from optoerk.serving.objectives import GoalContext, hold
+
+    engine = _real_engine(hold(1.2), ConstantDoseSearch(dose_levels(0.0, 150.0, 5)))
+    engine.cfg = replace(engine.cfg, batch_bucket=32)
+    frames = _frames(5)
+    ms = engine.decide(frames, GoalContext(fov=0, timestep=1, cells=frames))
+
+    assert len(ms) == 5
+    assert len(engine.last_plan_cost) == 5
+    assert len(engine.last_pred_cnr_h1) == 5
+    # every real cell advanced; nothing else was created to advance
+    assert all(f.state.h is not None for f in frames)
+    assert len(frames) == 5, "the caller's list must not be left padded"
+
+
+# ---------------------------------------------------------------------------
+# NVML device resolution (gpu.resolve_nvml_handle)
+# ---------------------------------------------------------------------------
+
+
+class _FakeNvml:
+    """Two physical GPUs, so an index handed straight across can pick the wrong one."""
+
+    def __init__(self):
+        self.uuids = {0: b"GPU-aaaaaaaa-0000", 1: b"GPU-bbbbbbbb-1111"}
+
+    def nvmlDeviceGetCount(self):
+        return 2
+
+    def nvmlDeviceGetHandleByIndex(self, i):
+        if i not in self.uuids:
+            raise RuntimeError(f"no such nvml device {i}")
+        return f"handle-{i}"
+
+    def nvmlDeviceGetHandleByUUID(self, uuid):
+        for i, u in self.uuids.items():
+            if u == uuid:
+                return f"handle-{i}"
+        raise RuntimeError("no such uuid")
+
+    def nvmlDeviceGetUUID(self, handle):
+        return self.uuids[int(str(handle).split("-")[1])]
+
+
+def test_nvml_handle_resolves_by_uuid_over_the_index(monkeypatch):
+    """The whole point: torch's cuda:0 can be the machine's physical GPU 1, and
+    the UUID is the only identifier that means the same thing on both sides."""
+    from optoerk.serving import gpu
+
+    monkeypatch.setattr(gpu, "_torch_device_uuid", lambda i: "GPU-bbbbbbbb-1111")
+    handle, meta = gpu.resolve_nvml_handle(_FakeNvml(), 0)
+
+    assert handle == "handle-1", "index 0 must not win over a UUID that says otherwise"
+    assert meta["resolved_by"] == "uuid"
+    assert meta["verified"] is True
+    assert meta["nvml_index"] == 1
+
+
+def test_nvml_handle_falls_back_to_cuda_visible_devices(monkeypatch):
+    """No UUID from torch (older driver), but the remapping is still recoverable."""
+    from optoerk.serving import gpu
+
+    monkeypatch.setattr(gpu, "_torch_device_uuid", lambda i: "")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,0")
+    handle, meta = gpu.resolve_nvml_handle(_FakeNvml(), 0)
+
+    assert handle == "handle-1"
+    assert meta["resolved_by"] == "visible-devices"
+    assert meta["verified"] is True
+
+
+def test_nvml_handle_marks_the_bare_index_as_unverified(monkeypatch):
+    """Telemetry still flows when nothing can confirm the mapping — but it must
+    say so, or a reader trusts numbers that may describe another card."""
+    from optoerk.serving import gpu
+
+    monkeypatch.setattr(gpu, "_torch_device_uuid", lambda i: "")
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    handle, meta = gpu.resolve_nvml_handle(_FakeNvml(), 0)
+
+    assert handle == "handle-0"
+    assert meta["resolved_by"] == "index-unverified"
+    assert meta["verified"] is False
+
+
+def test_gpu_sampler_takes_a_torch_device_not_an_index():
+    """`dev.index or 0` was the original bug: it silently coerced a device with
+    no explicit index, and handed NVML a number from torch's namespace."""
+    from optoerk.serving.gpu import GpuSampler
+
+    assert GpuSampler(lambda r: None, torch.device("cuda"), 5.0)._device_index == 0
+    assert GpuSampler(lambda r: None, torch.device("cuda:1"), 5.0)._device_index == 1
+    # the index-0 case must survive the `or` that used to swallow it
+    assert GpuSampler(lambda r: None, torch.device("cuda:0"), 5.0)._device_index == 0
+
+
+# ---------------------------------------------------------------------------
+# acquisition cadence guard
+# ---------------------------------------------------------------------------
+
+
+def _drive_at_cadence(svc, interval_s, n_frames=12, n_fovs=2, monkeypatch=None):
+    """Drive the service with a controlled wall clock, so the test is not timing
+    dependent. Fields are imaged sequentially inside a round, as faro does."""
+    import optoerk.serving.service as svc_mod
+
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(svc_mod.time, "time", lambda: clock["t"])
+    for i in range(n_frames):
+        for fov in range(n_fovs):
+            clock["t"] += interval_s / n_fovs        # the per-field slot
+            svc.predict({
+                "fov": fov, "timestep": i,
+                "cells": [{"particle": p, "x": 1.0 * p, "y": 1.0, "cnr_median": 0.9}
+                          for p in range(3)],
+            })
+
+
+def test_cadence_guard_stays_quiet_when_the_rig_keeps_time(tmp_path, monkeypatch):
+    log = tmp_path / "run.jsonl"
+    svc = InferenceService(_cfg(predict_log_path=str(log), frame_interval_min=1.0))
+    try:
+        _drive_at_cadence(svc, 60.0, monkeypatch=monkeypatch)
+        assert svc.cadence_degraded is False
+    finally:
+        svc.close()
+    recs = [json.loads(ln) for ln in log.read_text().splitlines()]
+    cad = [r for r in recs if r.get("event") == "cadence"]
+    assert len(cad) == 1 and cad[0]["degraded"] is False
+    assert cad[0]["observed_s"] == pytest.approx(60.0, abs=1.0)
+
+
+def test_cadence_guard_flags_a_run_that_is_silently_running_slow(tmp_path, monkeypatch):
+    """The v12 failure: 12 h declared, 40 h delivered, discovered only afterwards
+    from the parquet timestamps. Every reference period was multiplied by 3.4."""
+    log = tmp_path / "run.jsonl"
+    svc = InferenceService(_cfg(predict_log_path=str(log), frame_interval_min=1.0))
+    try:
+        _drive_at_cadence(svc, 202.0, monkeypatch=monkeypatch)   # v12's real cadence
+        assert svc.cadence_degraded is True
+    finally:
+        svc.close()
+
+    recs = [json.loads(ln) for ln in log.read_text().splitlines()]
+    cad = [r for r in recs if r.get("event") == "cadence"]
+    assert len(cad) == 1, "reported once, not every frame"
+    assert cad[0]["degraded"] is True
+    assert cad[0]["ratio"] == pytest.approx(202.0 / 60.0, rel=0.05)
+    # and it is sticky on every frame the analysis will read
+    preds = [r for r in recs if r.get("event") == "predict"]
+    assert preds[-1]["cadence_degraded"] is True
+
+
+def test_cadence_is_measured_per_field_not_between_requests(monkeypatch):
+    """Fields are imaged sequentially within a round, so consecutive requests are a
+    slot apart, not a frame apart. Measuring across fields would read an 8-field
+    round as 8x faster than it is and never fire."""
+    svc = InferenceService(_cfg(frame_interval_min=1.0))
+    try:
+        # 8 fields inside a 60 s round: each field is 60 s apart from its own last
+        # frame, but successive requests are only 7.5 s apart.
+        _drive_at_cadence(svc, 60.0, n_frames=12, n_fovs=8, monkeypatch=monkeypatch)
+        assert svc.cadence_degraded is False, (
+            "read the gap between requests instead of between a field's own frames"
+        )
+    finally:
+        svc.close()

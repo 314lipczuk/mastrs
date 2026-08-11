@@ -34,7 +34,7 @@ fed at the next encoder step).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -382,7 +382,8 @@ class StaggeredCadenceMPC(SequenceMPC):
 
         due_idx = torch.nonzero(due, as_tuple=False).flatten()
         sub_cells = [ctx.cells[j] for j in due_idx.tolist()]
-        sub_ctx = GoalContext(fov=ctx.fov, timestep=ctx.timestep, cells=sub_cells)
+        sub_ctx = GoalContext(fov=ctx.fov, timestep=ctx.timestep, cells=sub_cells,
+                              control_frame=ctx.control_frame)
 
         # Every due cell has its tick at offset 0, so they share one mask: the
         # stimulable future offsets are i % k == 0 (this tick, then every k-th).
@@ -401,10 +402,114 @@ class StaggeredCadenceMPC(SequenceMPC):
         return {**super().describe(), "type": self.name, "k": self.k}
 
 
+class OpenLoopController(Controller):
+    """The control arm: a fixed dose sequence, identical for every cell, no feedback.
+
+    This exists to be *compared against*. Every other controller here reads the
+    cell's own encoder state and takes a per-cell ``argmin``, so an experiment using
+    them cannot say whether the result came from closed-loop control or merely from
+    delivering light. This one delivers the same predetermined dose to every cell on
+    every frame, which makes the contrast a clean one-variable comparison: same
+    model, same objective, same ladder, same reference — only feedback removed.
+
+    ``sequence_ms`` is designed OFFLINE against the same model and objective (see
+    ``experiments/open_loop_design.py``), so the arm is "the best open-loop schedule
+    the model can produce", not a strawman. It is optimised over one period of the
+    reference and tiled, since a periodic reference has a periodic optimal
+    open-loop input.
+
+    **Indexed on ``ctx.control_frame``, never ``ctx.timestep``.** The sequence has
+    to line up with the reference waveform, and the waveform is clocked from the
+    first controlled frame — faro's timestep starts wherever the acquisition's
+    earlier phases left off. Reading the wrong one would slide the whole schedule
+    against the reference it was designed for.
+
+    The model still runs (``_score`` with a single candidate) even though nothing is
+    chosen. That is deliberate: it keeps ``plan_cost`` on the same scale as the
+    closed-loop arms, and it turns every frame of the open-loop arm into a free
+    one-step model-error measurement under a known dose — which is exactly the
+    quantity that says whether the model, rather than the controller, is the thing
+    that is wrong.
+    """
+
+    name = "open_loop"
+
+    def __init__(
+        self,
+        levels_ms: np.ndarray,
+        sequence_ms: Sequence[float],
+        repeat: bool = True,
+    ):
+        self.levels_ms = np.asarray(levels_ms, dtype=np.float64)
+        self.sequence_ms = np.asarray(list(sequence_ms), dtype=np.float64)
+        self.repeat = bool(repeat)
+        if self.sequence_ms.size == 0:
+            raise ValueError("open_loop needs a non-empty sequence_ms")
+        if np.any(self.sequence_ms < 0):
+            raise ValueError(f"open_loop sequence_ms has negative doses: {sequence_ms}")
+        # Not a hard error — a designed sequence may legitimately interpolate
+        # between rungs if the hardware accepts it — but a sequence off the ladder
+        # makes the arms incomparable on dose, so it must not pass silently.
+        off = [
+            float(v) for v in self.sequence_ms
+            if not np.any(np.isclose(v, self.levels_ms))
+        ]
+        if off:
+            print(
+                f"[serving] NOTE open_loop sequence uses doses outside the ladder: "
+                f"{sorted(set(off))} not in {self.levels_ms.tolist()}. The closed-loop "
+                f"arms can only choose ladder rungs, so the arms are not searching "
+                f"the same dose set."
+            )
+
+    def dose_at(self, control_frame: int) -> float:
+        """The dose this schedule commands at ``control_frame``, for every cell.
+
+        Past the end of a non-repeating sequence the schedule holds its last value
+        rather than going dark: an experiment that outruns its designed sequence
+        should degrade to a constant, not silently stop stimulating.
+        """
+        i = int(control_frame)
+        n = self.sequence_ms.size
+        return float(self.sequence_ms[i % n] if self.repeat else self.sequence_ms[min(i, n - 1)])
+
+    def plan(self, plant, h, c, cnr_fb, objective, ctx):
+        N, H = h.shape[1], plant.horizon
+        device = plant.device
+        ms = float(self.dose_at(ctx.control_frame))
+
+        # The plan this arm is committed to over the horizon: the next H entries of
+        # the schedule. Scored, never searched — `cost` is what the model believed
+        # would happen, logged so the arms are comparable.
+        future = torch.tensor(
+            [self.dose_at(ctx.control_frame + i) for i in range(H)],
+            dtype=torch.float32, device=device,
+        )                                                    # (H,)
+        fut = plant.std_fluence(future).view(1, 1, H).expand(N, 1, H)
+        plan_ms = future.view(1, 1, H).expand(N, 1, H) if objective.needs_plan else None
+        cost = self._score(plant, h, c, cnr_fb, fut, plan_ms, objective, ctx)  # (N, 1)
+
+        return torch.full((N,), ms, device=device), cost[:, 0]
+
+    def describe(self) -> dict[str, Any]:
+        # The full sequence goes in the startup record. A schedule that is only
+        # named and not written down cannot be reconstructed from the log, and this
+        # arm IS its schedule.
+        return {
+            "type": self.name,
+            "levels_ms": self.levels_ms.tolist(),
+            "sequence_ms": self.sequence_ms.tolist(),
+            "repeat": self.repeat,
+            "period_frames": int(self.sequence_ms.size),
+            "mean_ms": float(self.sequence_ms.mean()),
+        }
+
+
 CONTROLLERS: dict[str, type[Controller]] = {
     ConstantDoseSearch.name: ConstantDoseSearch,
     SequenceMPC.name: SequenceMPC,
     StaggeredCadenceMPC.name: StaggeredCadenceMPC,
+    OpenLoopController.name: OpenLoopController,
 }
 
 

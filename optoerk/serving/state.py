@@ -153,7 +153,14 @@ class StateStore:
 
     # -- field / dark baseline (per-fov) -----------------------------------
     def fov_window_start(self, fov: int, timestep: int) -> int:
-        """First timestep seen for this FOV — the start of its dark-baseline window."""
+        """First timestep this FOV was seen at — the origin every control-relative
+        clock is measured from.
+
+        Two things hang off it: the dark-baseline window, and the objective's
+        ``control_frame``. Anchoring on the first frame the server itself observed
+        is what makes both indifferent to where faro's numbering starts, which is
+        not zero when the acquisition ran earlier phases.
+        """
         return self._fov_start.setdefault(fov, timestep)
 
     def add_field_sample(self, fov: int, raw_cnr: float) -> None:

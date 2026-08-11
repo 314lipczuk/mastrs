@@ -22,8 +22,9 @@ lock — torch models and the state tensors are not thread-safe.
 """
 from __future__ import annotations
 
+import copy
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
@@ -69,11 +70,47 @@ class CellFrame:
 
 
 def _resolve_device(device: str) -> torch.device:
-    if device != "auto":
-        return torch.device(device)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    """Resolve a device string, failing LOUDLY on one that is not available.
+
+    An explicitly requested device used to be returned unchecked, so
+    ``--device cuda`` against a CPU-only torch build blew up later inside
+    ``load_model``, was swallowed by the degrade-to-stub handler, and surfaced as
+    ``checkpoint load failed ('Torch not compiled with CUDA enabled')`` — which
+    blames the checkpoint for a problem with the install. Worse, every FOV then
+    degraded to the stub, so the server came up "working" with no model at all.
+
+    A device that does not exist is a configuration error for the whole process,
+    not a per-FOV fallback, so it is raised here with the fix in the message.
+    """
+    if device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+
+    dev = torch.device(device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        built = torch.version.cuda
+        raise RuntimeError(
+            f"--device cuda requested but this torch cannot use CUDA "
+            f"(torch {torch.__version__}, "
+            f"{'no CUDA build' if built is None else f'CUDA build {built}'}, "
+            f"torch.cuda.is_available() is False).\n"
+            f"  * No CUDA build: pyproject pins a bare `torch`, so uv installs "
+            f"PyPI's default wheel — CPU-only on Windows. Install the CUDA wheel "
+            f"for this machine, or serve from a GPU node and point faro at it "
+            f"over HTTP.\n"
+            f"  * CUDA build present but unavailable: the driver is missing or "
+            f"the GPU is not visible — check `nvidia-smi` and "
+            f"CUDA_VISIBLE_DEVICES.\n"
+            f"  * To benchmark this machine as it actually is, pass --device cpu; "
+            f"that is the honest number if this is what will serve."
+        )
+    if dev.type == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError(
+            f"--device mps requested but MPS is unavailable (torch "
+            f"{torch.__version__}). Use --device cpu."
+        )
+    return dev
 
 
 def _resolve_checkpoint(checkpoint_dir: str) -> str:
@@ -213,6 +250,11 @@ def load_engine(
 
     calib = FluenceCalibration(cfg.instrument, cfg.stim_power_pct)
     if checkpoint_dir:
+        # Resolve the device OUTSIDE the degrade-to-stub handler below. A bad or
+        # unavailable device is a property of the process, not of one FOV, so
+        # letting it be caught there would quietly turn every field into a stub
+        # and report the cause as a checkpoint failure.
+        _resolve_device(cfg.device)
         try:
             handle = load_model(checkpoint_dir, cfg.device, cache)
             engine = RealModelEngine(handle, calib, cfg, objective, controller)
@@ -248,11 +290,50 @@ def load_engine(
                     "objective": objective.describe()}
 
 
-def warmup_engine(engine, batch_sizes: tuple[int, ...] = (1, 8, 32, 64)) -> None:
+def _bucket_to(n: int, width: int) -> int:
+    """Round ``n`` up to a multiple of ``width``; a width of 0 or 1 is a no-op."""
+    if width <= 1:
+        return n
+    return -(-n // width) * width
+
+
+def _padding_frame(proto: CellFrame) -> CellFrame:
+    """A throwaway cell that pads the batch to a bucket.
+
+    Copied from a real cell rather than built from defaults, so the padded rows
+    are in-distribution: objectives gate on ``x``/``y`` and read per-cell state,
+    and feeding them a NaN-positioned zero-state cell would exercise branches no
+    real cell takes. The state is a private copy with the encoder state cleared —
+    nothing written to it can reach the cell it was copied from, and it is
+    discarded when the frame returns.
+    """
+    st = copy.copy(proto.state)
+    st.h = None
+    st.c = None
+    # `copy.copy` shares the mutable containers with the original; give the
+    # padding cell its own so an append can never land on a real cell's history.
+    for name, value in vars(st).items():
+        if isinstance(value, list):
+            setattr(st, name, list(value))
+    return replace(proto, state=st)
+
+
+def warmup_engine(engine, batch_sizes: tuple[int, ...] | None = None) -> None:
     """Prime the GPU before the first real frame by running throwaway ``decide``
     calls across a few batch sizes. Triggers CUDA context creation, cuDNN
     autotune and allocator-pool growth up front — the cold-start work that
-    otherwise lands on the first predictions. Best-effort; never raises."""
+    otherwise lands on the first predictions. Best-effort; never raises.
+
+    Defaults to the bucket sizes the engine will actually ask for, so the
+    allocator pools it builds here are the ones the run reuses; warming sizes
+    that bucketing then rounds away would prime pools nothing ever hits.
+    """
+    if batch_sizes is None:
+        width = max(int(getattr(getattr(engine, "cfg", None), "batch_bucket", 0) or 1), 1)
+        batch_sizes = (
+            (1, 8, 32, 64) if width == 1
+            else tuple(width * m for m in (1, 2, 4, 8))
+        )
     try:
         t0 = time.perf_counter()
         for n in batch_sizes:
@@ -416,6 +497,18 @@ class RealModelEngine:
         self.last_pred_cnr_h1 = None
         if not frames:
             return []
+        # --- shape bucketing (see ServerConfig.batch_bucket) ------------------
+        # Pad the batch out to a bucket so the tensor shapes below repeat frame
+        # to frame and the CUDA caching allocator can actually reuse its blocks.
+        # The padding rows are throwaway cells appended at the END: the objective
+        # and the controller size themselves off `ctx.cells`, so that list is
+        # padded in lockstep, and everything is sliced back to `n_real` before
+        # any state is persisted or any dose returned.
+        n_real = len(frames)
+        n_pad = _bucket_to(n_real, self.cfg.batch_bucket) - n_real
+        if n_pad:
+            frames = frames + [_padding_frame(frames[-1]) for _ in range(n_pad)]
+            ctx = replace(ctx, cells=frames)
         N = len(frames)
         L, H = self.num_layers, self.hidden
 
@@ -482,7 +575,7 @@ class RealModelEngine:
             self, h_new, c_new, cnr_fb, self.objective, ctx
         )
         best_ms = self.controller.apply_gate(plan_ms, self.objective, ctx)
-        self.last_plan_cost = [float(v) for v in plan_cost]
+        self.last_plan_cost = [float(v) for v in plan_cost[:n_real]]
 
         # One-step prediction under the dose about to be commanded. One extra
         # decoder step for N cells, against the CEM's 512 plans x H steps — free in
@@ -491,14 +584,16 @@ class RealModelEngine:
         # per-cell sensitivity readout that needs no rolling regression.
         fut1 = self.std_fluence(best_ms.reshape(N, 1, 1))
         pred1 = self.denorm_cnr(self.rollout(h_new, c_new, cnr_fb, fut1))  # (N, 1)
-        self.last_pred_cnr_h1 = [float(v) for v in pred1[:, 0]]
+        self.last_pred_cnr_h1 = [float(v) for v in pred1[:n_real, 0]]
 
         # --- persist new encoder state + the APPLIED fluence ------------------
         # Only u[0] is applied; the rest of the optimized plan is discarded and
         # re-planned next frame (receding horizon). Persisting anything but the
         # applied dose would corrupt the u_t channel at the next encoder step.
+        # Padding rows are dropped here and never touched again: no state is
+        # written back for them, and no dose is returned for them.
         out_ms: list[float] = []
-        for i, f in enumerate(frames):
+        for i, f in enumerate(frames[:n_real]):
             f.state.h = h_new[:, i : i + 1].detach().clone()
             f.state.c = c_new[:, i : i + 1].detach().clone()
             ms = float(best_ms[i].item())

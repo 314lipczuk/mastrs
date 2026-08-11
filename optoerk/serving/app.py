@@ -108,6 +108,10 @@ def build_service(args) -> InferenceService:
         cfg.override_optortk_expr = True  # a value implies the override is on
     if args.live_optortk_expr is not None:
         cfg.live_optortk_expr = args.live_optortk_expr
+    if args.frame_interval_min is not None:
+        cfg.frame_interval_min = args.frame_interval_min
+    if args.cadence_tolerance is not None:
+        cfg.cadence_tolerance = args.cadence_tolerance
     if args.optortk_baseline_frames is not None:
         cfg.optortk_baseline_frames = args.optortk_baseline_frames
     if args.optortk_cohort_frames is not None:
@@ -153,6 +157,20 @@ def main():
                    type=int, default=None,
                    help="when the session expression cohort closes; must span the "
                         "run's FIRST optocheck (default 10)")
+    p.add_argument("--frame-interval-min", dest="frame_interval_min",
+                   type=float, default=None,
+                   help="the frame interval the acquisition is PROGRAMMED to "
+                        "deliver, in minutes (default 1.0). The server cannot "
+                        "enforce it, but it timestamps every request, so it warns "
+                        "and stamps every record once the delivered cadence drifts "
+                        "past --cadence-tolerance. A slip does not stretch the "
+                        "experiment, it invalidates it: every reference period is "
+                        "multiplied by the same factor and the checkpoint is run at "
+                        "an interval it was never trained on.")
+    p.add_argument("--cadence-tolerance", dest="cadence_tolerance",
+                   type=float, default=None,
+                   help="fractional slip tolerated before the run is flagged "
+                        "(default 0.25)")
     p.add_argument("--predict-log", dest="predict_log", default=None,
                    help="path to append a per-prediction JSONL log (off by default)")
     p.add_argument("--policy-file", dest="policy_file", default=None,

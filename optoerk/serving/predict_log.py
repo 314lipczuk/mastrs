@@ -6,13 +6,26 @@ already parse (``experiments/inference_cnrhold_tracks.py``):
   * ``startup`` — ``{t, n_predict, event, engine, model_loaded, info, policies,
     optortk_expr}``
   * ``predict`` — ``{t, n_predict, event, fov, timestep, n_cells_in, n_scored,
-    engine, timing:{...}, cells:[...], skipped:[...]}`` where each cell carries
-    ``{particle, raw_cnr, cnr_norm, baseline, fov_density, n_cells_200px,
-    u_t_in, n_frames_seen, first_seen, exposure_ms, fluence_out, dark,
-    optortk_expr, optortk_live, plan_cost, pred_cnr_h1}``, plus whatever the objective's
-    reference annotates (``r_t`` always; ``segment`` / ``phase_offset_min`` for an
-    oscillation; also ``block_index`` / ``sweep_index`` / ``block_period_min`` for
-    a frequency staircase).
+    engine, optortk_degraded, timing:{...}, cells:[...], skipped:[...]}`` where
+    each cell carries ``{particle, raw_cnr, cnr_norm, baseline, fov_density,
+    n_cells_200px, u_t_in, n_frames_seen, first_seen, exposure_ms, fluence_out,
+    dark, optortk_expr, optortk_source, nuc_area, plan_cost, pred_cnr_h1}``, plus
+    whatever the objective's reference annotates (``r_t`` always; ``segment`` /
+    ``phase_offset_min`` for an oscillation; also ``block_index`` /
+    ``sweep_index`` / ``block_period_min`` for a frequency staircase).
+  * ``optortk_cohort`` — ``{t, event, fov, timestep, spread:{n, min, p25, median,
+    p75, max}, degraded}``, written once when the expression cohort closes. It
+    records the distribution every rank in the run is measured against, so a
+    degenerate cohort is visible directly instead of only through the ranks it
+    produced.
+  * ``cadence`` — ``{t, event, fov, timestep, declared_s, observed_s, ratio,
+    n_samples, degraded}``, written once after enough per-FOV frame intervals have
+    been seen. ``observed_s`` is the median gap between two successive frames of the
+    SAME field (fields are imaged sequentially inside a round, so the gap between
+    requests is a slot, not a frame). A ratio above tolerance means every reference
+    period is stretched by that factor in real time and the checkpoint is being run
+    at an interval it was not trained on; ``cadence_degraded`` is then sticky on
+    every subsequent ``predict`` record.
 
 ``plan_cost`` and ``pred_cnr_h1`` record what the controller *believed* about the
 plan it chose: the winning plan's cost, and the predictive mean one step ahead
@@ -25,12 +38,25 @@ is a per-cell sensitivity readout. Both are ``None`` on the stub engine, and
 overridden to zero after the prediction was made.
 
 ``optortk_expr`` is the value fed on the optoRTK-expression channel, and
-``optortk_live`` says which regime produced it: ``true`` for a real per-cell
-session rank (``--live-optortk-expr``), ``false`` for a constant — either the
-operator's ``--optortk-expr-value`` or the channel's training population mean.
-The regime is also recorded once, whole, in the ``startup`` record under
-``optortk_expr``. It changes what the controller can condition on, so two runs
-are only comparable when it matches.
+``optortk_source`` says where that number came from: ``"measured"`` for a real
+per-cell session rank (``--live-optortk-expr``, and this cell was in the
+optocheck), ``"fallback"`` for the middle of the percentile scale — the channel's
+training population mean, which standardizes to exactly 0. The regime is also
+recorded once, whole, in the ``startup`` record under ``optortk_expr``. It changes
+what the controller can condition on, so two runs are only comparable when it
+matches.
+
+Expect ``"fallback"`` to be common and to grow through a run: faro attaches the
+value only to the tracks it followed through the optocheck, there is no lineage
+column, so cells appearing later never acquire one. Reading the per-cell source is
+the only way to tell a run where the feature was live from one where it decayed to
+a constant. ``nuc_area`` is recorded for the same reason — ``None`` means the model
+was fed that channel's population mean rather than a real area.
+
+``optortk_degraded`` on the ``predict`` record is sticky: once the cohort closes
+with too few cells to rank against (``optortk_min_cohort_cells``) every subsequent
+frame carries it, so the condition lives in the log rather than in one startup
+message.
 
 ``t`` is the *completion* timestamp; ``timing`` decomposes how the latency to
 that point was spent: ``recv_epoch`` (wall-clock the request entered the

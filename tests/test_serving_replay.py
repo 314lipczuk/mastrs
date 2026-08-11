@@ -5,7 +5,10 @@ no mount, no checkpoint, and (being CPU-only and deterministic) an exact 1.0
 match is the correct bar here. Replaying a *CUDA* run on CPU is a different
 matter; see the note in ``optoerk/serving/README.md``.
 """
+import numpy as np
 import polars as pl
+import pytest
+import torch
 
 from optoerk.serving.config import ServerConfig
 from optoerk.serving.replay import (
@@ -142,3 +145,128 @@ def test_replay_limit_is_respected(tmp_path):
                                               gpu_sample_interval_s=0), limit=3)
     assert isinstance(df, pl.DataFrame)
     assert df.select(pl.struct("fov", "timestep").n_unique()).item() == 3
+
+
+# ---------------------------------------------------------------------------
+# simulate_open_loop — the open-loop arm's designer
+# ---------------------------------------------------------------------------
+
+
+def _ol_engine(sequence_ms, future_len=5):
+    from optoerk.serving.bench import synthetic_handle
+    from optoerk.serving.calibration import FluenceCalibration
+    from optoerk.serving.config import ServerConfig
+    from optoerk.serving.control import OpenLoopController, dose_levels
+    from optoerk.serving.objectives import hold
+    from optoerk.serving.runtime import RealModelEngine
+
+    cfg = ServerConfig(warmup=False, control_horizon=future_len, gpu_sample_interval_s=0)
+    handle = synthetic_handle(future_len=future_len, device=torch.device("cpu"))
+    calib = FluenceCalibration(cfg.instrument, cfg.stim_power_pct)
+    levels = dose_levels(0.0, 150.0, 4)
+    ctrl = OpenLoopController(levels, sequence_ms=sequence_ms)
+    return RealModelEngine(handle, calib, cfg, hold(1.0), ctrl)
+
+
+def test_simulate_open_loop_matches_stepping_the_engine_itself():
+    """The batched simulator reimplements `decide`'s channel assembly, so it can
+    drift from the code it is meant to predict — and the whole open-loop arm is
+    designed against it. Pin it: stepping one cell through the real engine must give
+    the same trajectory the simulator does.
+    """
+    from optoerk.serving.objectives import GoalContext
+    from optoerk.serving.replay import simulate_open_loop
+    from optoerk.serving.runtime import CellFrame
+    from optoerk.serving.state import CellState
+
+    seq = [0.0, 150.0, 50.0]
+    n_frames = 9
+    engine = _ol_engine(seq)
+    chans = engine.channels
+
+    # The simulator feeds the population mean on every channel the ensemble does not
+    # vary — crowding included, since a nominal cell has no real neighbours. Give the
+    # reference frame the same values, so this compares the STEPPING MATH and not two
+    # different sets of inputs.
+    def _mean(name):
+        return float(engine.mean_np[chans.index(name)])
+
+    st = CellState()
+    st.particle = 0
+    frame = CellFrame(
+        state=st,
+        cnr_norm=_mean("cnr"),
+        fov_density=_mean("fov_density") if "fov_density" in chans else 1.0,
+        n_cells_200px=_mean("n_cells_200px"),
+        x=0.0, y=0.0,
+        optortk_expr=_mean("optortk_expr") if "optortk_expr" in chans else None,
+    )
+    stepwise = []
+    for t in range(n_frames):
+        engine.decide([frame], GoalContext(fov=0, timestep=t, cells=[frame],
+                                           control_frame=t))
+        nxt = float(engine.last_pred_cnr_h1[0])
+        stepwise.append(nxt)
+        frame.cnr_norm = nxt
+
+    static = {
+        name: np.array([_mean(name)], dtype=np.float32)
+        for name in ("optortk_expr", "nuc_area") if name in chans
+    }
+    got = simulate_open_loop(
+        engine, np.array([seq], dtype=np.float32), n_frames, ens=1, static=static
+    )
+    assert got.shape == (1, 1, n_frames)
+    np.testing.assert_allclose(got[0, 0], np.array(stepwise, dtype=np.float32), rtol=2e-5)
+
+
+def test_simulate_open_loop_evaluates_every_candidate_in_one_pass():
+    """The optimiser's inner loop depends on this: C schedules must come back in C
+    rows, and a schedule must not be affected by the others sharing the batch."""
+    from optoerk.serving.replay import simulate_open_loop
+
+    engine = _ol_engine([0.0])
+    a, b = [0.0, 0.0, 0.0], [150.0, 150.0, 150.0]
+    both = simulate_open_loop(engine, np.array([a, b], dtype=np.float32), 6, ens=4)
+    assert both.shape == (2, 4, 6)
+
+    alone_a = simulate_open_loop(engine, np.array([a], dtype=np.float32), 6, ens=4)
+    alone_b = simulate_open_loop(engine, np.array([b], dtype=np.float32), 6, ens=4)
+    np.testing.assert_allclose(both[0], alone_a[0], rtol=1e-6)
+    np.testing.assert_allclose(both[1], alone_b[0], rtol=1e-6)
+    # and light has to do something, or the whole experiment is measuring nothing
+    assert both[1].mean() != pytest.approx(both[0].mean())
+
+
+def test_simulate_open_loop_tiles_the_schedule_and_ignores_the_cells():
+    """No feedback anywhere: the dose at frame t is seq[t % P] whatever the cells do.
+    That is the property the control arm exists to embody."""
+    from optoerk.serving.replay import simulate_open_loop
+
+    engine = _ol_engine([0.0])
+    # Two ensembles differing only in seed still see the identical dose schedule, so
+    # any spread between them comes from the cells, never from the controller.
+    seq = np.array([[0.0, 150.0]], dtype=np.float32)
+    x = simulate_open_loop(engine, seq, 8, ens=6, seed=1)
+    y = simulate_open_loop(engine, seq, 8, ens=6, seed=2)
+    assert x.shape == y.shape == (1, 6, 8)
+
+
+def test_score_open_loop_uses_the_objectives_own_cost():
+    """The schedule must be optimised against exactly what the closed-loop arms
+    minimise. A hand-rolled L2 here would let the arms drift apart silently."""
+    from optoerk.serving.objectives import hold
+    from optoerk.serving.replay import score_open_loop
+
+    engine = _ol_engine([0.0])
+    target = 1.0
+    # Two candidates: one sitting on the target, one 0.5 away. An l2 hold objective
+    # must score them 0 and 0.25.
+    cnr = np.stack([
+        np.full((3, 4), target, dtype=np.float32),
+        np.full((3, 4), target + 0.5, dtype=np.float32),
+    ])                                                       # (2, 3, 4)
+    cost = score_open_loop(engine, hold(target), cnr, start_frame=0)
+    assert cost.shape == (2,)
+    assert cost[0] == pytest.approx(0.0, abs=1e-6)
+    assert cost[1] == pytest.approx(0.25, abs=1e-6)

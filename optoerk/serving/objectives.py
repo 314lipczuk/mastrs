@@ -65,10 +65,32 @@ class PolicyViolation(Exception):
 
 @dataclass
 class GoalContext:
-    """Everything an objective may condition on, for one FOV at one frame."""
+    """Everything an objective may condition on, for one FOV at one frame.
+
+    ``timestep`` is faro's own frame number — a LABEL, chosen by the acquisition
+    schedule, and it does not start at zero when earlier phases ran first.
+    ``control_frame`` is the MEASURE: frames since this FOV's first controlled
+    frame. An objective's schedule (settle, periods, block boundaries, gates) is
+    written relative to the start of control, so it must use ``control_frame``.
+
+    They are the same number only when control begins on acquisition frame 0.
+    That held for every run until an optocheck phase was added ahead of the
+    controlled one, at which point the first controlled frame arrived numbered 40
+    — and a waveform clocked on ``timestep`` was already 40 minutes into a
+    100-minute settle before it had seen a single frame.
+
+    ``control_frame`` defaults to ``timestep`` for a context built at the start of
+    control (tests constructing one directly, warmup, bench). The service always
+    passes it explicitly.
+    """
     fov: int
     timestep: int
     cells: list  # list[CellFrame] — avoids a circular import with runtime
+    control_frame: int | None = None
+
+    def __post_init__(self):
+        if self.control_frame is None:
+            self.control_frame = self.timestep
 
 
 @dataclass
@@ -183,7 +205,7 @@ class ScheduleReference(Reference):
         return out
 
     def values(self, ctx, horizon, device):
-        row = [self.value_at(ctx.timestep + h) for h in range(horizon)]
+        row = [self.value_at(ctx.control_frame + h) for h in range(horizon)]
         return torch.tensor(
             [row] * len(ctx.cells), dtype=torch.float32, device=device
         )
@@ -350,7 +372,7 @@ class StepTrainReference(Reference):
         # `n_phase_groups` distinct offsets — so compute one row per offset rather
         # than one per cell. Without this the reference is N x H Python calls on
         # the CEM's hot path (~19k per FOV-frame at 208 cells, H=30, 3 iters).
-        # Cached per call, never across calls: ctx.timestep moves every frame.
+        # Cached per call, never across calls: ctx.control_frame moves every frame.
         rows: dict[float, list[float]] = {}
         out = []
         for cell in ctx.cells:
@@ -358,7 +380,7 @@ class StepTrainReference(Reference):
             row = rows.get(off)
             if row is None:
                 row = [
-                    self.value_at((ctx.timestep + h) * dt, off)
+                    self.value_at((ctx.control_frame + h) * dt, off)
                     for h in range(horizon)
                 ]
                 rows[off] = row
@@ -370,7 +392,7 @@ class StepTrainReference(Reference):
         out = []
         for cell in ctx.cells:
             off = self.phase_offset_min(cell)
-            r, seg = self._eval(ctx.timestep * dt, off)
+            r, seg = self._eval(ctx.control_frame * dt, off)
             out.append({"r_t": r, "segment": seg, "phase_offset_min": off})
         return out
 
@@ -536,7 +558,7 @@ class FrequencyStaircaseReference(Reference):
             row = rows.get(off)
             if row is None:
                 row = [
-                    self.value_at((ctx.timestep + h) * dt, off)
+                    self.value_at((ctx.control_frame + h) * dt, off)
                     for h in range(horizon)
                 ]
                 rows[off] = row
@@ -548,7 +570,7 @@ class FrequencyStaircaseReference(Reference):
         out = []
         for cell in ctx.cells:
             off = self.phase_offset_min(cell)
-            r, seg, block, sweep = self._locate(ctx.timestep * dt, off)
+            r, seg, block, sweep = self._locate(ctx.control_frame * dt, off)
             out.append({
                 "r_t": r, "segment": seg, "phase_offset_min": off,
                 "block_index": block, "sweep_index": sweep,
@@ -809,7 +831,7 @@ class Objective:
         if self.gate_fn is None:
             return None
         return torch.tensor(
-            [bool(self.gate_fn(cell, ctx.timestep)) for cell in ctx.cells],
+            [bool(self.gate_fn(cell, ctx.control_frame)) for cell in ctx.cells],
             dtype=torch.bool,
         )
 
