@@ -184,3 +184,7 @@ uv run python -m optoerk.serving.app --port 8080 --device cuda \
 ranked before the population they are ranked against exists. Acquire 700 min per
 run, and give each its own `--predict-log` (the file is append-only).
 
+
+python -m optoerk.serving.app --port 8080 --device cuda ^
+    --policy-file policies/policy_8fov_diverse.toml ^
+    --predict-log run.jsonl
