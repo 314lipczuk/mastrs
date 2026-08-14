@@ -250,15 +250,15 @@ objective = { type = "hold", target_cnr = 1.034 }
 
 [fov.0]
 arm = 1
-objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, frame_interval_min = 1.0, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
+objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
 
 [fov.5]
 arm = 1
-objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, frame_interval_min = 1.0, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
+objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
 
 [fov.9]
 arm = 1
-objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, frame_interval_min = 1.0, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
+objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups = 4, blocks = [ { low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 }, { low = 0.89, high = 1.15, t_low_min = 8, t_rise_min = 2, t_high_min = 13, t_fall_min = 12, n_cycles = 2 }, { low = 0.92, high = 1.12, t_low_min = 6, t_rise_min = 2, t_high_min = 8, t_fall_min = 9, n_cycles = 3 }, { low = 0.945, high = 1.095, t_low_min = 4, t_rise_min = 2, t_high_min = 6, t_fall_min = 6, n_cycles = 3 } ] }
 
 
 # ---------------------------------------------------------------------------
@@ -293,15 +293,15 @@ objective = { type = "frequency_staircase", settle_min = 100.0, n_phase_groups =
 
 [fov.1]
 arm = 2
-objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4 }
 
 [fov.4]
 arm = 2
-objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4 }
 
 [fov.8]
 arm = 2
-objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_rise_min = 28, t_high_min = 2, t_fall_min = 18, settle_periods = 2, n_phase_groups = 4 }
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +326,11 @@ objective = { type = "oscillation", low = 0.87, high = 1.35, t_low_min = 2, t_ri
 
 [fov.2]
 arm = 3
-objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 1, t_rise_min = 3, t_high_min = 8, t_fall_min = 38, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 1, t_rise_min = 3, t_high_min = 8, t_fall_min = 38, settle_periods = 2, n_phase_groups = 4 }
 
 [fov.7]
 arm = 3
-objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 1, t_rise_min = 3, t_high_min = 8, t_fall_min = 38, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 1, t_rise_min = 3, t_high_min = 8, t_fall_min = 38, settle_periods = 2, n_phase_groups = 4 }
 
 
 # ---------------------------------------------------------------------------

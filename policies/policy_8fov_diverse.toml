@@ -1,141 +1,87 @@
-# 8-FOV CLOSED LOOP, DIVERSE OBJECTIVES — with a live dose-response probe.
+# 8 FOVs. Three closed-loop objectives, plus two fields measuring the dose
+# response so the other six can be read against something.
 #
-# v13 asked whether feedback beats open loop and could not answer, for a reason
-# that was not about feedback: THE LIGHT DID NOT MEASURABLY MOVE THE CELLS.
-# Measured on v13's own open-loop arms, whose dose is state-independent and so
-# gives an unbiased dose-response (a closed-loop arm's exposure is chosen BECAUSE
-# the cell is low, which biases every conditional statistic downward):
+#   arm 1  fov 0, 7   dose probe, open loop, wider ladder
+#   arm 2  fov 1, 6   hold 1.20
+#   arm 3  fov 2, 5   schedule: steps, a ramp, and a repeat of the first step
+#   arm 4  fov 3, 4   frequency staircase, 4 periods (50/36/26/18 min)
 #
-#     delivered            achieved cnr p50
-#     23.5 ms/real-min     0.90 - 0.93     (arm 4, fov 3/4)
-#     46.5 ms/real-min     0.905 - 0.93    (arm 2, fov 1/6)
-#     NO STIMULATION       0.958           (optocheck phase, all fovs)
-#    ~250  ms/real-min     1.02 - 1.03     (fov 8/9, a SEPARATE later 3.3 h run)
-#
-# Doubling the dose rate moved the median by 0.005, and both stimulated levels sit
-# BELOW the unstimulated one. The one high-dose point looks better but is confounded
-# with time: v13's run A fell from p50 0.995 in its first third to 0.884 in its last,
-# and fov 8/9 ran for 3.3 h against run A's 22 h. Correcting for that, ~250 ms/min
-# buys 0.025 CNR over the run-A first third. Across an order of magnitude of dose
-# rate, the response is flat to within the drift.
-#
-# THE LADDER IS THEREFORE SPLIT, AND THE SPLIT IS THE DESIGN:
-#
-#   arms 2, 3, 4   [0, 20, 45, 85, 150]        the ladder v13 and v12 used
-#   arm 1 only     [0, 85, 150, 300, 600]      extended, open loop, 2 fields
-#
-# The controlled arms stay on known ground — same rungs as every previous run, so
-# they are comparable to v13 and to each other, and nothing about them is new
-# except the objectives. Arm 1 is instrumentation: it is the only arm with the
-# authority to probe past the range v13 already covered, and it is what says
-# within the first 90 minutes whether that range is usable at all.
-#
-# Run:
-#   uv run python -m optoerk.serving.app --port 8080 --device cuda \
-#       --policy-file policies/policy_8fov_diverse.toml \
-#       --live-optortk-expr --optortk-cohort-frames 10 \
-#       --no-dark-baseline --frame-interval-min 2.0 \
-#       --stim-power 10 --predict-log run.jsonl
-#
-# Soak (at the hour-12 cell count, which v13's soak skipped):
-#   uv run python -m optoerk.serving.soak --policy-file policies/policy_8fov_diverse.toml \
-#       --allow-placeholders --device cuda --n-fovs 8 --cycles 20 --cycle-seconds 120
-
-
-# --- WHY ONE ARM CARRIES A DIFFERENT LADDER, AND WHY IT IS ARM 1 ------------
-# "Arms that differ in their ladder are not comparable" (policy.py, levels_ms) is
-# the rule, and it is not being broken: THE THREE CONTROLLED ARMS ALL SHARE ONE
-# LADDER. Arm 1 does not control anything. It commands a fixed schedule that
-# ignores the cell, so it is never compared against arms 2-4 on tracking — it is
-# the axis they are read against. Giving the measuring instrument a wider range
-# than the thing it measures is not a confound.
-#
-# Arm 1 is also the right place to put the unverified rungs for two practical
-# reasons. Its doses are scheduled rather than chosen, so 600 ms lands at a known
-# time on a known field and phototoxicity is observable in isolation. And a
-# closed-loop arm handed a 600 ms rung would reach for it constantly given the
-# flat dose-response, which would put the highest fluence in this project on six
-# fields at once with nothing to compare them to.
-#
-# ARM 1's RUNGS ARE CHOSEN TO BRIDGE THE TWO LADDERS:
-#
-#     rung      0     85     150     300     600   ms/frame
-#     rate      0    42.5     75     150     300   ms/real-min
-#
-#   0    the resting level, measured live every 90 min
-#   85   EXACTLY v13's arm 2 dose, so this run's dose-response is anchored to
-#        the previous one at a shared point rather than extrapolated to it
-#   150  the old ladder's top — the most the controlled arms here can ever spend
-#   300  } past everything v13 sampled below its one confounded high point
-#   600  } and spanning it
-#
-# 85 is not a multiple of the 25 ms DMD quantum. Kept deliberately: the whole
-# value of that rung is being byte-identical to v13's arm 2, and it inherits that
-# run's quantisation error along with its dose.
-
-
-# --- WHY THE CADENCE IS DECLARED AS 2.0 -------------------------------------
-# v13 declared 1.0 and ran at 1.83. Everything downstream of a frame index then
-# silently rescaled: the open-loop schedules delivered 55% of their designed dose
-# rate, and every waveform stretched 1.83x in wall-clock time. The server's own
-# alarm caught it at timestep 14 (ratio 1.838) and stamped `cadence_degraded` on
-# 6981 of 6998 predictions. The run continued anyway. That is the failure this
-# declaration removes: at 2.0 the measured 1.83 sits INSIDE the declaration with
-# 9% of margin, so the references below are correct in real minutes rather than
-# aspirationally correct in frames.
-#
-# THE PRICE, STATED PLAINLY: on the original ladder at 2.0 min/frame the top rung
-# buys 75 ms/real-min, where v13's arms had 82. THE CONTROLLED ARMS HERE HAVE
-# SLIGHTLY LESS LIGHT AUTHORITY THAN THE RUN THAT ALREADY PRODUCED A NULL. That is
-# the honest consequence of declaring the cadence truthfully instead of leaving
-# the shortfall hidden, and it is why the targets below were resized rather than
-# carried over. If v13's null was dose-limited, arms 2-4 reproduce it — and arm 1
-# is what turns that from a wasted run into a measurement.
-#
-# RISK 1 is separate and worse: the checkpoint was trained on 1-minute frames and
-# is served 2-minute frames, so every step it predicts is half as long as the step
-# that actually happens. No policy file can fix that.
-
-
-# --- WHAT DIVERSITY MEANS HERE, AND THE ARITHMETIC THAT SET IT --------------
-# Requested: four objective families (hold at two levels; oscillation at two
-# periods; frequency staircase; schedule), n = 2 per objective, mirrored, AND two
-# fields devoted to the dose-response. Those do not fit in eight fields — six
-# controlled fields hold three objectives at n = 2, not four.
-#
-# They are reconciled by folding rather than by dropping, because two of the
-# families are strict subsets of two others:
-#
-#   frequency_staircase CONTAINS oscillation-at-two-periods — it sweeps four
-#     periods (50/36/26/18 min) inside one field, which is strictly more of the
-#     frequency axis than two fixed periods would have covered.
-#   schedule CONTAINS hold-at-a-second-level — its 1.08 segments are 90- and
-#     60-minute holds at the stretch level, and it adds ramps and asymmetric
-#     steps that no periodic reference can express.
-#
-# So all four requested families are present, at n = 2, in three objectives:
-#
-#   arm 1  DOSE PROBE      open loop, 5 rungs x 18 min, repeating   fov 0, 7
-#   arm 2  HOLD 1.00       closed loop, constant reference          fov 1, 6
-#   arm 3  SCHEDULE        closed loop, steps + ramp + repeat-step  fov 2, 5
-#   arm 4  FREQ STAIRCASE  closed loop, 4 periods, sweep repeats    fov 3, 4
-#
-# ARM 1 IS OPEN LOOP AND THAT IS THE POINT — a dose-response needs a dose that
-# does not depend on the cell, or it measures the controller instead of the cells.
-# The request was for an all-closed-loop run; the two probe fields are the stated
-# exception, and they are what makes the other six interpretable.
-
-
-# --- FOV LAYOUT -------------------------------------------------------------
 #   fov   0  1  2  3  4  5  6  7
 #   arm   1  2  3  4  4  3  2  1
 #
-# Mirrored. Every arm's mean field index is 3.5, so arm is not confounded with
-# position on the plate. Note this includes ARM 1: the dose-response is the
-# calibration every other arm is read against, so it is the arm that can least
-# afford to sit at one edge and absorb a radial illumination gradient. v13 put its
-# two unplanned fields at 8 and 9 — both edge — which is one of several reasons
-# they cannot stand in for this measurement.
+# Mirrored, so each arm averages field index 3.5 and no arm is stuck at an edge.
+#
+# Run:
+#   uv run python -m optoerk.serving.app --device cuda \
+#       --policy-file policies/policy_8fov_diverse.toml \
+#       --predict-log run.jsonl
+#
+# That is the whole command. Everything v13 and v14 also passed was redundant:
+# --stim-power 10 and --optortk-cohort-frames 10 were already defaults,
+# --live-optortk-expr is the default now, --no-dark-baseline does nothing on a
+# raw-cnr checkpoint, and --frame-interval-min no longer exists.
+
+
+# --- WHERE THE TARGETS COME FROM -------------------------------------------
+# v14's arm 1, per-cell CNR at each rung once settled, pooled over sweeps 1-6.
+# This is the distribution, NOT the population median — the median is dragged
+# down by dead and unresponsive cells, and half the population sits above it by
+# definition. Sweep 0 is dropped because its dark rung is the settle window.
+#
+#     rung      p10    p25    p50    p75    p90    >=1.2   >=1.3   >=1.4
+#       0      0.65   0.76   0.88   1.00   1.17     9%      4%      2%
+#      85      0.86   0.99   1.20   1.38   1.51    51%     37%     23%
+#     150      0.90   1.04   1.24   1.40   1.53    56%     40%     25%
+#     300      0.92   1.09   1.31   1.48   1.61    66%     52%     37%
+#     600      0.95   1.13   1.31   1.47   1.62    68%     53%     36%
+#
+# Per track, taking each cell's own p75 while it sat at 300 ms or more: median
+# 1.40, and 80% of tracks reach 1.2, 68% reach 1.3, 49% reach 1.4.
+#
+# So 1.2 and 1.3 are ordinary targets, not stretch ones. A fair number of cells
+# will not get there — the dead and near-dead ones, which show up as the bottom
+# decile at every rung including the dark one. That is expected, and it is a
+# thing to report rather than a reason to lower the target.
+#
+# 1.00 is about where an active, not-fully-starved cell sits with the light off,
+# which matches the dark rung's p75. A floor below that is only reachable by a
+# dying cell, so nothing here goes under 1.05.
+#
+# Sustained is harder than transient: the hold arm asks for 1.20 for the whole
+# run, while the schedule and staircase go to 1.30 and above in bursts.
+
+
+# --- THE LADDER IS SPLIT ----------------------------------------------------
+# Arms 2, 3, 4 use [0, 20, 45, 85, 150], the same ladder as v12 and v13, so
+# they stay comparable to those runs and to each other.
+#
+# Arm 1 uses [0, 85, 150, 300, 600]. It is not a controlled arm — it commands a
+# fixed schedule and ignores the cell — so it is never compared against the
+# others on tracking. It is the axis they are measured against, and it needs to
+# reach past the range the controlled arms can.
+#
+# Its rungs are picked to connect the two ladders: 0 gives resting, 85 is
+# exactly what v13's open-loop arm delivered, 150 is the most the controlled
+# arms here can spend, and 300 and 600 go beyond anything sampled before.
+#
+# 300 and 600 ms have never been run in this project. Keeping them on two
+# fields on a known schedule is deliberate — phototoxicity shows up somewhere
+# you can see it.
+
+
+# --- CADENCE ----------------------------------------------------------------
+# One frame per minute. This is no longer settable anywhere: it is a constant
+# in optoerk/serving/config.py, and the objective builders no longer take a
+# frame_interval_min of their own.
+#
+# It used to be a flag. Raising it to match a slow rig silenced the cadence
+# alarm and halved the frame count of every waveform at the same time, which is
+# how two runs came out looking clean while measuring something else.
+#
+# v14's round took 133 s against the 60 s it should: 117 s imaging (about 15 s
+# per field), 14 s idle, and only 6.8 s of that was the server. v11 did 6.9 s
+# per field on the same rig. The regression is on the faro side and is still
+# unexplained.
 
 
 placeholders_resolved = true
@@ -143,369 +89,247 @@ placeholders_resolved = true
 
 [default]
 
-# Unchanged from policy_8fov_openloop.toml. Real mCitrine expression channel,
-# future_len 30, cnr_mode "raw", 3 mixture components.
-#   channels: [cnr, u_t, n_cells_200px, optortk_expr, nuc_area]
-#
-# NOTE for the analysis notebook: this name contains no "raw", so anything that
-# infers cnr units from the checkpoint name gets it wrong. The server logs
-# cnr_mode explicitly at startup; read it from there.
+# Real mCitrine expression channel, future_len 30, cnr_mode "raw".
+# Note the name contains no "raw", so anything guessing cnr units from the
+# checkpoint name gets it wrong. The server logs cnr_mode at startup.
 checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
 
-# The checkpoint's future_len, so it is not clamped. At 2.0 min/frame this is a
-# 60-real-minute horizon — long enough to see a whole low->high transition of even
-# the slowest block below.
+# The checkpoint's future_len, so it is not clamped. 30 real minutes.
 control_horizon = 30
 
-# THE ORIGINAL LADDER, unchanged from v12 and v13, and shared by all three
-# CONTROLLED arms. Arm 1 overrides it per FOV; nothing else does.
+# Shared by the three controlled arms. Arm 1 overrides it; nothing else does.
 levels_ms = [0, 20, 45, 85, 150]
 
-# lambda_move = 0. Nothing here is about smoothness, and a move penalty would
-# handicap the objectives with the fastest references specifically. It also
-# normalises by the ladder max, which would otherwise couple arm 1's wider ladder
-# into its cost — moot at zero, and a reason to keep it there.
 kernel = "l2"
 lambda_move = 0.0
 
-# Fallback objective and controller. Both are real, not placeholders: v13's policy
-# declared 8 fields, the rig imaged 10, and fovs 8-9 silently ran [default] for
-# 3.3 h. If that happens again the extra fields should at least be running the
-# baseline hold on the shared ladder rather than something arbitrary.
-objective = { type = "hold", target_cnr = 1.00 }
+# Also the fallback if the rig images more fields than this file declares,
+# which is what happened in v13 (8 declared, 10 imaged).
+objective = { type = "hold", target_cnr = 1.20 }
 controller = { type = "sequence_mpc" }
 
 
 # --- RUN LENGTH -------------------------------------------------------------
-# 330 frames at 2.0 min = 660 min = 11 h, plus a 40-frame (80 min) settle.
+# 688 frames = 688 min = 11.5 h. Set by arm 4, which is the only arm with a hard
+# requirement: 80 min settle + 2 x 304 min sweep = 688. At 660 it gets 1.91
+# sweeps, and the second sweep is the whole point — comparing a period's blocks
+# between sweep 0 and sweep 1 is the drift measurement.
 #
-# Sized so every arm completes a whole number of its own units inside it:
-#   arm 1  7 full dose sweeps      (90 min each)
-#   arm 3  the schedule once, with its step repeated late (see arm 3)
-#   arm 4  2 full frequency sweeps (304 min each)
+# The others fit inside it: arm 1 gets 7.6 dose sweeps (it just repeats), arm 3
+# finishes its schedule at frame 660 and holds baseline for the last 28.
 #
-# Two sweeps for arm 4 is the minimum that makes drift separable from frequency:
-# comparing a period's blocks between sweep 0 and sweep 1 is a matched-frequency
-# measurement of the decay that dominated v13.
+# Frame counts appear in two places only, arm 1's sequence_ms and arm 3's
+# points, and both are written for 1 frame = 1 minute.
 
 
-# ---------------------------------------------------------------------------
-# ARM 1 — DOSE PROBE, OPEN LOOP, EXTENDED LADDER (fov 0, 7)
+# --- ARM 1 — dose probe, open loop (fov 0, 7) -------------------------------
+# Five rungs, 18 frames (18 min) each, repeating. 90 min per sweep, 7 sweeps.
 #
-# Five rungs, 9 frames (18 min) each, repeating for the whole run. 45 frames =
-# 90 min per sweep, 7 sweeps in 11 h. THE ONLY ARM WITH THE EXTENDED LADDER.
+# It repeats so that dose and time separate. v14's only high-dose data came
+# from the youngest cells, so the two were confounded and neither could be
+# read. Seven sweeps give a dose response at seven points along the drift, and
+# the 0 ms rung is a live resting measurement every 90 minutes — which is what
+# every other arm's floor depends on.
 #
-# WHY IT REPEATS INSTEAD OF RUNNING ONCE. Dose and time were hopelessly confounded
-# in v13 — the only high-dose point was also the youngest culture. Repeating the
-# whole ladder seven times through the run measures the dose-response AT SEVEN
-# POINTS ALONG THE DRIFT, so the two separate by construction rather than by
-# assumption. It also means the 0 ms rung is a live resting-level measurement
-# every 90 minutes, which is the quantity every other arm's floor depends on and
-# which no previous run tracked at all.
+# 18 min is about 2.5 tau, so each rung mostly settles before the next.
 #
-# 18 min per rung is ~2.5 tau at the declared tau of 7.3 min, so each rung reaches
-# most of its steady state before the next begins.
-#
-# RUNG ORDER IS INTERLEAVED, NOT ASCENDING: 0, 300, 85, 600, 150. Ascending order
-# confounds rung with cumulative dose delivered so far within the sweep — every
-# rung would follow a lower one and carry-over would always push the same way.
-# Interleaving decorrelates the two, and it costs nothing.
-#
-# The objective is inherited from [default] (hold 1.00) and is never used to
-# choose a dose here. It is kept so `plan_cost` stays on the same scale as arms
-# 2-4, and so every frame of this arm is a one-step model-error measurement under
-# a KNOWN input — the cleanest such measurement in the run, because the input is
-# not confounded with a controller's reaction to the output.
-# ---------------------------------------------------------------------------
+# Rung order is 0, 300, 85, 600, 150, not ascending. Ascending would mean every
+# rung follows a lower one, so carry-over always pushes the same way.
 
 [fov.0]
 arm = 1
 levels_ms = [0, 85, 150, 300, 600]
 controller = { type = "open_loop", repeat = true, sequence_ms = [
-  0,   0,   0,   0,   0,   0,   0,   0,   0,
-  300, 300, 300, 300, 300, 300, 300, 300, 300,
-  85,  85,  85,  85,  85,  85,  85,  85,  85,
-  600, 600, 600, 600, 600, 600, 600, 600, 600,
-  150, 150, 150, 150, 150, 150, 150, 150, 150,
+  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+  300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300,
+  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,
+  600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600,
+  150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150,
 ] }
 
 [fov.7]
 arm = 1
 levels_ms = [0, 85, 150, 300, 600]
 controller = { type = "open_loop", repeat = true, sequence_ms = [
-  0,   0,   0,   0,   0,   0,   0,   0,   0,
-  300, 300, 300, 300, 300, 300, 300, 300, 300,
-  85,  85,  85,  85,  85,  85,  85,  85,  85,
-  600, 600, 600, 600, 600, 600, 600, 600, 600,
-  150, 150, 150, 150, 150, 150, 150, 150, 150,
+  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+  300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300,
+  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,  85,
+  600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600, 600,
+  150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150, 150,
 ] }
 
 
-# ---------------------------------------------------------------------------
-# ARM 2 — HOLD 1.00, CLOSED LOOP (fov 1, 6)
+# --- ARM 2 — hold 1.20 (fov 1, 6) -------------------------------------------
+# The baseline. 1.20 is the sustained target: at 150 ms, the most this arm can
+# spend, the median cell sits at 1.24, so about half the population can hold it
+# and the rest cannot. That split is the point — the same split the other arms
+# will show, measured against the simplest possible reference.
 #
-# The baseline, and — given what v13 measured — a real task rather than a trivial
-# one. Unstimulated cells sat at p50 0.958 and fell to 0.884 over 22 h. Holding
-# 1.00 is therefore mostly DRIFT REJECTION: the setpoint is 0.04 above where an
-# untouched cell starts and 0.12 above where it ends, so the controller has to
-# spend steadily more light to stay level. Whether it can, on 75 ms/real-min of
-# authority, is exactly the question the flat dose-response makes interesting, and
-# it is measured against arm 1's 0 ms rung, which tracks the same drift with no
-# control at all.
-#
-# 1.00 IS THE MILDEST DEFENSIBLE ASK, unlike v13's 1.034. It sits 0.04 above the
-# unstimulated median and below anything v13 achieved with real light. On the
-# original ladder nothing higher is worth demanding: at 46 ms/real-min v13's cells
-# sat at 0.91, so 1.00 is already at the edge of the evidence.
-# ---------------------------------------------------------------------------
+# Also a drift-rejection task. Untouched cells fall through the run, so holding
+# a fixed level costs steadily more light. Arm 1's 0 ms rung tracks the same
+# drift with no control at all, which is the comparison.
 
 [fov.1]
 arm = 2
 controller = { type = "sequence_mpc" }
-objective = { type = "hold", target_cnr = 1.00 }
+objective = { type = "hold", target_cnr = 1.20 }
 
 [fov.6]
 arm = 2
 controller = { type = "sequence_mpc" }
-objective = { type = "hold", target_cnr = 1.00 }
+objective = { type = "hold", target_cnr = 1.20 }
 
 
-# ---------------------------------------------------------------------------
-# ARM 3 — SCHEDULE, CLOSED LOOP (fov 2, 5)
+# --- ARM 3 — schedule (fov 2, 5) --------------------------------------------
+# Setpoints are given in frames, and at 1 frame per minute frame == minute.
+# Not periodic, so it can ask things a repeating waveform cannot.
 #
-# Piecewise-constant setpoints, in FRAMES (ScheduleReference indexes on
-# control_frame, not minutes — at 2.0 min/frame, frame 45 is minute 90).
-# Non-periodic on purpose: it is the only arm that can ask questions a repeating
-# waveform cannot.
-#
-# EVERY LEVEL SITS IN [0.98, 1.12], the band the original ladder can plausibly
-# reach. These were 1.00-1.18 while the extended ladder was shared; carrying those
-# numbers onto 75 ms/real-min of authority would have demanded a ramp top 0.22
-# above resting from an actuator that moved v13's population by 0.005.
-#
-#   frame    min   target   what it measures
-#     0        0    1.00    baseline hold, identical to arm 2 -> a within-run
-#                           replicate of arm 2 at a different plate position
-#    45       90    1.08    step UP to the stretch level. Dose-limited: the
-#                           controller can push. Rise time is the observable.
-#   105      210    0.98    step DOWN. Decay-limited — there is no inhibitory
-#                           actuator, so this is free decay and the controller
-#                           can only stop dosing. Measures tau directly, which
-#                           every previous file DECLARED as 7.3 and never checked.
-#   135      270    1.00    ramp begins, +0.03 every 15 frames (30 min)
-#   150      300    1.03
-#   165      330    1.06
-#   180      360    1.09
-#   195      390    1.12    ramp top, deliberately past the expected ceiling.
-#                           Each cell departs from the ramp somewhere; that
-#                           departure point IS its ceiling, and this gives one
-#                           per cell rather than one per population.
-#   225      450    0.98    hard drop back
-#   270      540    1.08    THE SAME STEP AS FRAME 45, 7.5 h later. Matched-step
-#                           drift measurement: any difference in rise time or
-#                           achieved level between the two is bleaching, not
-#                           control.
-#   330      660    1.00    return
-#
-# The repeat at frame 270 is the piece worth protecting if this schedule is ever
-# retuned. A ramp measures the ceiling once; a repeated step measures how the
-# whole response changed over the run, and v13 says that change is the largest
-# effect in the data.
-#
-# 0.98 is the lowest level anywhere in this arm, and it is above the measured
-# unstimulated 0.958 ON PURPOSE. There is no inhibitory actuator: a floor below
-# resting is unreachable by construction, which is the error v13's oscillation
-# arms made with low = 0.87.
-# ---------------------------------------------------------------------------
+#     0    1.20   same as arm 2, so this doubles as an arm 2 replicate
+#    90    1.35   step up, held 2 h. Transient, so it can ask for more than the
+#                 hold arm. The controller can push, so this measures rise time.
+#   210    1.05   step down. Nothing can pull a cell down, so this is free decay
+#                 and it measures tau — assumed to be 7.3 min by every file so
+#                 far, including this one, and never actually measured.
+#   270    1.10   ramp starts, +0.07 every 30 min
+#   300    1.17
+#   330    1.24
+#   360    1.31
+#   390    1.45   above the median per-track ceiling of 1.40 on purpose. Each
+#                 cell falls off the ramp somewhere, and that point is its own
+#                 ceiling — one estimate per cell rather than one per field.
+#   450    1.05   drop
+#   540    1.35   the same step as frame 90, 7.5 h later. Any difference in
+#                 rise time or level between the two is drift, not control.
+#   660    1.20   back to baseline
 
 [fov.2]
 arm = 3
 controller = { type = "sequence_mpc" }
 objective = { type = "schedule", points = [
-  [0, 1.00], [45, 1.08], [105, 0.98],
-  [135, 1.00], [150, 1.03], [165, 1.06], [180, 1.09], [195, 1.12],
-  [225, 0.98], [270, 1.08], [330, 1.00],
+  [0, 1.20], [90, 1.35], [210, 1.05],
+  [270, 1.10], [300, 1.17], [330, 1.24], [360, 1.31], [390, 1.45],
+  [450, 1.05], [540, 1.35], [660, 1.20],
 ] }
 
 [fov.5]
 arm = 3
 controller = { type = "sequence_mpc" }
 objective = { type = "schedule", points = [
-  [0, 1.00], [45, 1.08], [105, 0.98],
-  [135, 1.00], [150, 1.03], [165, 1.06], [180, 1.09], [195, 1.12],
-  [225, 0.98], [270, 1.08], [330, 1.00],
+  [0, 1.20], [90, 1.35], [210, 1.05],
+  [270, 1.10], [300, 1.17], [330, 1.24], [360, 1.31], [390, 1.45],
+  [450, 1.05], [540, 1.35], [660, 1.20],
 ] }
 
 
-# ---------------------------------------------------------------------------
-# ARM 4 — FREQUENCY STAIRCASE, CLOSED LOOP (fov 3, 4)
+# --- ARM 4 — frequency staircase (fov 3, 4) ---------------------------------
+# Periods 50, 36, 26, 18 min, then the sweep repeats. 304 min per sweep, so 2
+# sweeps in 11 h. Comparing the same period between sweep 0 and sweep 1 is a
+# drift measurement at matched frequency.
 #
-# Four periods in one field — 50 / 36 / 26 / 18 min — then the sweep repeats.
-# Sweep = 100 + 72 + 78 + 54 = 304 min, so 2 full sweeps in 11 h.
+# Amplitude shrinks and the floor rises as the period gets shorter, because the
+# fall is free decay and a short cycle has less time for it.
 #
-# EVERY FLOOR IS AT OR ABOVE THE RESTING LEVEL, WHICH v13's WERE NOT. This is the
-# correction that matters most here. v13's oscillation arms demanded low = 0.87
-# against an unstimulated population sitting at 0.958. There is no inhibitory
-# actuator: the cells cannot be driven below resting, so the low hold of every
-# cycle was unreachable by construction and the arms were scored against a floor
-# they could never touch. Floors here start at 0.98 and rise with frequency.
+# Time needed for the fall, as tau * ln((high - rest) / (low - rest)) at
+# tau = 7.3, checked at rest = 1.00, where an active cell sits unlit and where
+# decay to a floor just above it is slowest:
 #
-# AMPLITUDES ARE SIZED FOR THE ORIGINAL LADDER — 0.14 at the slowest block down to
-# 0.05 at the fastest, against 0.20-0.08 when the extended ladder was shared.
+#   50 min   1.30 -> 1.05   needs 13.1 of 18
+#   36 min   1.27 -> 1.08   needs  8.9 of 12
+#   26 min   1.23 -> 1.10   needs  6.1 of 10
+#   18 min   1.19 -> 1.12   needs  3.4 of 6
+#   wrap     1.12 -> 1.05   needs  6.4 of 12
 #
-# FALL FEASIBILITY, computed rather than assumed. Free decay from `high` to `low`
-# toward rest = 0.958 takes tau * ln((high - rest) / (low - rest)) at tau = 7.3:
+# All fit. tau = 7.3 is inherited from earlier files and has never been
+# measured — arm 3's frame 210 step is the first real measurement of it.
 #
-#   block 1  1.12 -> 0.98   ln(0.162/0.022) = 2.00   14.6 min <= 18   OK
-#   block 2  1.10 -> 0.99   ln(0.142/0.032) = 1.49   10.9 min <= 12   OK
-#   block 3  1.08 -> 1.00   ln(0.122/0.042) = 1.07    7.8 min <= 10   OK
-#   block 4  1.06 -> 1.01   ln(0.102/0.052) = 0.67    4.9 min <=  6   OK
-#   wrap     1.01 -> 0.98   ln(0.052/0.022) = 0.86    6.3 min <= 12   OK
+# If measured tau comes out above about 9, the fast blocks stop fitting. Arm 3's
+# frame 210 step is the measurement — check it before reading anything off this
+# arm.
 #
-# All five fit, so the fall is never the binding constraint and what the sweep
-# measures is the real quantity: achieved amplitude / demanded amplitude against
-# frequency, i.e. a Bode magnitude whose rolloff is the bandwidth. Amplitude
-# shrinks and the floor rises with frequency because that is what keeps the fast
-# falls reachable — holding amplitude fixed would break the sweep at the first
-# step down for a reason arithmetic already predicts.
-#
-# THE MARGINS ARE THINNER THAN THEY WERE. Block 1 now uses 14.6 of its 18 min and
-# block 2 uses 10.9 of 12, because a floor closer to rest makes the last part of
-# the decay slower. A measured tau above ~9.0 takes block 2 out and above ~8.9
-# takes block 1; on the previous, wider amplitudes the equivalent figures were
-# ~10.4 and ~11.5. Arm 3's frame-105 step is the live measurement of tau — check
-# it against this table before reading the Bode curve, and discount blocks whose
-# margin it eats.
-#
-# n_phase_groups = 1, matching v13's oscillation arms so the two runs stay
-# comparable, and keeping every cell on one waveform so the population median is
-# the waveform rather than a smear of four antiphase copies.
-# ---------------------------------------------------------------------------
+# n_phase_groups = 1, matching v13's oscillation arms, so every cell is on the
+# same waveform and the population median is the waveform.
 
 [fov.3]
 arm = 4
 controller = { type = "sequence_mpc" }
-objective = { type = "frequency_staircase", settle_min = 80.0, n_phase_groups = 1, frame_interval_min = 2.0, blocks = [
-  { low = 0.98, high = 1.12, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 },
-  { low = 0.99, high = 1.10, t_low_min = 8,  t_rise_min = 2, t_high_min = 14, t_fall_min = 12, n_cycles = 2 },
-  { low = 1.00, high = 1.08, t_low_min = 6,  t_rise_min = 2, t_high_min = 8,  t_fall_min = 10, n_cycles = 3 },
-  { low = 1.01, high = 1.06, t_low_min = 4,  t_rise_min = 2, t_high_min = 6,  t_fall_min = 6,  n_cycles = 3 },
+objective = { type = "frequency_staircase", settle_min = 80.0, n_phase_groups = 1, blocks = [
+  { low = 1.05, high = 1.30, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 },
+  { low = 1.08, high = 1.27, t_low_min = 8,  t_rise_min = 2, t_high_min = 14, t_fall_min = 12, n_cycles = 2 },
+  { low = 1.10, high = 1.23, t_low_min = 6,  t_rise_min = 2, t_high_min = 8,  t_fall_min = 10, n_cycles = 3 },
+  { low = 1.12, high = 1.19, t_low_min = 4,  t_rise_min = 2, t_high_min = 6,  t_fall_min = 6,  n_cycles = 3 },
 ] }
 
 [fov.4]
 arm = 4
 controller = { type = "sequence_mpc" }
-objective = { type = "frequency_staircase", settle_min = 80.0, n_phase_groups = 1, frame_interval_min = 2.0, blocks = [
-  { low = 0.98, high = 1.12, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 },
-  { low = 0.99, high = 1.10, t_low_min = 8,  t_rise_min = 2, t_high_min = 14, t_fall_min = 12, n_cycles = 2 },
-  { low = 1.00, high = 1.08, t_low_min = 6,  t_rise_min = 2, t_high_min = 8,  t_fall_min = 10, n_cycles = 3 },
-  { low = 1.01, high = 1.06, t_low_min = 4,  t_rise_min = 2, t_high_min = 6,  t_fall_min = 6,  n_cycles = 3 },
+objective = { type = "frequency_staircase", settle_min = 80.0, n_phase_groups = 1, blocks = [
+  { low = 1.05, high = 1.30, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, n_cycles = 2 },
+  { low = 1.08, high = 1.27, t_low_min = 8,  t_rise_min = 2, t_high_min = 14, t_fall_min = 12, n_cycles = 2 },
+  { low = 1.10, high = 1.23, t_low_min = 6,  t_rise_min = 2, t_high_min = 8,  t_fall_min = 10, n_cycles = 3 },
+  { low = 1.12, high = 1.19, t_low_min = 4,  t_rise_min = 2, t_high_min = 6,  t_fall_min = 6,  n_cycles = 3 },
 ] }
 
 
-# --- PRE-FLIGHT — THE GATE THIS FILE EXISTS TO ENFORCE ----------------------
-# v13's pre-flight was skipped by decision and every skipped entry is a reason its
-# primary contrast is unreadable. These are not optional, and each one has a
-# pre-committed action on failure rather than a judgement call at 9 a.m. on the
-# rig.
+# --- BEFORE THE RUN ---------------------------------------------------------
+# 1. Cadence. Measure the real round time at 8 fields. It needs to be at or
+#    under about 52 s. If it is not, fix the rig or cut to 4 fields (one per
+#    arm) — do not start and hope, which is what v13 and v14 both did after the
+#    alarm had already fired.
 #
-# 1. DOES LIGHT MOVE THE CELLS AT ALL?  THE BLOCKING GATE.
-#    Run arm 1's ladder open-loop on 2 fields for one 90-min sweep before booking
-#    the full run. Required: population median CNR at the 600 ms rung exceeds the
-#    0 ms rung of the SAME sweep by >= 0.10 — comfortably more than the 0.005 that
-#    a doubling of dose bought in v13, and enough to exceed half the cross-cell SD.
-#    ON FAILURE: DO NOT RUN. The problem is upstream of anything a policy file can
-#    set — optogenetic construct expression, DMD alignment, --stim-power, or the
-#    CNR readout itself — and another 11 h of MPC measures none of them.
+# 2. Confirm the rig is set to 8 fields. v13 declared 8, the rig imaged 10, and
+#    two fields ran the default policy for 3.3 h before anyone noticed.
 #
-#    SECOND READING OF THE SAME SWEEP, and the one that decides arms 2-4: compare
-#    the 150 ms rung against 0 ms. 150 is the most the CONTROLLED arms can ever
-#    spend. If the gate passes at 600 but 150 moves the median by < 0.05, arms 2-4
-#    are dose-limited before they start — run them anyway, but pre-register that
-#    their tracking numbers are a statement about the actuator, not the controller.
+# 3. Watch fov 0 and 7 for the first two sweeps. 300 and 600 ms are new. If
+#    track loss or nuclear area diverges from the other fields, cut the top
+#    rung to 300.
 #
-# 2. CADENCE at 8 fields. Measure the real round time on the rig.
-#    Required: <= 105 s (12% headroom under the declared 120 s).
-#    ON FAILURE: cut to 4 fields — arms 1-4 at n = 1 — and re-declare
-#    --frame-interval-min at the measured value. NEVER keep 8 fields and let the
-#    declaration drift; that is precisely v13's failure, and every target above is
-#    sized on the declaration being true.
-#
-# 3. tau. Fit free decay off arm 3's frame-105 step in the first hours and check
-#    it against the fall table in arm 4. Declared 7.3, never measured in any run.
-#    ON FAILURE (tau > 8.9): drop the affected blocks from the Bode read, and say
-#    so. The margins here are thin — see arm 4.
-#
-# 4. AMPLITUDE vs SPREAD, the one that decides whether arm 4 is resolvable at all.
-#    v13's cross-cell SD of CNR was 0.16-0.26 at every frame. Arm 4's largest
-#    demanded amplitude is 0.14 and its smallest is 0.05 — EVERY block demands
-#    less than the population spread, and the fastest demands a quarter of it.
-#    That is workable for a per-cell tracking error and hopeless for anything read
-#    off a population median.
-#    ACTION, not a gate: arm 4 is analysed per cell, always. No block of it
-#    supports a population-level amplitude claim. This got worse when the ladder
-#    reverted, and it is the clearest price of that choice.
-#
-# 5. Soak at the HOUR-12 cell count (`--from-log --start-frame 600`), which v13
-#    ran only at hour 0 and therefore at the optimistic end. Required: rho < 0.7.
+# 4. Soak at a realistic cell count, not an hour-0 one.
 
 
-# --- ANALYSIS CONSTRAINT ----------------------------------------------------
-# 1. THE UNIT OF REPLICATION IS THE FIELD, n = 2 PER ARM. Cells within a field
-#    share its arm, illumination and position. Report per-field values
-#    individually, per-cell distributions with field identity visible, and a mixed
-#    model with field as a random effect. Never a per-cell p-value.
-# 2. DROP THE FIRST 40 FRAMES (80 min) OF EVERY ARM, including arm 2, which has no
-#    settle of its own. The comparison window must be identical across arms.
-# 3. EVERY LEVEL IS READ AGAINST ARM 1's 0 ms RUNG FROM THE NEAREST SWEEP IN TIME,
-#    never against a fixed resting value. Resting drifts — 0.995 to 0.884 over
-#    v13's 22 h — and that drift is the largest single effect in that dataset.
-#    This is what the seven repeated sweeps are for; use them.
-# 4. Tracking error is against each cell's own logged `r_t`, never a scalar
-#    target. Arms 3 and 4 have no scalar target to fall back on.
-# 5. REPORT CUMULATIVE DELIVERED FLUENCE PER ARM next to every tracking number.
-#    Arm 1 spends far more than arms 2-4 can, by design; comparing its cells'
-#    achieved CNR to theirs is a dose comparison and must be labelled as one.
-# 6. THE ANALYSIS NOTEBOOK WILL REPORT TWO PER-FOV LADDERS AND WARN ABOUT IT.
-#    That warning is expected here and is not a policy/run mismatch — arm 1's
-#    ladder differs by design. It resolves the union [0, 20, 45, 85, 150, 300,
-#    600]; the exposure stackplot will show rungs no controlled arm can command.
-# 7. Group arm 4 on the logged `block_index` / `sweep_index`, never on wall-clock
-#    time. Comparing a period's blocks between sweep 0 and sweep 1 is the
-#    matched-frequency drift measurement.
+# --- READING THE RESULTS ----------------------------------------------------
+# 1. The unit of replication is the field, n = 2 per arm. Cells in a field
+#    share its arm, its light and its position, so a per-cell p-value is wrong
+#    by roughly the number of cells per field. Report per-field values and use
+#    field as a random effect.
+#
+# 2. Drop the first 80 frames of every arm, including arm 2, so the comparison
+#    window is the same everywhere.
+#
+# 3. Compare every level against arm 1's 0 ms rung from the nearest sweep in
+#    time, not against a fixed resting value. Resting moves by 0.25 over the
+#    run and that is the largest single effect in the data.
+#
+# 4. Tracking error goes against each cell's own logged r_t. Arms 3 and 4 have
+#    no single target to fall back on.
+#
+# 5. Report total delivered light per arm next to any tracking number. Arm 1
+#    spends far more than the others by design.
+#
+# 6. Arm 4 is read per cell. Its amplitudes are 0.18 down to 0.04 against a
+#    cross-cell spread of about 0.21, so no block of it supports a claim based
+#    on a population median.
+#
+# 7. Group arm 4 on the logged block_index and sweep_index, not on wall clock.
+#
+# 8. The analysis notebook will warn that two ladders are in use. That is arm 1
+#    and it is expected.
 
 
-# --- RISKS ------------------------------------------------------------------
-# 1. MODEL / CADENCE MISMATCH. The checkpoint was trained on 1-minute frames and
-#    is served 2-minute frames, so its predicted dynamics are half-speed in real
-#    time and the MPC will be sluggish by about that factor. Unfixable in a policy
-#    file — the choices are retraining at the served cadence or cutting to 4
-#    fields. v13 had this defect at 1.83x and never recorded it. RECORDED HERE, and
-#    it applies to arms 2, 3 and 4 equally, so it does not confound them against
-#    each other — only against any absolute claim about tracking quality.
-# 2. THE MODEL HAS NO ONE-STEP SKILL. On v13, predicted-vs-achieved MAE was 0.0431
-#    against persistence's 0.0423 (arm 1) and 0.0462 against 0.0440 (arm 3) — very
-#    slightly WORSE than assuming nothing changes. An MPC on a model at persistence
-#    skill is not doing much control. This run is diagnostic (does light do
-#    anything, what is tau, where is the ceiling) rather than a control-performance
-#    claim, which is the only reason it is worth running before the model improves.
-# 3. THE CONTROLLED ARMS MAY BE DOSE-LIMITED BEFORE THEY START. At 75 ms/real-min
-#    they have marginally less authority than v13's arms had at 82, and v13 was a
-#    null. This is the accepted cost of keeping arms 2-4 on the ladder every
-#    previous run used; the alternative was six fields on rungs no experiment has
-#    ever delivered. Pre-flight 1's second reading is what turns this from a
-#    surprise into a pre-registered expectation.
-# 4. PHOTOTOXICITY AT ARM 1's NEW TOP RUNGS. 300 and 600 ms have never been
-#    delivered in this project. At 2 min/frame, 600 ms is a 0.5% duty cycle and
-#    arm 1 holds it for 18 min at a stretch, seven times. UNVERIFIED — but now
-#    confined to two fields on a known schedule, which is most of why it lives
-#    here. Watch fov 0 and 7 for a divergence in track loss or nuclear area
-#    against arms 2-4 in the first two sweeps, and cut the top rung to 300 if
-#    either moves.
-# 5. PHOTOBLEACHING over 330 frames. v13 lost 0.11 of CNR over 22 h; this run is
-#    shorter, and only arm 1 is brighter. Arm 1's 0 ms rung measures it directly
-#    every 90 min on those fields, and arms 2-4 bleach at v13's rate or below.
-# 6. FOV COUNT. v13 declared 8 fields and the rig imaged 10, silently running two
-#    on [default] for 3.3 h. CONFIRM THE RIG IS SET TO 8 BEFORE STARTING. If it is
-#    not, [default] here is the arm-2 hold on the shared ladder, so the extras are
-#    at least interpretable — but they are edge fields and are not arm-2 replicates.
+# --- KNOWN PROBLEMS ---------------------------------------------------------
+# 1. The model is barely better than assuming nothing changes. On v13 its
+#    one-step error was 0.043 against persistence's 0.042. An MPC built on that
+#    is not doing much control. This run is diagnostic — does light work, what
+#    is tau, where is the ceiling — rather than a claim about control quality.
+#
+# 2. Photobleaching. v13 lost 0.11 of CNR over 22 h and v14 lost 0.25 over 11 h
+#    at a higher dose. Arm 1's 0 ms rung measures it directly.
+#
+# 3. The controlled arms top out at 150 ms, where the median cell reaches 1.24.
+#    That makes the 1.20 hold something about half the population can meet. At
+#    300 ms the median is 1.31 and 66% of cells clear 1.20. If the point is for
+#    most cells to make it rather than half, the controlled arms need the wider
+#    ladder too. That is a decision, not an oversight.
+#
+# 4. tau = 7.3 min is inherited and unmeasured, and every fall duration in arm 4
+#    is sized on it. If arm 3's step measures it much above 9, the fast blocks
+#    stop being reachable.

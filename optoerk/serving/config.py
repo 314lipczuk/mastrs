@@ -22,6 +22,33 @@ def _env(name: str) -> str | None:
     return os.environ.get(f"OPTOERK_SERVE_{name.upper()}")
 
 
+# --- THE ACQUISITION CADENCE IS AN INVARIANT, NOT A SETTING ----------------
+# One frame per minute, one inference per frame. Nothing configures this.
+#
+# The number is load-bearing in two directions at once: the checkpoint is trained
+# on a 1-frame = 1-minute grid (``preprocessing.add_stim_features``), and every
+# time-parameterized reference converts its waveform from minutes to frames at
+# this rate. It used to be a ``ServerConfig`` field behind a
+# ``--frame-interval-min`` flag — declared TWICE in this dataclass, with two
+# different comment blocks, the second silently replacing the first.
+#
+# That made the most load-bearing constant in the experiment look like a knob,
+# and raising it to match a slow rig does two things at once: it SILENCES the
+# only alarm that catches the slip, and it rescales every waveform's frame count,
+# so the run comes out looking clean while meaning something else. Both happened.
+#
+# If the rig cannot hold one frame per minute, that is a fault to fix upstream.
+# It is not a number to restate here.
+FRAME_INTERVAL_MIN = 1.0
+FRAME_INTERVAL_S = FRAME_INTERVAL_MIN * 60.0
+
+# Fractional slip tolerated before a run is flagged.
+CADENCE_TOLERANCE = 0.25
+# Per-FOV intervals collected before judging: small enough to fire early, large
+# enough that one slow frame cannot trip it.
+CADENCE_MIN_SAMPLES = 10
+
+
 @dataclass
 class ServerConfig:
     # --- transport --------------------------------------------------------
@@ -71,14 +98,6 @@ class ServerConfig:
     target_cnr: float = 1.5
     control_horizon: int = 5         # frames to look ahead when scoring a dose
     n_candidates: int = 5           # exposure grid resolution (0..max_exposure_ms)
-
-    # Acquisition cadence. The training data is built on a 1-frame = 1-minute grid
-    # (``preprocessing.add_stim_features``), so this is 1.0 for every dataset so
-    # far. It is explicit because time-parameterized references (the oscillation
-    # step train) are configured in *minutes* while the horizon is in *frames*,
-    # and the bound relating them is load-bearing: get this wrong and the startup
-    # period check passes on a period the controller cannot actually see.
-    frame_interval_min: float = 1.0
 
     # --- exposure output bounds (faro contract) ---------------------------
     min_exposure_ms: float = 0.0
@@ -130,9 +149,13 @@ class ServerConfig:
     # reference measurement, ranked against the session's cohort pooled across
     # FOVs (see `optoerk.serving.expression`).
     #
-    # OFF BY DEFAULT, and switching it on is a change of EXPERIMENTAL CONDITION,
-    # not a bug fix: it gives the controller a per-cell gain covariate it has never
-    # had, so a run with it on is not comparable to one with it off.
+    # ON BY DEFAULT since 2026-08-14. It was off, on the reasoning that switching
+    # it on is a change of EXPERIMENTAL CONDITION rather than a bug fix — which is
+    # true, and is exactly why the default is now the condition every real run
+    # since v13 has actually used. A default nobody wants is not a safe default:
+    # it makes the flag mandatory ceremony on every command line, and the OFF state
+    # is the silent-degradation one (every cell gets the neutral median rank and
+    # the run looks fine). Turn it off explicitly to reproduce a pre-v13 run.
     #
     # It requires the payload to carry the optocheck/reference measurement
     # (`ref_mean_intensity`, or the older `optocheck_mean_intensity`). faro's
@@ -144,7 +167,7 @@ class ServerConfig:
     # to rank against (`_check_optortk_coverage`), because a silent fallback looks
     # exactly like a successful run and produces a whole experiment of
     # median-expresser predictions.
-    live_optortk_expr: bool = False
+    live_optortk_expr: bool = True
     # How many optocheck samples one cell contributes before its rank freezes. One
     # optocheck per run is the normal case, so 1 is the sensible default.
     optortk_baseline_frames: int = 1
@@ -238,30 +261,6 @@ class ServerConfig:
     # prediction path, so it keeps recording through a stall. Requires
     # ``nvidia-ml-py``. 0 disables it.
     gpu_sample_interval_s: float = 5.0
-
-    # --- acquisition cadence ----------------------------------------------
-    # The frame interval the rig is SUPPOSED to deliver, in minutes. The server
-    # cannot enforce it — it only answers requests — but it can see it, because it
-    # timestamps every one. Set it to the acquisition's programmed interval.
-    #
-    # This is a contract, not a measurement to adapt to. The checkpoint was trained
-    # at a fixed interval and every objective converts its waveform from minutes to
-    # frames at a declared rate, so a rig running slower does not stretch the
-    # experiment, it invalidates it: a 50-minute reference period delivered at 3.4
-    # minutes per frame is really a 170-minute period, and the model is being asked
-    # to extrapolate dynamics on a timescale it never saw. That happened for a whole
-    # 12 h run and was only found afterwards, from the parquet timestamps.
-    #
-    # So: measure the real interval, compare, and shout in the first few minutes
-    # while the run is still cheap to abort. Never quietly redefine the experiment
-    # to match what the hardware managed.
-    frame_interval_min: float = 1.0
-    # Fractional slip tolerated before the run is flagged. 0.25 = the median
-    # observed interval may exceed the declared one by 25%.
-    cadence_tolerance: float = 0.25
-    # Per-FOV intervals to collect before judging. Small enough to fire early,
-    # large enough that one slow frame does not.
-    cadence_min_samples: int = 10
 
     # --- crowding features -------------------------------------------------
     crowd_radius_px: float = 200.0   # n_cells_200px neighbourhood radius

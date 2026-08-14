@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 import torch
+from optoerk.serving.config import FRAME_INTERVAL_MIN
 
 
 class PolicyViolation(Exception):
@@ -284,7 +285,6 @@ class StepTrainReference(Reference):
         t_fall_min: float,
         settle_periods: float = 2.0,
         n_phase_groups: int = 4,
-        frame_interval_min: float = 1.0,
     ):
         self.low = float(low)
         self.high = float(high)
@@ -294,7 +294,12 @@ class StepTrainReference(Reference):
         self.t_fall_min = float(t_fall_min)
         self.settle_periods = float(settle_periods)
         self.n_phase_groups = int(n_phase_groups)
-        self.frame_interval_min = float(frame_interval_min)
+        # NOT a parameter. One frame is one minute, everywhere, always — see
+        # config.FRAME_INTERVAL_MIN. A reference that converts its waveform at
+        # any other rate is desynchronised from the acquisition that serves it,
+        # and the only thing that ever set this to something else was a policy
+        # file trying to absorb a rig slip.
+        self.frame_interval_min = FRAME_INTERVAL_MIN
 
         for label, v in (
             ("t_low_min", self.t_low_min), ("t_rise_min", self.t_rise_min),
@@ -312,8 +317,6 @@ class StepTrainReference(Reference):
             raise ValueError(
                 f"step_train: n_phase_groups must be >= 1, got {n_phase_groups}"
             )
-        if self.frame_interval_min <= 0:
-            raise ValueError("step_train: frame_interval_min must be > 0")
 
     @property
     def period_min(self) -> float:
@@ -461,13 +464,12 @@ class FrequencyStaircaseReference(Reference):
         blocks: Sequence[dict[str, Any]],
         settle_min: float = 0.0,
         n_phase_groups: int = 4,
-        frame_interval_min: float = 1.0,
     ):
         if not blocks:
             raise ValueError("frequency_staircase: needs at least one block")
         self.settle_min = float(settle_min)
         self.n_phase_groups = int(n_phase_groups)
-        self.frame_interval_min = float(frame_interval_min)
+        self.frame_interval_min = FRAME_INTERVAL_MIN  # see StepTrainReference
         if self.settle_min < 0:
             raise ValueError("frequency_staircase: settle_min must be >= 0")
         if self.n_phase_groups < 1:
@@ -475,8 +477,6 @@ class FrequencyStaircaseReference(Reference):
                 f"frequency_staircase: n_phase_groups must be >= 1, got "
                 f"{n_phase_groups}"
             )
-        if self.frame_interval_min <= 0:
-            raise ValueError("frequency_staircase: frame_interval_min must be > 0")
 
         self.n_cycles: list[int] = []
         self.refs: list[StepTrainReference] = []
@@ -493,8 +493,7 @@ class FrequencyStaircaseReference(Reference):
             # settle and phase live on the staircase, not inside a block.
             self.refs.append(
                 StepTrainReference(
-                    settle_periods=0.0, n_phase_groups=1,
-                    frame_interval_min=self.frame_interval_min, **spec,
+                    settle_periods=0.0, n_phase_groups=1, **spec,
                 )
             )
 
@@ -947,7 +946,6 @@ def oscillation(
     t_fall_min: float,
     settle_periods: float = 2.0,
     n_phase_groups: int = 4,
-    frame_interval_min: float = 1.0,
     kernel: str | dict[str, Any] = "l2",
     lambda_move: float = 0.0,
     lambda_dose: float = 0.0,
@@ -967,7 +965,6 @@ def oscillation(
             t_high_min=t_high_min, t_fall_min=t_fall_min,
             settle_periods=settle_periods,
             n_phase_groups=n_phase_groups,
-            frame_interval_min=frame_interval_min,
         ),
         build_kernel(kernel),
         _regularizers(lambda_move, lambda_dose),
@@ -980,7 +977,6 @@ def frequency_staircase(
     blocks: Sequence[dict[str, Any]],
     settle_min: float = 0.0,
     n_phase_groups: int = 4,
-    frame_interval_min: float = 1.0,
     kernel: str | dict[str, Any] = "l2",
     lambda_move: float = 0.0,
     lambda_dose: float = 0.0,
@@ -997,7 +993,6 @@ def frequency_staircase(
             blocks=blocks,
             settle_min=settle_min,
             n_phase_groups=n_phase_groups,
-            frame_interval_min=frame_interval_min,
         ),
         build_kernel(kernel),
         _regularizers(lambda_move, lambda_dose),

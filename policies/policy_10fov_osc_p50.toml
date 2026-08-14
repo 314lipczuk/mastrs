@@ -184,7 +184,7 @@ levels_ms = [0, 20, 45, 85, 150]
 # the run it defined before. The bounds quoted above are now checked in the
 # pre-flight (experiments/policy_preflight.py), against measured distributions
 # rather than against a hand-typed tau.
-objective = { type = "oscillation", low = 0.85, high = 1.225, t_low_min = 17, t_rise_min = 3, t_high_min = 14, t_fall_min = 16, settle_periods = 2, n_phase_groups = 4, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.85, high = 1.225, t_low_min = 17, t_rise_min = 3, t_high_min = 14, t_fall_min = 16, settle_periods = 2, n_phase_groups = 4 }
 
 # Fallback for any FOV not listed below (none, here) — mirror arm 1.
 controller = { type = "constant_dose" }

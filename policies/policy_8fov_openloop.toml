@@ -236,12 +236,12 @@ controller = { type = "open_loop", sequence_ms = [85.0], repeat = true }
 [fov.2]
 arm = 3
 controller = { type = "sequence_mpc" }
-objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1 }
 
 [fov.5]
 arm = 3
 controller = { type = "sequence_mpc" }
-objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1 }
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +277,7 @@ objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_r
 
 [fov.3]
 arm = 4
-objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1 }
 controller = { type = "open_loop", repeat = true, sequence_ms = [
   45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
   45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
@@ -287,7 +287,7 @@ controller = { type = "open_loop", repeat = true, sequence_ms = [
 
 [fov.4]
 arm = 4
-objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1, frame_interval_min = 1.0 }
+objective = { type = "oscillation", low = 0.87, high = 1.17, t_low_min = 12, t_rise_min = 2, t_high_min = 18, t_fall_min = 18, settle_periods = 2, n_phase_groups = 1 }
 controller = { type = "open_loop", repeat = true, sequence_ms = [
   45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
   45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,

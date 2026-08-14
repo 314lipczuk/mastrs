@@ -14,7 +14,12 @@ import threading
 import time
 from typing import Any
 
-from optoerk.serving.config import ServerConfig
+from optoerk.serving.config import (
+    CADENCE_MIN_SAMPLES,
+    CADENCE_TOLERANCE,
+    FRAME_INTERVAL_S,
+    ServerConfig,
+)
 from optoerk.serving.expression import ExpressionCohort
 from optoerk.serving.features import (
     OPTORTK_KEYS,
@@ -188,55 +193,64 @@ class InferenceService:
         )
 
     def _check_cadence(self, fov: int, timestep: int, recv_epoch: float) -> None:
-        """Compare the cadence the rig is actually delivering against the declared one.
+        """Compare the cadence the rig is actually delivering against the invariant.
+
+        One frame per minute, one inference per frame — ``FRAME_INTERVAL_S``, a
+        constant, not a setting. There is deliberately nothing to configure here:
+        the previous design let a run declare its own interval, and declaring the
+        observed one is how a slip stops being an alarm and becomes a silent
+        redefinition of the experiment.
 
         Measured PER FOV — the fields are imaged sequentially within a round, so
         consecutive requests across fields are separated by a slot, not by a frame.
         Only the gap between two successive frames of the SAME field is the frame
-        interval.
+        interval. Judged on the median so one slow frame cannot trip it, reported
+        once.
 
-        Judged on the median so one slow frame cannot trip it, and reported once.
-        This is deliberately advisory: the server cannot fix the acquisition, and
-        halting a run over a transient would be worse than the thing it guards
-        against. What it must not do is let a 3.4x slip go unremarked for 12 hours,
-        which is exactly what happened before this existed.
+        Advisory by design: the server cannot fix the acquisition, and halting a
+        run over a transient would be worse than the thing it guards against. What
+        it must not do is let a slip go unremarked for twelve hours, which is
+        exactly what happened before this existed — and twice since, because the
+        warning went to a stream with no clock on it. Hence the timestamp.
         """
         prev = self._fov_last_recv.get(fov)
         self._fov_last_recv[fov] = recv_epoch
         if prev is None or self._cadence_checked:
             return
         self._cadence_samples.append(recv_epoch - prev)
-        if len(self._cadence_samples) < self.cfg.cadence_min_samples:
+        if len(self._cadence_samples) < CADENCE_MIN_SAMPLES:
             return
 
         self._cadence_checked = True
-        declared_s = float(self.cfg.frame_interval_min) * 60.0
         observed_s = float(sorted(self._cadence_samples)[len(self._cadence_samples) // 2])
-        ratio = observed_s / declared_s if declared_s > 0 else float("inf")
+        ratio = observed_s / FRAME_INTERVAL_S
+        now = time.time()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
         if self._logger:
             self._logger.write({
-                "t": time.time(), "event": "cadence",
+                "t": now, "event": "cadence",
+                "wall_clock": stamp,
                 "fov": fov, "timestep": timestep,
-                "declared_s": declared_s, "observed_s": round(observed_s, 2),
+                "required_s": FRAME_INTERVAL_S, "observed_s": round(observed_s, 2),
                 "ratio": round(ratio, 3), "n_samples": len(self._cadence_samples),
-                "degraded": ratio > 1.0 + self.cfg.cadence_tolerance,
+                "degraded": ratio > 1.0 + CADENCE_TOLERANCE,
             })
-        if ratio <= 1.0 + self.cfg.cadence_tolerance:
-            print(f"[serving] cadence OK: {observed_s:.1f}s per frame vs "
-                  f"{declared_s:.0f}s declared ({ratio:.2f}x)")
+        if ratio <= 1.0 + CADENCE_TOLERANCE:
+            print(f"[serving] [{stamp}] cadence OK: {observed_s:.1f}s per frame vs "
+                  f"{FRAME_INTERVAL_S:.0f}s required ({ratio:.2f}x)")
             return
 
         self.cadence_degraded = True
         print(
-            f"\n[serving] *** CADENCE SLIP ***\n"
-            f"[serving] The rig is delivering a frame every {observed_s:.1f}s, but "
-            f"this run declares {declared_s:.0f}s ({ratio:.2f}x slower).\n"
-            f"[serving] Every reference waveform converts minutes to frames at the "
-            f"declared rate, so a {ratio:.2f}x slip multiplies every period by "
+            f"\n[serving] [{stamp}] *** CADENCE SLIP ***  (fov {fov}, timestep {timestep})\n"
+            f"[serving] The rig is delivering a frame every {observed_s:.1f}s. This "
+            f"server requires {FRAME_INTERVAL_S:.0f}s ({ratio:.2f}x slower).\n"
+            f"[serving] Every reference waveform converts minutes to frames at one "
+            f"frame per minute, so a {ratio:.2f}x slip multiplies every period by "
             f"{ratio:.2f} in real time, and the checkpoint is being asked for "
             f"dynamics at an interval it was not trained on.\n"
-            f"[serving] The run is NOT what the policy describes. Abort now if you "
-            f"can — every predict record from here carries `cadence_degraded`.\n",
+            f"[serving] The run is NOT what the policy describes. Abort now — every "
+            f"predict record from here carries `cadence_degraded`.\n",
             file=sys.stderr, flush=True,
         )
 
