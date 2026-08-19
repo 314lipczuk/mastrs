@@ -1,0 +1,459 @@
+# 8 FOVs, four oscillation periods, two replicates each. The arm IS the
+# waveform: every arm shares one checkpoint, one dose ladder, one horizon, one
+# controller, one kernel, one amplitude, one rise slope and one duty cycle, and
+# differs only in period.
+#
+#   arm 1  fov 1, 6   period 20 min
+#   arm 2  fov 0, 7   period 30 min
+#   arm 3  fov 3, 4   period 60 min
+#   arm 4  fov 2, 5   period 70 min
+#
+#   fov   0  1  2  3  4  5  6  7
+#   arm   2  1  4  3  3  4  1  2
+#
+# 40 and 50 min were the two waveforms of policy_10fov_osc.toml /
+# policy_10fov_osc_p50.toml, so they are deliberately absent. Together the four
+# here plus those two tile 20-70 min at roughly even log spacing.
+#
+# Run:
+#   uv run python -m optoerk.serving.app --device cuda \
+#       --policy-file policies/policy_8fov_osc_periods.toml \
+#       --predict-log run.jsonl
+#
+# Soak:
+#   uv run python -m optoerk.serving.soak --device cuda \
+#       --policy-file policies/policy_8fov_osc_periods.toml \
+#       --n-fovs 8 --cycles 20 --cycle-seconds 60
+
+
+# --- WHERE EVERY NUMBER BELOW COMES FROM ------------------------------------
+# Measured 2026-08-19 from v16 (2026-08-07_InferenceCNRhold_12h_v16), which ran
+# the SAME checkpoint on the SAME rig at a verified 1.000 min/frame, and whose
+# arm 1 (fov 0, 7) is an open-loop dose probe: 18-min rungs in the order
+# 0, 300, 85, 600, 150 ms, repeating. Control began at acquisition frame 16, so
+# everything below is phase-aligned on control_frame = timestep - 16 — aligning
+# on timestep instead shifts the rung labels by 16 min and reads the 300 ms rung
+# as darker than dark.
+#
+# Steady state = last 6 frames of each rung, per cell, then pooled.
+#
+#   sweep    0 ms    +85     +150    +300    +600
+#     0      0.745  +0.261  +0.378  +0.604  +0.574
+#     1      0.759  +0.168  +0.274  +0.457  +0.465
+#     2      0.796  +0.132  +0.216  +0.382  +0.403
+#     3      0.818  +0.067  +0.161  +0.294  +0.359
+#     4      0.780  +0.086  +0.168  +0.285  +0.355
+#     5      0.779  +0.079  +0.160  +0.283  +0.345
+#     6      0.783  +0.066  +0.155  +0.246  +0.314
+#     7      0.787  +0.069  +0.151  +0.215  +0.298
+#
+# Three things follow, and two of them contradict what every previous policy
+# file in this directory assumed.
+#
+# 1. RESTING IS FLAT, THE GAIN IS NOT. Resting sits at 0.78-0.82 from sweep 2
+#    onward and does not drift. What collapses is the dose response: 150 ms buys
+#    +0.38 in the first 90 min and +0.15 in the last, a factor of 2.5. Earlier
+#    files (and the v14 write-up) treated drifting resting as the thing that
+#    puts a fixed target out of band. On this checkpoint it is the gain. The
+#    consequence is the opposite of what it looks like: a fixed target does not
+#    get easier as resting rises, it gets harder as the actuator weakens, and it
+#    fails LATE rather than early.
+#
+# 2. tau IS ABOUT 3 MINUTES, NOT 7.3. Log-linear fit of the 150 -> 0 ms fall
+#    against the same sweep's resting level: 3.63 min early, 2.94 min late.
+#    Every policy file so far sized its falls on tau = 7.3, a number that was
+#    inherited and never measured. Falls are therefore roughly twice as cheap as
+#    assumed, which is what makes a 20-min period admissible at all.
+#
+# 3. THERE IS A 3-5 MIN DEAD TIME IN BOTH DIRECTIONS. Frames from a dose step to
+#    the first frame that moves: 3-4 min late in the run, 0-3 min early. After
+#    the dead time the rise has a time constant of about 4 min (the 0 -> 300 ms
+#    step reaches 86% of its final value 8 min after it starts moving).
+#
+#    Dead time plus rise constant is ~8 min of lag. At a 20-min period that is
+#    145 degrees of phase, so the fast arm is not trackable by feedback alone —
+#    only by the MPC acting on its 30-frame lookahead. Whether it can is exactly
+#    what arm 1 tests.
+#
+# Per-cell reachable ceiling at 150 ms (each cell's own mean over the steady
+# part of the rung), and per-cell frame-to-frame CNR noise:
+#
+#   sweep     n    >=0.85  >=0.91  >=0.97
+#     0      190     83%     75%     67%
+#     3      205     71%     62%     50%
+#     5      224     67%     56%     42%
+#     7      227     67%     55%     43%
+#
+#   within-cell sd of successive CNR differences, late sweeps:
+#     0 ms 0.014   85 ms 0.017   150 ms 0.020   300 ms 0.030
+#
+# The amplitude below is 0.12, six times that noise, so a single cell's swing is
+# resolvable without pooling — which matters because the cross-cell CNR spread
+# is about 0.21 and no claim here can rest on a population median.
+
+
+# --- TWO CHOICES THAT WERE MADE AGAINST THE MEASUREMENT ---------------------
+# Recorded because they are not recoverable after the run, and because both were
+# argued and then overruled on purpose.
+#
+# THE LADDER STAYS AT 150 ms. The table above says the controlled ceiling late
+# in the run is resting + 0.15, i.e. about 0.94, so `high` at 0.97 is at or past
+# what roughly half the population can hold in the second half. Extending the
+# ladder to 300 ms would have bought another +0.10 of authority. It was not
+# taken: this ladder is what v12-v16 searched, and keeping it means the tracking
+# numbers here can be read directly against those runs.
+#
+#   WHAT THIS COSTS, CONCRETELY: expect the high hold to clip for the lower half
+#   of the population in the last third of the run. This is NOT the v15/v16
+#   failure, where every arm sat at the top rung 50-82% of ALL frames and the
+#   arms stopped being distinguishable. Here the reference spends half its time
+#   at or below the midpoint by construction (see the duty cycle below), the
+#   trough is reachable by two thirds of cells throughout, and both transitions
+#   are inside the actuator's range. Clipping shows up at the peak only, it is
+#   per-cell, and a cell whose achieved amplitude collapses while its neighbours'
+#   does not is a ceiling measurement rather than a lost field.
+#
+#   READ IT THIS WAY: report achieved amplitude per cell against that cell's own
+#   fraction of frames at the 150 ms rung. Cells at the rail for most of their
+#   high holds are censored, not tracking badly, and must not be pooled with the
+#   rest when the period contrast is computed.
+#
+# THE RUN IS 660 FRAMES, WHICH IS NOT A WHOLE NUMBER OF 70-MIN CYCLES. The four
+# periods have LCM 420, so a settle plus 420 or 840 post-settle minutes would
+# have given every arm whole cycles. 660 was chosen to match the standard
+# booking. 20, 30 and 60 divide the 600 post-settle minutes exactly; 70 does not
+# (8 cycles = 560, leaving a 30-min partial ninth).
+#
+#   WHAT THIS COSTS: the time-mean reference is identical across arms only over
+#   a whole number of cycles. TRUNCATE ARM 4 AT 560 MIN POST-SETTLE before
+#   computing anything integrated. Truncating mid-cycle biases the mean by up to
+#   half an excursion and biases it in one direction, since the partial ninth
+#   cycle is all low hold and rise.
+
+
+placeholders_resolved = true
+
+
+[default]
+
+# Same checkpoint as v15/v16, so the dose response and dynamics quoted above
+# were measured on cells under this exact model and rig. future_len 30,
+# cnr_mode "raw", norm_channels [cnr, u_t, n_cells_200px, optortk_expr,
+# nuc_area]. The name
+# contains no "raw" — the server logs cnr_mode at startup; trust that, not the
+# name.
+checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
+
+# The checkpoint's future_len, so it is not clamped. 30 frames = 30 real min.
+#
+# This is also what bounds the period from above. The old rule was
+# period <= 2 x horizon, which rules out the 70-min arm. The rule that actually
+# matters is weaker and is what that one was standing in for: the controller
+# must be able to SEE the next transition from anywhere inside a hold, i.e.
+#
+#     max(t_low, t_high) <= horizon
+#
+# Every arm below has holds of at most 29 min against a 30-frame horizon, so
+# from any frame of any hold the upcoming ramp is inside the lookahead and the
+# MPC can start driving before it lands. Period 70 is admissible on that rule
+# and inadmissible on the old one; the old one is the conservative special case
+# for a 50/50 two-segment waveform and is not the constraint here.
+control_horizon = 30
+
+# Unchanged from v12-v16. Every arm searches it — an arm that differed in its
+# ladder would not be comparable to the others, and the whole design here is
+# that only the period differs. The 20 ms rung earns its place in this run
+# specifically: the trough sits only 0.03-0.09 above resting, so holding it is a
+# small-dose job and a ladder whose first lit rung was 45 ms would overshoot the
+# low hold on every cycle.
+levels_ms = [0, 20, 45, 85, 150]
+
+# Held identical across all four arms, and this is structural. When arms vary
+# the controller, the reference is the property of the experiment; here the arms
+# vary the reference, so the controller, the kernel and the regularizers are
+# what must be byte-identical. Nothing below overrides any of these three.
+controller = { type = "sequence_mpc" }
+kernel = "l2"
+lambda_move = 0.0
+
+# Fallback for a field this file does not declare. v13 declared 8 and the rig
+# imaged 10, and the two undeclared fields ran the default for 3.3 h. A hold at
+# 0.91 is the common time-mean of all four waveforms (see below), so a stray
+# field lands in band and is instantly identifiable as not being any arm.
+objective = { type = "hold", target_cnr = 0.91 }
+
+
+# --- THE WAVEFORM FAMILY ----------------------------------------------------
+# One shape, four periods. Every arm has:
+#
+#   low        0.85     amplitude  0.12     rise ramp   2 min  (0.060 CNR/min)
+#   high       0.97     time-mean  0.91     fall ramp  10 min  (0.012 CNR/min)
+#
+# and the two holds absorb the whole period difference:
+#
+#   t_low = t_high = (period - 12) / 2
+#
+#   arm  period   t_low  t_rise  t_high  t_fall   settle   cycles in 600 min
+#    1     20       4      2       4      10      60 (3P)      30
+#    2     30       9      2       9      10      60 (2P)      20
+#    3     60      24      2      24      10      60 (1P)      10
+#    4     70      29      2      29      10      70 (1P)       8 + partial
+#
+# WHY THE HOLDS ARE EQUAL. With equal holds the effective high-dwell is
+# X = t_high + (t_rise + t_fall) / 2 = (period - 12)/2 + 6 = period / 2, so the
+# duty cycle is EXACTLY 0.5 for every period and the time-mean reference is
+# low + amplitude/2 = 0.91 for every arm, exactly rather than to rounding. The
+# four arms therefore deliver the same integrated reference per unit time and
+# differ only in how that integral is distributed in time. That is the same
+# integral-matching doctrine as the 40/50-min pair, obtained here for free from
+# the geometry instead of by solving for one segment.
+#
+# All durations are integer minutes, and they must stay integer. A ramp sampled
+# from its start under-counts its midpoint by A/2 and one sampled from its top
+# over-counts by A/2; rise and fall cancel exactly only when every segment
+# boundary lands on a frame boundary. A half-minute segment silently breaks the
+# duty invariant in the third decimal.
+#
+# WHY low = 0.85. Resting measured 0.745-0.823 across v16's eight sweeps, and it
+# wanders inside that band rather than trending. 0.85 clears the top of that
+# band by 0.03, so the trough stays reachable for the whole run — nothing can
+# pull a cell BELOW resting, there is no inhibitory actuator, and v14 spent half
+# its frames demanding exactly that. It is also close enough to resting that the
+# trough costs 20-45 ms, which leaves the ladder's upper rungs free for the peak.
+#
+# WHY high = 0.97. Amplitude 0.12 is six times the within-cell frame-to-frame
+# noise, so a single cell's cycle is resolvable. Going to 0.91 instead would
+# raise the fraction of cells that can hold the peak late in the run from ~42%
+# to ~55% — a poor trade, because it would halve the amplitude to 0.06 and put
+# it at three times noise. The ceiling is shallow in this range and the noise
+# floor is not.
+#
+# WHY t_fall = 10. Free decay from high to low, tau * ln((high - rest)/(low -
+# rest)) plus the dead time, at the measured tau and the WORST resting in the
+# band:
+#
+#     rest 0.79, tau 2.9   ->  2.9 * ln(0.18/0.06) = 3.2 min  + 4 dead =  7.2
+#     rest 0.82, tau 2.9   ->  2.9 * ln(0.15/0.03) = 4.7 min  + 4 dead =  8.7
+#     rest 0.75, tau 3.6   ->  3.6 * ln(0.22/0.10) = 2.8 min  + 4 dead =  6.8
+#
+# 10 min covers all three. Note this is a bound on the fall being REACHABLE, not
+# on it being demanded: a fall slower than free decay is fully controllable — the
+# controller adds light to brake it — so 10 min is a floor with margin, not a
+# target. At the 20-min period the fall is half the whole cycle, which is what
+# it costs to make a 20-min oscillation physically possible at this amplitude.
+#
+# WHY t_rise = 2 EVERYWHERE. The demanded rise slope is then identical across
+# all four arms (0.060 CNR/min), so a rise lag that differs between arms is a
+# property of the period and not of the reference. It is also far faster than
+# the cells can go — dead time alone is 3-5 min — which is deliberate: the rise
+# is dose-limited, so "how far behind did it fall" is the measurement.
+#
+# SETTLE is roughly one hour for every arm, expressed in each arm's own periods
+# because that is the only unit `oscillation` takes. Arms 1-3 get exactly 60 min
+# and arm 4 gets 70. All four start from rest with no controller history, so the
+# first cycle would otherwise mix the initial transient into the tracking
+# response. Drop the settle window in analysis; it is labelled.
+#
+# n_phase_groups = 4 on every arm. A cell's reference is offset by
+# (particle % 4) * period / 4, fixed for its lifetime. This is a nuisance
+# control, not a sweep, and it is load-bearing here: CNR falls monotonically
+# through every run of this rig, and for the 60- and 70-min arms that decline is
+# nearly aliased with the reference, so with aligned phase "the population
+# follows the reference" would be close to unfalsifiable. With four offsets any
+# global trend is common to all groups and separable from the waveform.
+#
+#   ANALYSIS MUST ALIGN ON EACH CELL'S LOGGED phase_offset_min BEFORE POOLING.
+#   The population median of a phase-grouped arm is nearly flat by construction;
+#   it is not evidence of failure to track. Per-cell reading is required anyway
+#   at this amplitude.
+#
+# ---------------------------------------------------------------------------
+# FOV LAYOUT
+#
+#   arm 1: fov 1, 6   -> mean stage position 3.5
+#   arm 2: fov 0, 7   -> mean stage position 3.5
+#   arm 3: fov 3, 4   -> mean stage position 3.5
+#   arm 4: fov 2, 5   -> mean stage position 3.5
+#
+# Every arm averages 3.5, the grand mean, so a monotone spatial gradient in
+# illumination, temperature or media depth cannot separate the arms. No two
+# adjacent fields share an arm, so a local artifact cannot take out both
+# replicates of one period.
+#
+# arm = (fov % 4) + 1 DOES NOT HOLD and neither does the mirrored 1 2 3 4 4 3 2 1
+# of policy_8fov_diverse.toml. Each [fov.N] block declares `arm` explicitly and
+# optoerk.serving.policy.arm_map() is the only reader.
+#
+# The layout is permuted relative to policy_8fov_diverse.toml on purpose: the
+# arms there were 1 2 3 4 4 3 2 1, so no field runs the same position-arm
+# pairing across the two runs. The fastest arm is deliberately NOT on fields 0
+# and 7 — it is the arm most likely to fail outright, and an edge field is the
+# worst place to put the failure you most expect to have to explain.
+# ---------------------------------------------------------------------------
+
+
+# --- ARM 1 — period 20 min (fov 1, 6) ---------------------------------------
+# The shortest period, and the one this run exists to reach. 8 min of lag
+# against a 20-min period is 145 degrees, so nothing that reacts to the current
+# error can track this; only the 30-frame lookahead can. Expect large phase lag
+# and attenuated amplitude, and expect the attenuation to be the result rather
+# than a fault. 30 cycles in the post-settle window, so the per-cell amplitude
+# estimate is well averaged even for short tracks.
+
+[fov.1]
+arm = 1
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 4, t_rise_min = 2, t_high_min = 4, t_fall_min = 10, settle_periods = 3.0, n_phase_groups = 4 }
+
+[fov.6]
+arm = 1
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 4, t_rise_min = 2, t_high_min = 4, t_fall_min = 10, settle_periods = 3.0, n_phase_groups = 4 }
+
+
+# --- ARM 2 — period 30 min (fov 0, 7) ---------------------------------------
+# Period equals the control horizon, so the controller sees exactly one cycle
+# ahead. This is the arm nearest the old period <= 2 x horizon doctrine's
+# comfortable middle, and it is the reference point the other three are read
+# against. 20 cycles.
+
+[fov.0]
+arm = 2
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 9, t_rise_min = 2, t_high_min = 9, t_fall_min = 10, settle_periods = 2.0, n_phase_groups = 4 }
+
+[fov.7]
+arm = 2
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 9, t_rise_min = 2, t_high_min = 9, t_fall_min = 10, settle_periods = 2.0, n_phase_groups = 4 }
+
+
+# --- ARM 3 — period 60 min (fov 3, 4) ---------------------------------------
+# 24-min holds against ~8 min of lag, so each hold is long enough to actually
+# settle. This is the arm where tracking should be easy and where a tracking
+# failure means something other than bandwidth — most likely the peak clipping
+# discussed above, since a long high hold is where sustained authority is tested
+# hardest. 10 cycles.
+
+[fov.3]
+arm = 3
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 24, t_rise_min = 2, t_high_min = 24, t_fall_min = 10, settle_periods = 1.0, n_phase_groups = 4 }
+
+[fov.4]
+arm = 3
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 24, t_rise_min = 2, t_high_min = 24, t_fall_min = 10, settle_periods = 1.0, n_phase_groups = 4 }
+
+
+# --- ARM 4 — period 70 min (fov 2, 5) ---------------------------------------
+# The slow end. 29-min holds, one minute inside the horizon, so the ramps are
+# only just visible from the far end of a hold — this arm is the one that tests
+# the relaxed horizon rule stated above, and if the rises here start later
+# relative to the reference than arm 3's do, that rule is where to look.
+#
+# Only 8 whole cycles fit in the post-settle window and a partial ninth is
+# acquired. Truncate at 560 min post-settle for anything integrated.
+
+[fov.2]
+arm = 4
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 29, t_rise_min = 2, t_high_min = 29, t_fall_min = 10, settle_periods = 1.0, n_phase_groups = 4 }
+
+[fov.5]
+arm = 4
+objective = { type = "oscillation", low = 0.85, high = 0.97, t_low_min = 29, t_rise_min = 2, t_high_min = 29, t_fall_min = 10, settle_periods = 1.0, n_phase_groups = 4 }
+
+
+# --- BEFORE THE RUN ---------------------------------------------------------
+# 1. Cadence, at 8 fields, measured — not assumed. v16's round was 53.5 s of the
+#    60 s budget with the sweep eroding from 7.19 to 7.64 s per field over 12 h,
+#    so the margin is about 11% and it shrinks. Every waveform here is written
+#    for 1 frame = 1 minute and there is no longer a knob that absorbs a slip.
+#    If the round exceeds ~55 s, cut to 4 fields (one per period) rather than
+#    starting and hoping, which is what v13 and v14 both did after their alarm
+#    had already fired.
+#
+#    The server's cadence check is ONE-SHOT: it fires once near timestep 50 and
+#    never again. v15 lost 8 h to a 3.5x slip that started at timestep 371 and
+#    produced no event. Watch the round time yourself past the first hour.
+#
+# 2. Confirm the rig is set to 8 fields, and confirm which acquisition frame
+#    control starts on. Everything in this file is clocked on control_frame, and
+#    the analysis of v16 above only came out right once the 16-frame offset was
+#    applied.
+#
+# 3. Cell density drives serving latency far more than the model does: v16's
+#    68-124 cells/FOV took handler latency to 1.76 s median against v15's 0.62 s
+#    at 14-46 cells. Soak at a realistic density, not an hour-0 one. If the
+#    budget is tight, sequence_mpc n_samples 512 -> 256 is the cheapest lever and
+#    costs nothing this design depends on.
+#
+# 4. Run the pre-flight on this file (experiments/policy_preflight.py) and check
+#    section 1 against tau = 3 min rather than the 7.3 the notebook still
+#    defaults to. Its REST constant is 0.82, from a different checkpoint; this
+#    one rests at 0.78-0.82.
+#
+# 5. All four waveforms are worth plotting before the run. The duty cycle should
+#    come out at exactly 0.500 and the time-mean at exactly 0.910 for all four.
+#
+#
+# --- READING THE RESULTS ----------------------------------------------------
+# 1. The unit of replication is the field, n = 2 per period. Cells in a field
+#    share its arm, its light and its position. Report per-field values and use
+#    field as a random effect; a per-cell p-value is wrong by roughly the number
+#    of cells per field.
+#
+# 2. Align every cell on its own phase_offset_min before pooling within an arm,
+#    and group on control_frame, never on wall clock or on timestep.
+#
+# 3. Drop each arm's settle window. It is 60 min for arms 1-3 and 70 for arm 4,
+#    so a single shared cutoff is wrong; use the labelled window.
+#
+# 4. The primary measurement is achieved amplitude and phase lag per cell per
+#    period, against the reference the cell was actually served (logged r_t).
+#    The expected shape is a low-pass roll-off: full amplitude at 60-70 min,
+#    partial at 30, heavily attenuated at 20. A flat profile across periods
+#    would mean the controller is not bandwidth-limited at all, which given ~8
+#    min of measured lag would be the surprising result.
+#
+# 5. Censor before comparing. A cell at the 150 ms rung for most of its high
+#    holds has a clipped amplitude, not a tracked one. Report the censored
+#    fraction per arm per third of the run alongside every amplitude number —
+#    it will rise through the run as the gain collapses, and it will rise fastest
+#    on the arms with the longest high holds.
+#
+# 6. Truncate arm 4 at 560 min post-settle for any integrated quantity.
+#
+# 7. The time-mean reference is 0.910 for every arm over whole cycles. If the
+#    achieved time-mean differs between arms, that is the low-pass hypothesis
+#    failing — the same contrast the 40/50-min pair was built for, here across
+#    four frequencies instead of two.
+#
+# 8. Report total delivered light per arm next to every tracking number. Equal
+#    reference integrals do not imply equal dose integrals, and the fast arm
+#    will spend the most.
+#
+#
+# --- KNOWN PROBLEMS ---------------------------------------------------------
+# 1. The peak clips for roughly half the population in the last third. This is
+#    the accepted cost of holding the ladder at 150 ms; see the choices block.
+#
+# 2. Every FOV is a closed-loop oscillation, so there is no open-loop dose probe
+#    and no live resting measurement in this run. v14, v15 and v16 all leaned on
+#    arm 1's 0 ms rung to read resting and the gain collapse, and every number in
+#    this file's provenance block came from exactly that arm in v16. Nothing here
+#    can measure whether the gain collapses the same way this time.
+#
+#    The 4 x 2 layout was specified, so this is a stated cost rather than an
+#    oversight. If it turns out to matter more than a second replicate, the
+#    cheapest fix is to give up one replicate of arm 3 (the slow arm is the one
+#    whose amplitude estimate degrades least from n = 1) and run fov 4 as
+#    policy_8fov_diverse.toml's arm 1 open-loop probe on the wider ladder.
+#
+# 3. tau = 3 min and the 3-5 min dead time are single-run measurements from one
+#    plate on one day. They set t_fall and they set the expectation that the
+#    20-min arm is near the limit rather than past it. A plate that is slower
+#    than v16's moves the roll-off knee down and the fast arm stops being
+#    informative.
+#
+# 4. The model is close to persistence at one step (v16 h1 MAE ratios 0.86-1.00),
+#    but h1 is the wrong gate for a 30-step planner — offline its margin over
+#    persistence GROWS with lead time. This run leans hard on the lookahead,
+#    since arm 1 is untrackable without it, so it is also the first real test of
+#    whether the multi-step prediction is worth anything in closed loop. The
+#    serving log carries only pred_cnr_h1; reconstruct the multi-step predictions
+#    offline from tracks/ before judging that.
