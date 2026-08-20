@@ -319,6 +319,7 @@ def _(Path, results_write_path):
         bundle,
         collate_history,
         evaluate,
+        load_experiment,
         load_history_tracks,
         make_split,
         mcfg,
@@ -2399,13 +2400,798 @@ def _(alt, fluence_quad, np, pl, replication_fluence):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## FIG:  What's the diversity of intervention for a single objective?
+
+    How to measure?
+    - take raw time series, plot agains each other, see if there are areas of higher-lower density?
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(CAL_RUN, np, parse_arm):
+    # Arm 2 of v16: `sequence_mpc` holding one constant target (1.2) for every cell.
+    # One objective, one model, one dose ladder — so any difference between what two
+    # cells are commanded is the controller choosing differently for them.
+    DIV_FOVS = (1, 6)
+    DIV_MIN_FRAMES = 240      # cells followed long enough to have a trajectory
+
+    div_df, DIV_T0, div_startup = parse_arm(CAL_RUN, DIV_FOVS)
+
+    # The commanded dose, in delivered fluence rather than exposure time — the log
+    # carries `fluence_out`, and it is a fixed multiple of the exposure. The rungs are
+    # read off the data instead of hardcoded, so they cannot drift from the policy.
+    DIV_LEVELS = np.array(sorted(div_df["fluence_out"].unique().to_list()))
+
+
+    def div_matrix(df, n_frames):
+        """(cells x frames) of commanded dose, for cells present from the first frame."""
+        rows, keys = [], []
+        for (fov, particle), g in df.sort("control_frame").group_by(
+                ["fov", "particle"], maintain_order=True):
+            cf = g["control_frame"].to_numpy()
+            if cf[0] != 0 or len(cf) < n_frames or not np.all(np.diff(cf[:n_frames]) == 1):
+                continue
+            rows.append(g["fluence_out"].to_numpy()[:n_frames].astype(np.float32))
+            keys.append((fov, particle))
+        return np.array(rows), keys
+
+
+    div_dose, div_keys = div_matrix(div_df, DIV_MIN_FRAMES)
+    _idx = np.abs(div_dose[..., None] - DIV_LEVELS[None, None, :]).argmin(axis=-1)
+
+    # How often is a cell given something other than what most cells get on that
+    # frame? Zero would mean the per-cell machinery is doing nothing a single
+    # population-wide command could not do.
+    _mode = np.array([np.bincount(_idx[:, t], minlength=len(DIV_LEVELS)).argmax()
+                      for t in range(div_dose.shape[1])])
+    div_off_mode = (_idx != _mode[None, :]).mean(axis=0)
+
+    # Spread of commands across cells at each frame, in bits. 0 = everyone identical.
+    _p = np.stack([(_idx == k).mean(axis=0) for k in range(len(DIV_LEVELS))])
+    div_entropy = -(np.where(_p > 0, _p * np.log2(np.maximum(_p, 1e-12)), 0.0)).sum(axis=0)
+    div_level_frac = _p
+
+    {"cells": div_dose.shape[0], "frames": div_dose.shape[1],
+     "levels_mJ_cm2": [round(v, 2) for v in DIV_LEVELS],
+     "mean_off_mode": float(div_off_mode.mean()),
+     "mean_entropy_bits": float(div_entropy.mean()),
+     "max_bits": float(np.log2(len(DIV_LEVELS))),
+     "mean_dose": float(div_dose.mean())}
+    return (
+        DIV_LEVELS,
+        div_dose,
+        div_entropy,
+        div_level_frac,
+        div_matrix,
+        div_off_mode,
+    )
+
+
+@app.cell(hide_code=True)
+def _(Path, json, pl):
+    # Every arm of the two runs that held 1.000 min/frame. Static, so the figure is
+    # reproducible; the dropdown below only chooses which one to draw in detail.
+    #
+    # The open-loop arms are the null: one predetermined dose for every cell, so their
+    # diversity is zero by construction and they set the floor the closed-loop arms are
+    # read against.
+    DIV_RUNS = {
+        "v15": Path("/Volumes/imaging.data/mic01-imaging/314lipczuk/"
+                    "2026-08-07_InferenceCNRhold_12h_v15/run15.jsonl"),
+        "v16": Path("/Volumes/imaging.data/mic01-imaging/314lipczuk/"
+                    "2026-08-07_InferenceCNRhold_12h_v16/run16.jsonl"),
+    }
+
+
+    def arm_table(path):
+        """(arm, controller, reference, FOVs) for one run, from its startup record."""
+        with open(path) as f:
+            fp = json.loads(f.readline())["policies"]["fov"]
+        by_arm = {}
+        for k, v in fp.items():
+            arm = (v.get("requested") or {}).get("arm")
+            ref = (v.get("objective", {}).get("reference", {}) or {}).get("type")
+            key = (arm, v["controller"]["type"], ref)
+            by_arm.setdefault(key, []).append(int(k))
+        return by_arm
+
+
+    div_registry = []
+    for run, path in DIV_RUNS.items():
+        for (arm, controller, ref), fovs in sorted(arm_table(path).items()):
+            div_registry.append({"run": run, "arm": arm, "controller": controller,
+                                 "reference": ref, "fovs": tuple(sorted(fovs)),
+                                 "label": f"{run} arm {arm} · {controller} · {ref}"})
+
+    pl.DataFrame([{k: (str(v) if k == "fovs" else v) for k, v in r.items()}
+                  for r in div_registry])
+    return DIV_RUNS, div_registry
+
+
+@app.cell(hide_code=True)
+def _(DIV_RUNS, div_matrix, div_registry, np, parse_arm, pl):
+    DIV_FRAMES = 240        # common window, so arms are compared over the same span
+
+
+    def diversity_of(run, fovs, n_frames=DIV_FRAMES):
+        """Dose matrix and diversity metrics for one arm."""
+        df, _t0, _s = parse_arm(DIV_RUNS[run], fovs)
+        dose, keys = div_matrix(df, n_frames)
+        if len(dose) < 20:
+            return None
+        levels = np.array(sorted(df["fluence_out"].unique().to_list()))
+        idx = np.abs(dose[..., None] - levels[None, None, :]).argmin(axis=-1)
+        mode = np.array([np.bincount(idx[:, t], minlength=len(levels)).argmax()
+                         for t in range(dose.shape[1])])
+        off_mode = (idx != mode[None, :]).mean(axis=0)
+        p = np.stack([(idx == k).mean(axis=0) for k in range(len(levels))])
+        ent = -(np.where(p > 0, p * np.log2(np.maximum(p, 1e-12)), 0.0)).sum(axis=0)
+        return {"dose": dose, "levels": levels, "level_frac": p,
+                "off_mode": off_mode, "entropy": ent, "n": len(dose)}
+
+
+    div_by_arm = {}
+    for _r in div_registry:
+        _res = diversity_of(_r["run"], _r["fovs"])
+        if _res is not None:
+            div_by_arm[_r["label"]] = {**_r, **_res}
+
+    diversity_summary = pl.DataFrame([
+        {"label": k, "run": v["run"], "controller": v["controller"],
+         "reference": v["reference"], "n_cells": v["n"],
+         "off_mode": float(v["off_mode"].mean()),
+         "entropy_bits": float(v["entropy"].mean()),
+         "top_rung_share": float(v["level_frac"][-1].mean()),
+         "dose_spread": float(v["dose"].sum(axis=1).std() / max(v["dose"].sum(axis=1).mean(), 1e-9))}
+        for k, v in div_by_arm.items()
+    ]).sort(["controller", "reference", "run"])
+    diversity_summary
+    return div_by_arm, diversity_summary
+
+
+@app.cell(hide_code=True)
+def _(
+    GRID,
+    MUTED,
+    SERIES,
+    div_by_arm,
+    diversity_summary,
+    mpl,
+    np,
+    plt,
+    save_fig,
+):
+    DIV_SHORT = {"constant": "hold a level", "schedule": "follow a schedule",
+                 "frequency_staircase": "oscillate, period stepping down"}
+    DIV_RUN_COLOUR = {"v15": SERIES[0], "v16": SERIES[1]}
+
+
+    def _div_order():
+        """Open loop first, as the zero reference, then the closed-loop objectives."""
+        rows = diversity_summary.to_dicts()
+        rows.sort(key=lambda r: (r["controller"] != "open_loop", r["reference"], r["run"]))
+        return rows
+
+
+    def _panel_div_bars(ax):
+        """(a) How much the commands differ between cells, arm by arm."""
+        rows = _div_order()
+        y = np.arange(len(rows))
+        ax.barh(y, [r["entropy_bits"] for r in rows],
+                color=[DIV_RUN_COLOUR[r["run"]] for r in rows], height=0.7)
+        labs = [f"{r['run']}  {'no feedback' if r['controller'] == 'open_loop' else DIV_SHORT.get(r['reference'], r['reference'])}"
+                for r in rows]
+        ax.set_yticks(y, labs, fontsize=7.5)
+        for yi, r in zip(y, rows):
+            ax.text(r["entropy_bits"] + 0.03, yi, f"n={r['n_cells']}", va="center",
+                    fontsize=6.5, color=MUTED)
+        ax.axvline(0, color=MUTED, lw=1.0)
+        ax.set_xlabel("spread of commands across cells (bits)")
+        ax.set_xlim(0, 2.4)
+        ax.set_title("a  One objective, how many different things does it do?",
+                     loc="left", fontweight="bold")
+        ax.tick_params(axis="y", length=0)
+        ax.xaxis.grid(True, color=GRID, lw=0.6)
+        ax.set_axisbelow(True)
+        ax.text(0.98, 0.06, "no feedback = one dose for every cell, so zero by construction",
+                transform=ax.transAxes, ha="right", fontsize=6.5, color=MUTED)
+
+
+    DIV_MARKER = {"constant": "o", "schedule": "s", "frequency_staircase": "^"}
+
+
+    def _panel_div_saturation(ax):
+        """(b) Why some arms have less to choose from.
+
+        Nothing to differentiate WITH once the controller is pinned at the top of the
+        ladder: at the ceiling there is only one command available.
+        """
+        for r in diversity_summary.to_dicts():
+            if r["controller"] == "open_loop":
+                continue
+            ax.plot(r["top_rung_share"], r["entropy_bits"],
+                    DIV_MARKER.get(r["reference"], "o"), ms=9,
+                    color=DIV_RUN_COLOUR[r["run"]])
+
+        handles = ([mpl.lines.Line2D([], [], ls="", marker=m, ms=8, color=MUTED,
+                                     label=DIV_SHORT[k]) for k, m in DIV_MARKER.items()]
+                   + [mpl.lines.Line2D([], [], ls="", marker="o", ms=8,
+                                       color=c, label=run)
+                      for run, c in DIV_RUN_COLOUR.items()])
+        ax.legend(handles=handles, frameon=False, fontsize=6.5, loc="lower left", ncol=1)
+        ax.set_xlabel("share of commands at the highest dose")
+        ax.set_ylabel("spread of commands (bits)")
+        ax.set_title("b  A saturated controller cannot differentiate",
+                     loc="left", fontweight="bold")
+        ax.set_xlim(0.2, 0.85)
+        ax.set_ylim(1.15, 2.0)
+        ax.yaxis.grid(True, color=GRID, lw=0.6)
+        ax.set_axisbelow(True)
+
+    def _panel_div_time(ax):
+        """(c) Diversity is not a constant of the objective.
+
+        The one arm that collapses is the one that ends up pinned at the top rung; the
+        oscillating arms rise and fall with their own reference, differentiating when
+        it demands a change and converging while it holds.
+        """
+        for r in diversity_summary.to_dicts():
+            if r["controller"] == "open_loop":
+                continue
+            v = div_by_arm[r["label"]]
+            ax.plot(np.convolve(v["off_mode"], np.ones(9) / 9, mode="valid"),
+                    lw=1.6, color=DIV_RUN_COLOUR[r["run"]],
+                    ls={"constant": "-", "schedule": "--",
+                        "frequency_staircase": ":"}[r["reference"]])
+        ax.set_xlabel("control frame (min)")
+        ax.set_ylabel("share of cells off the\nmajority command")
+        ax.set_ylim(0, 0.75)
+        ax.set_title("c  Not a constant of the objective", loc="left", fontweight="bold")
+        ax.annotate("the arm that ends up\npinned at the top rung",
+                    xy=(200, 0.15), xytext=(95, 0.045), fontsize=6.5, color=MUTED,
+                    arrowprops=dict(arrowstyle="->", color=MUTED, lw=0.8))
+        ax.text(0.98, 0.97, "line style = objective, colour = run\n(legend in b)",
+                transform=ax.transAxes, ha="right", va="top", fontsize=6.5, color=MUTED)
+        ax.yaxis.grid(True, color=GRID, lw=0.6)
+        ax.set_axisbelow(True)
+
+    fig_divsum = plt.figure(figsize=(9.8, 6.6))
+    _gv = fig_divsum.add_gridspec(2, 2, height_ratios=[1.0, 0.9], hspace=0.5, wspace=0.3,
+                                  left=0.26, right=0.97, top=0.93, bottom=0.1)
+    _panel_div_bars(fig_divsum.add_subplot(_gv[0, :]))
+    _panel_div_saturation(fig_divsum.add_subplot(_gv[1, 0]))
+    _panel_div_time(fig_divsum.add_subplot(_gv[1, 1]))
+    save_fig(fig_divsum, "fig14_intervention_diversity_by_objective")
+    fig_divsum
+    return
+
+
+@app.cell(hide_code=True)
+def _(div_by_arm, mo):
+    div_choice = mo.ui.dropdown(
+        options=list(div_by_arm),
+        value=next(k for k in div_by_arm if "v16 arm 2" in k),
+        label="Show in detail:",
+        full_width=True,
+    )
+    div_choice
+    return (div_choice,)
+
+
+@app.cell(hide_code=True)
+def _(INK, div_by_arm, div_choice, np, plt):
+    _sel = div_by_arm[div_choice.value]
+    _dose, _levels, _frac = _sel["dose"], _sel["levels"], _sel["level_frac"]
+
+    _centred = _dose - _dose.mean(axis=0, keepdims=True)
+    _uu, _ss, _ = np.linalg.svd(_centred, full_matrices=False)
+    _pcs, _var = _uu[:, :2] * _ss[:2], (_ss ** 2 / (_ss ** 2).sum())[:2]
+
+
+    def _panel_sel_heatmap(ax):
+        order = np.argsort(_dose.sum(axis=1))
+        im = ax.imshow(_dose[order], aspect="auto", origin="lower", cmap="magma",
+                       interpolation="nearest",
+                       extent=(0, _dose.shape[1], 0, _dose.shape[0]))
+        ax.set_xlabel("control frame (min)")
+        ax.set_ylabel(f"cells, sorted by total dose  (n = {_dose.shape[0]})")
+        ax.set_yticks([])
+        ax.set_title("a  What each cell was told to do", loc="left", fontweight="bold")
+        cb = ax.figure.colorbar(im, ax=ax, pad=0.02, fraction=0.045)
+        cb.set_label("commanded dose (mJ/cm²)", fontsize=7)
+        cb.ax.tick_params(labelsize=7)
+
+
+    def _panel_sel_levels(ax):
+        cmap = plt.cm.magma
+        ax.stackplot(np.arange(_dose.shape[1]), _frac,
+                     colors=[cmap(0.12 + 0.78 * i / max(len(_levels) - 1, 1))
+                             for i in range(len(_levels))],
+                     labels=[f"{v:.0f}" for v in _levels])
+        ax.set_xlim(0, _dose.shape[1]); ax.set_ylim(0, 1)
+        ax.set_xlabel("control frame (min)")
+        ax.set_ylabel("share of cells")
+        ax.set_title("b  Which rung the cells are on", loc="left", fontweight="bold")
+        leg = ax.legend(frameon=False, fontsize=6.5, ncol=5, loc="upper center",
+                        bbox_to_anchor=(0.5, -0.22), title="commanded dose (mJ/cm²)")
+        leg.get_title().set_fontsize(6.5)
+
+
+    def _panel_sel_density(ax):
+        ax.hexbin(_pcs[:, 0], _pcs[:, 1], gridsize=22, cmap="Blues", mincnt=1, linewidths=0)
+        ax.plot(_pcs[:, 0], _pcs[:, 1], "o", ms=2.5, color=INK, alpha=0.35)
+        ax.set_xlabel(f"dose-sequence component 1  ({_var[0]:.0%} of variance)")
+        ax.set_ylabel(f"component 2  ({_var[1]:.0%})")
+        ax.set_title("c  Are there distinct strategies?", loc="left", fontweight="bold")
+        ax.text(0.03, 0.96,
+                f"{_sel['off_mode'].mean():.0%} of cells off the majority command\n"
+                f"{_sel['entropy'].mean():.2f} of {np.log2(len(_levels)):.2f} bits of spread",
+                transform=ax.transAxes, va="top", fontsize=7, color=INK)
+
+
+    fig_divdetail = plt.figure(figsize=(9.8, 6.8))
+    _gd = fig_divdetail.add_gridspec(2, 2, height_ratios=[1.0, 0.95], hspace=0.48,
+                                     wspace=0.3, left=0.085, right=0.97, top=0.90,
+                                     bottom=0.14)
+    fig_divdetail.suptitle(div_choice.value, fontsize=9, y=0.97)
+    _panel_sel_heatmap(fig_divdetail.add_subplot(_gd[0, :]))
+    _panel_sel_levels(fig_divdetail.add_subplot(_gd[1, 0]))
+    _panel_sel_density(fig_divdetail.add_subplot(_gd[1, 1]))
+    fig_divdetail
+    return
+
+
+@app.cell(hide_code=True)
+def _(
+    DIV_LEVELS,
+    INK,
+    MUTED,
+    div_dose,
+    div_entropy,
+    div_level_frac,
+    div_off_mode,
+    np,
+    plt,
+    save_fig,
+):
+    # Two dimensions of the dose sequences, to answer the density question directly:
+    # if the controller had a few distinct strategies the cells would fall into
+    # separate clumps; if it is really tuning per cell they lie on a continuum.
+    _centred = div_dose - div_dose.mean(axis=0, keepdims=True)
+    _u, _s, _vt = np.linalg.svd(_centred, full_matrices=False)
+    div_pcs = _u[:, :2] * _s[:2]
+    div_var = (_s ** 2 / (_s ** 2).sum())[:2]
+
+
+    def _panel_div_heatmap(ax):
+        """(a) Every cell's commanded dose, sorted by how much it received in total."""
+        order = np.argsort(div_dose.sum(axis=1))
+        im = ax.imshow(div_dose[order], aspect="auto", origin="lower", cmap="magma",
+                       interpolation="nearest",
+                       extent=(0, div_dose.shape[1], 0, div_dose.shape[0]))
+        ax.set_xlabel("control frame (min)")
+        ax.set_ylabel(f"cells, sorted by total dose  (n = {div_dose.shape[0]})")
+        ax.set_yticks([])
+        ax.set_title("a  What each cell was told to do", loc="left", fontweight="bold")
+        ax.text(0.99, 0.03, "pale = the maximum rung", transform=ax.transAxes,
+                ha="right", fontsize=6.5, color=MUTED)
+        cb = ax.figure.colorbar(im, ax=ax, pad=0.02, fraction=0.045)
+        cb.set_label("commanded dose (mJ/cm²)", fontsize=7)
+        cb.ax.tick_params(labelsize=7)
+
+
+    def _panel_div_levels(ax):
+        """(b) How the population is split across the ladder, frame by frame."""
+        t = np.arange(div_dose.shape[1])
+        cmap = plt.cm.magma
+        ax.stackplot(t, div_level_frac,
+                     colors=[cmap(0.12 + 0.78 * i / (len(DIV_LEVELS) - 1))
+                             for i in range(len(DIV_LEVELS))],
+                     labels=[f"{v:.0f}" for v in DIV_LEVELS])
+        ax.set_xlim(0, div_dose.shape[1])
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("control frame (min)")
+        ax.set_ylabel("share of cells")
+        ax.set_title("b  Choice narrows as the run goes on", loc="left", fontweight="bold")
+        leg = ax.legend(frameon=False, fontsize=6.5, ncol=5, loc="upper center",
+                        bbox_to_anchor=(0.5, -0.22), title="commanded dose (mJ/cm²)")
+        leg.get_title().set_fontsize(6.5)
+        ax.text(0.98, 0.93,
+                f"top rung carries {div_level_frac[-1].mean():.0%}\nof all commands",
+                transform=ax.transAxes, va="top", ha="right", fontsize=7, color="white")
+
+
+    def _panel_div_density(ax):
+        """(c) Are there distinct strategies, or one continuum?"""
+        ax.hexbin(div_pcs[:, 0], div_pcs[:, 1], gridsize=22, cmap="Blues", mincnt=1,
+                  linewidths=0)
+        ax.plot(div_pcs[:, 0], div_pcs[:, 1], "o", ms=2.5, color=INK, alpha=0.35)
+        ax.set_xlabel(f"dose-sequence component 1  ({div_var[0]:.0%} of variance)")
+        ax.set_ylabel(f"component 2  ({div_var[1]:.0%})")
+        ax.set_title("c  A dense core and a thin tail", loc="left", fontweight="bold")
+        ax.text(0.03, 0.96,
+                f"at a typical frame {div_off_mode.mean():.0%} of cells are given\n"
+                f"something other than the majority command\n"
+                f"spread across cells: {div_entropy.mean():.2f} of "
+                f"{np.log2(len(DIV_LEVELS)):.2f} bits",
+                transform=ax.transAxes, va="top", fontsize=7, color=INK)
+
+
+    fig_div = plt.figure(figsize=(9.8, 6.8))
+    _gsd = fig_div.add_gridspec(2, 2, height_ratios=[1.0, 0.95], hspace=0.48, wspace=0.3,
+                                left=0.085, right=0.97, top=0.93, bottom=0.14)
+    _panel_div_heatmap(fig_div.add_subplot(_gsd[0, :]))
+    _panel_div_levels(fig_div.add_subplot(_gsd[1, 0]))
+    _panel_div_density(fig_div.add_subplot(_gsd[1, 1]))
+    save_fig(fig_div, "fig14_intervention_diversity")
+    fig_div
+    return
+
+
 @app.cell
-def _():
+def _(df):
+    df
     return
 
 
 @app.cell
 def _():
+
+
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    ## Does giving every cell the same light let the model tell them apart?
+
+    `v16` arm 1 (FOVs 0 and 7) delivered a fixed sequence of light steps —
+    18 minutes each at 0, 300, 85, 600 and 150 ms exposure, repeating — the same
+    for every cell, with no feedback. The server ran throughout, so the model saw
+    each cell's response as it happened.
+
+    Because every cell received identical light, anything the model predicts
+    differently between cells must come from what it saw of that cell's own past.
+    The future light it is given carries no information about which cell it is.
+
+    Two starting points, each with the same amount of the past to read:
+
+    | forecast starts at | the 18 minutes before it | what the model can know |
+    |---|---|---|
+    | control frame 18 | the light was off | this cell's resting level |
+    | control frame 36 | the light was on at 300 ms | how strongly it responds |
+
+    Matching the length of those two stretches is what makes the comparison mean
+    something: otherwise simply having more of the past to read would explain any
+    improvement, and this would only repeat Figure 10.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(Path, pl):
+    import json
+    from collections import defaultdict
+
+    CAL_RUN = Path("/Volumes/imaging.data/mic01-imaging/314lipczuk/"
+                   "2026-08-07_InferenceCNRhold_12h_v16/run16.jsonl")
+    CAL_FOVS = (0, 7)          # arm 1 — a fixed sequence of light steps, no feedback
+    CAL_RUNG = 18              # frames per rung
+
+
+    def parse_arm(path, fovs):
+        """Per-cell-per-frame records for selected FOVs, plus the control-frame offset.
+
+        `control_frame = timestep - first_controlled_timestep`. The waveform and the
+        rung labels are clocked from the first controlled frame, not from faro's
+        timestep, which starts wherever earlier acquisition phases left off.
+        """
+        keep = ("raw_cnr", "u_t_in", "fluence_out", "n_cells_200px",
+                "optortk_expr", "nuc_area", "pred_cnr_h1")
+        rows = defaultdict(list)
+        with open(path) as f:
+            startup = json.loads(f.readline())
+            for line in f:
+                if '"predict"' not in line:
+                    continue
+                r = json.loads(line)
+                if r.get("event") != "predict" or r.get("fov") not in fovs:
+                    continue
+                for c in r.get("cells") or []:
+                    rows["fov"].append(r["fov"])
+                    rows["timestep"].append(r["timestep"])
+                    rows["particle"].append(c["particle"])
+                    for k in keep:
+                        rows[k].append(c.get(k))
+        df = pl.DataFrame(rows)
+        t0 = int(df["timestep"].min())
+        return df.with_columns((pl.col("timestep") - t0).alias("control_frame")), t0, startup
+
+
+    cal_df, CAL_T0, cal_startup = parse_arm(CAL_RUN, CAL_FOVS)
+    CAL_CHECKPOINT = cal_startup["policies"]["default"]["checkpoint_dir"]
+
+    # Which light step is which, to confirm they land where the policy file says.
+    _rungs = (
+        cal_df.with_columns((pl.col("control_frame") // CAL_RUNG).alias("rung"))
+        .group_by("rung").agg(pl.col("fluence_out").median().alias("fluence"),
+                              pl.col("control_frame").min().alias("from"),
+                              pl.col("control_frame").max().alias("to"))
+        .sort("rung").head(6)
+    )
+    {"rows": cal_df.height, "cells": cal_df.select(["fov", "particle"]).n_unique(),
+     "first_controlled_timestep": CAL_T0, "checkpoint": CAL_CHECKPOINT,
+     "first_rungs": _rungs.to_dicts()}
+    return CAL_CHECKPOINT, CAL_RUN, cal_df, json, parse_arm
+
+
+@app.cell(hide_code=True)
+def _(
+    CAL_CHECKPOINT,
+    Path,
+    cal_df,
+    load_experiment,
+    np,
+    pl,
+    predict_many,
+    results_write_path,
+    spearmanr,
+):
+    cal_bundle = load_experiment(str(Path(results_write_path()) / CAL_CHECKPOINT))
+    cal_model = cal_bundle.reconstruct_model()
+    ccfg = cal_model.cfg
+    CAL_FEATURES = [c for c in ccfg.norm_channels if c != "cnr"]
+
+    CAL_START_AFTER_DARKNESS = 18      # context = the 0 ms rung
+    CAL_START_AFTER_LIGHT = 36     # context = the 300 ms rung and its response
+    CAL_CTX = 18              # equal-length stretches of the past: one rung each
+    CAL_ORIGINS = [36, 54, 72, 90]   # starts of successive light steps
+    CAL_LAST_ORIGIN = 90
+
+
+    def cal_tracks():
+        """Cells present and contiguous from control frame 0 through the second origin."""
+        # Long enough for every origin tested below to have a FULL horizon. A short
+        # tail silently shortens the forecast instead of failing, which would make
+        # origins incomparable to each other.
+        need = CAL_LAST_ORIGIN + ccfg.future_len
+        out = []
+        for (fov, particle), g in cal_df.sort("control_frame").group_by(
+                ["fov", "particle"], maintain_order=True):
+            cf = g["control_frame"].to_numpy()
+            if cf[0] != 0 or len(cf) < need or not np.all(np.diff(cf[:need]) == 1):
+                continue
+            out.append({"fov": fov, "particle": particle,
+                        "cnr": g["raw_cnr"].to_numpy()[:need].astype(np.float32),
+                        **{k: g[{"u_t": "u_t_in"}.get(k, k)].to_numpy()[:need].astype(np.float32)
+                           for k in CAL_FEATURES}})
+        return out
+
+
+    cal_cells = cal_tracks()
+
+
+    def cal_forecast(origin, cap):
+        """Predicted mean, sigma and truth over the horizon, for every cell, at one origin."""
+        means, sigmas, truths = [], [], []
+        for tr in cal_cells:
+            chans = {k: tr[k] for k in CAL_FEATURES}
+            m, s = predict_many(cal_model, tr["cnr"], chans["u_t"], [origin],
+                                channels=chans, cap=cap)
+            means.append(m[0]); sigmas.append(s[0])
+            truths.append(tr["cnr"][origin:origin + ccfg.future_len])
+        return np.array(means), np.array(sigmas), np.array(truths)
+
+
+    def cal_metrics(origin, cap):
+        """Sharpening, differentiation, and accuracy at one origin.
+
+        Every cell in this arm receives the SAME dose, so the decoder's future input
+        carries no cell-specific information: the spread of predicted means is
+        produced entirely by the encoder's view of each cell's past. A model that
+        cannot tell the cells apart would predict the same trajectory for all of them
+        and `pred_spread` would be zero.
+        """
+        m, s, t = cal_forecast(origin, cap)
+        pm, tm = m.mean(axis=1), t.mean(axis=1)
+        return {
+            "origin": origin, "cap": cap, "n": len(m),
+            "sigma_mean": float(s.mean()),
+            "pred_spread": float(pm.std()),
+            "true_spread": float(tm.std()),
+            "corr_pred_true": float(spearmanr(pm, tm).statistic),
+            "mae": float(np.abs(m - t).mean()),
+        }
+
+
+    calibration = pl.DataFrame([
+        cal_metrics(CAL_START_AFTER_DARKNESS, CAL_CTX),
+        cal_metrics(CAL_START_AFTER_LIGHT, CAL_CTX),
+    ])
+    calibration
+    return (
+        CAL_CTX,
+        CAL_ORIGINS,
+        CAL_START_AFTER_LIGHT,
+        cal_cells,
+        cal_forecast,
+        cal_metrics,
+    )
+
+
+@app.cell(hide_code=True)
+def _(CAL_START_AFTER_LIGHT, cal_metrics, pl):
+    # How many minutes of the light response does the model need?
+    #
+    # The two-origin comparison above has one weakness: the origins forecast
+    # DIFFERENT future windows (the 300 ms rung vs the 85 ms rung), so part of the
+    # improvement could be that the second window is easier to predict. Holding the
+    # origin fixed at 36 and varying only how far back the encoder may read removes
+    # that entirely — same cells, same future, same dose, one variable.
+    #
+    # `cap = k` keeps the last k frames before the origin, which is exactly the
+    # operational question: calibrate for k minutes, then start controlling.
+    CAL_CAPS = [1, 2, 3, 4, 6, 8, 11, 14, 18, 24, 30, 36]
+
+    calibration_sweep = pl.DataFrame([
+        cal_metrics(CAL_START_AFTER_LIGHT, k) for k in CAL_CAPS
+    ])
+    calibration_sweep
+    return
+
+
+@app.cell(hide_code=True)
+def _(CAL_CTX, CAL_ORIGINS, cal_cells, cal_forecast, np, pl):
+    # --- Does the model know anything about a cell beyond its current level? -----
+    #
+    # Swapping a random cell's past into the forecast would only re-prove that the
+    # current CNR matters, which the last-observed-value predictor already shows.
+    # The test that means something pairs each cell with a DONOR whose last observed
+    # CNR is essentially identical, so both stretches of past contain a full light
+    # response of the same length at the same dose and differ only in which cell they
+    # came from. Whatever the forecast loses under that swap is cell identity; what it
+    # keeps is the current level plus dynamics common to every cell.
+    #
+    # The light is identical across cells in this arm, so the future input the decoder
+    # receives is the same no matter whose past is used — nothing has to be held fixed
+    # by hand.
+
+    SWAP_SEED = 0
+
+
+    def swap_test(origin, cap=CAL_CTX):
+        m, _s, t = cal_forecast(origin, cap)
+        last = np.array([tr["cnr"][origin - 1] for tr in cal_cells])
+        n = len(m)
+
+        gap = np.abs(last[:, None] - last[None, :])
+        np.fill_diagonal(gap, np.inf)
+        donor = gap.argmin(axis=1)
+        rng = np.random.default_rng(SWAP_SEED)
+        shuffled = rng.permutation(n)
+
+        per_cell = lambda pred: np.abs(pred - t).mean(axis=1)
+        persistence = np.repeat(last[:, None], t.shape[1], axis=1)
+        return {
+            "origin": origin,
+            "n": n,
+            "own": per_cell(m),
+            "matched": per_cell(m[donor]),
+            "shuffled": per_cell(m[shuffled]),
+            "last_value": per_cell(persistence),
+            "donor_gap": np.abs(last - last[donor]),
+            "last_sd": float(last.std()),
+        }
+
+
+    swap_results = {o: swap_test(o) for o in CAL_ORIGINS}
+
+    swap_summary = pl.DataFrame([
+        {"origin": o,
+         "own": float(r["own"].mean()),
+         "level_matched_donor": float(r["matched"].mean()),
+         "shuffled_donor": float(r["shuffled"].mean()),
+         "last_value_only": float(r["last_value"].mean()),
+         "identity_cost": float(r["matched"].mean() - r["own"].mean()),
+         "identity_share": float((r["matched"].mean() - r["own"].mean()) / r["own"].mean()),
+         "median_donor_gap": float(np.median(r["donor_gap"]))}
+        for o, r in swap_results.items()
+    ])
+    swap_summary
+    return (swap_results,)
+
+
+@app.cell(hide_code=True)
+def _(GRID, INK, MUTED, SERIES, mpl, np, plt, save_fig, swap_results):
+    SWAP_ORIGIN_SHOWN = 36
+    SWAP_LABELS = [("own", "the cell's own past", INK),
+                   ("matched", "a different cell at the same level", SERIES[0]),
+                   ("last_value", "its current CNR, held", SERIES[2]),
+                   ("shuffled", "a different cell, any level", SERIES[1])]
+
+
+    def _panel_swap_bars(ax):
+        """(a) What the forecast is actually built on."""
+        origins = list(swap_results)
+        w = 0.2
+        for j, (key, lab, colour) in enumerate(SWAP_LABELS):
+            vals = [swap_results[o][key].mean() for o in origins]
+            err = [swap_results[o][key].std() / np.sqrt(swap_results[o]["n"]) for o in origins]
+            ax.bar(np.arange(len(origins)) + (j - 1.5) * w, vals, w, yerr=err,
+                   color=colour, label=lab, error_kw=dict(lw=0.9, ecolor=MUTED))
+
+        ax.set_xticks(range(len(origins)), [f"min {o}" for o in origins])
+        ax.set_xlabel("forecast starts at")
+        ax.set_ylabel("forecast error (absolute CNR)")
+        ax.set_title("a  Replace the cell's past and see what breaks",
+                     loc="left", fontweight="bold")
+        ax.legend(frameon=False, fontsize=7, ncol=2, loc="upper left")
+        ax.set_ylim(0, 0.42)
+        ax.yaxis.grid(True, color=GRID, lw=0.6)
+        ax.set_axisbelow(True)
+
+
+    def _panel_swap_paired(ax):
+        """(b) The same comparison cell by cell, not as an average."""
+        r = swap_results[SWAP_ORIGIN_SHOWN]
+        lim = (0, max(r["own"].max(), r["matched"].max()) * 1.05)
+        ax.plot(r["own"], r["matched"], "o", ms=4, alpha=0.5, color=SERIES[0])
+        ax.plot(lim, lim, color=INK, lw=1.0, ls="--")
+        worse = float((r["matched"] > r["own"]).mean())
+        ax.text(0.04, 0.95,
+                f"donor's past is worse for {worse:.0%} of cells\n"
+                f"median donor differs in current CNR\nby {np.median(r['donor_gap']):.3f}"
+                f"  (population sd {r['last_sd']:.2f})",
+                transform=ax.transAxes, va="top", fontsize=7.5, color=INK)
+        ax.set_xlim(*lim); ax.set_ylim(*lim)
+        ax.set_xlabel("error using the cell's own past")
+        ax.set_ylabel("error using a level-matched\ndifferent cell's past")
+        ax.set_title(f"b  Cell by cell, from min {SWAP_ORIGIN_SHOWN}",
+                     loc="left", fontweight="bold")
+
+
+    def _panel_swap_identity(ax):
+        """(c) How much of the forecast is genuinely about *this* cell."""
+        origins = list(swap_results)
+        share = [swap_results[o]["matched"].mean() / swap_results[o]["own"].mean() - 1
+                 for o in origins]
+        ax.plot(origins, share, color=SERIES[0], lw=2.2, marker="o", ms=6)
+        ax.axhline(0, color=MUTED, lw=1.0)
+        for o, s in zip(origins, share):
+            ax.annotate(f"{s:.0%}", (o, s), textcoords="offset points", xytext=(0, 8),
+                        ha="center", fontsize=7.5, color=INK)
+
+        ax.set_xlabel("forecast starts at (min into the run)")
+        ax.set_ylabel("error added by using\nanother cell's past")
+        ax.set_xticks(origins)
+        ax.set_ylim(-0.02, 0.20)
+        ax.yaxis.set_major_formatter(mpl.ticker.PercentFormatter(1.0))
+        ax.set_title("c  What is left that is about this cell", loc="left", fontweight="bold")
+        ax.yaxis.grid(True, color=GRID, lw=0.6)
+        ax.set_axisbelow(True)
+
+
+    fig_swap = plt.figure(figsize=(9.8, 6.4))
+    _gsw = fig_swap.add_gridspec(2, 2, height_ratios=[1.0, 0.95], hspace=0.5, wspace=0.32,
+                                 left=0.09, right=0.98, top=0.92, bottom=0.1)
+    _panel_swap_bars(fig_swap.add_subplot(_gsw[0, :]))
+    _panel_swap_paired(fig_swap.add_subplot(_gsw[1, 0]))
+    _panel_swap_identity(fig_swap.add_subplot(_gsw[1, 1]))
+    save_fig(fig_swap, "fig13_history_swap")
+    fig_swap
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+ 
+    """)
     return
 
 

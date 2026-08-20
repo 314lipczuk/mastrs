@@ -99,11 +99,12 @@ def _(mo):
     exp_dir_input = mo.ui.text( 
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-07-16_InferenceCNRhold_12h_v7",
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-07-30_InferenceCNRhold_12h_v10",
-        #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-07-30_InferenceCNRhold_12h_v11",
+        value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-07-30_InferenceCNRhold_12h_v11",
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v12",
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v13_2",
-        value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v15", 
+        #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v15", 
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v16",
+        #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-19_InferenceCNRhold_12h_v17", 
         label="Experiment directory (per-FOV parquets + a .jsonl log)", 
         full_width=True,
     )
@@ -1216,7 +1217,6 @@ def _(FOV_META, REF_KIND, SEL_FOVS, fov_df, pl):
             (pl.col("aligned_min") >= float(_o.max()))
             & (pl.col("aligned_min") <= _tmax + float(_o.min()))
         )
-
     return CAN_ALIGN, HAS_PHASE_SPREAD, PERIOD_MIN, aligned
 
 
@@ -1546,7 +1546,6 @@ def _(
     _ax.legend(fontsize=8, ncol=2)
     plt.tight_layout()
     plt.gca()
-
     return
 
 
