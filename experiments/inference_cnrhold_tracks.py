@@ -100,7 +100,10 @@ def _(mo):
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-07-16_InferenceCNRhold_12h_v7",
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-07-30_InferenceCNRhold_12h_v10",
         #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-07-30_InferenceCNRhold_12h_v11",
-        value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v12",
+        #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v12",
+        #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v13_2",
+        value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v15", 
+        #value="/Volumes/imaging.data/mic01-imaging/314lipczuk/2026-08-07_InferenceCNRhold_12h_v16",
         label="Experiment directory (per-FOV parquets + a .jsonl log)", 
         full_width=True,
     )
@@ -267,7 +270,31 @@ def _(Path, exp_dir_input, json, mo, pl, re):
     gpu = pl.DataFrame(_gpu_rows, schema_overrides={"t": pl.Float64}).sort("t") if _gpu_rows else None
 
     serving = (
-        pl.DataFrame(_srv_rows)
+        # SCHEMA IS DECLARED, NOT INFERRED. polars types a list of dicts from its
+        # first 100 rows, and every optional field here is absent for whole FOVs at a
+        # time rather than at random: a `hold` objective annotates no `segment` and no
+        # `phase_offset_min`, a run that predates an annotation has none of them
+        # anywhere. Whenever the first FOVs served are the ones WITHOUT a field, the
+        # column types as Null and the first real value — "settle" arriving from a
+        # frequency_staircase FOV a few hundred rows later — kills the whole load with
+        # a builder-append error. That is not a corrupt log; it is a run whose FOVs
+        # carry different objectives, which is now the normal case.
+        #
+        # Declaring the types costs nothing and removes the ordering dependence
+        # entirely. `infer_schema_length=None` would also work but scans every row of
+        # a multi-million-row list to learn what is written here in seven lines.
+        pl.DataFrame(
+            _srv_rows,
+            schema_overrides={
+                "cnr_norm": pl.Float64,
+                "baseline": pl.Float64,
+                "r_t": pl.Float64,
+                "segment": pl.Utf8,
+                "phase_offset_min": pl.Float64,
+                "plan_cost": pl.Float64,
+                "pred_cnr_h1": pl.Float64,
+            },
+        )
         .unique(subset=["fov", "timestep", "particle"], keep="first")
         .with_columns(
             pl.col("fov").cast(pl.UInt16),
@@ -417,7 +444,7 @@ def _(Path, mo, policy_input, tomllib):
 
 
 @app.cell
-def _(Path, policy, startup):
+def _(Path, data_all, policy, startup):
     # Per-FOV policy metadata, normalized to ONE record shape from either source.
     # Prefers the policy `.toml` (authoritative for the controller, and the only
     # place the assignment survives when a FOV degraded to the stub); falls back to
@@ -493,11 +520,26 @@ def _(Path, policy, startup):
         return str(_type)
 
     def _mode_of(_info):
-        # Explicit cnr_mode when the model loaded; else infer from the checkpoint
-        # name (…_raw_cnr_… -> raw), which the stub startup / policy file still name.
+        # cnr units. Explicit `cnr_mode` when the record carries one — the startup
+        # log always does, the policy .toml never does. That asymmetry is not an
+        # oversight upstream: cnr_mode is a property of the CHECKPOINT, resolved by
+        # the server when it loads the weights, not something a policy file sets.
+        #
+        # So when the .toml is the source, fall through to the startup record for the
+        # SAME checkpoint before guessing from the name. The name heuristic is a last
+        # resort and v13 is exactly where it fails: `enc_e_area_lean_2026-08-07_...`
+        # IS a raw model (the server logged cnr_mode="raw", and cnr_norm == cnr_median
+        # to the bit in this run) but its name never says so, so the heuristic returns
+        # "norm". That drops `cnr_median` out of TARGET_COLS, which silently stops the
+        # reference being drawn on the default readout and makes the phase-aligned
+        # panel refuse to render — a mislabelled unit presenting as a missing plot.
         _m = (_info or {}).get("cnr_mode")
         if _m in ("norm", "raw"):
             return _m
+        _srv = (startup or {}).get("policies", {}) or {}
+        for _cand in [_srv.get("default") or {}, *((_srv.get("fov") or {}).values())]:
+            if _ckpt(_cand) == _ckpt(_info) and _cand.get("cnr_mode") in ("norm", "raw"):
+                return _cand["cnr_mode"]
         return "raw" if "raw" in _ckpt(_info).lower() else "norm"
 
     def _kernel_label(_info):
@@ -604,6 +646,43 @@ def _(Path, policy, startup):
 
     FOV_META = {int(_k): _meta(_v) for _k, _v in _fov_info.items()}
     DEFAULT_META = _meta(_default_info)
+
+    # --- FOVs THE POLICY NEVER MENTIONED ----------------------------------
+    # The policy file and the rig can disagree about how many fields exist, and in
+    # v13 they did: `policy_8fov_openloop.toml` declares fov 0-7, the microscope
+    # imaged 10, so fov 8 and 9 were served by `[default]`. They are real controlled
+    # cells with a real reference — they are simply not part of the design.
+    #
+    # Left out of FOV_META they do not vanish, which is the trap: every FOV list
+    # below is built from the DATA, so they stay inside "All (pooled)" while being
+    # absent from every arm group. A pooled number then quietly averages designed
+    # fields with accidental ones and nothing on the plot says so.
+    #
+    # They get their own arm instead. Their config is arm 1's byte for byte, but
+    # they are NOT arm 1: the layout is mirrored so that each arm's mean field index
+    # is 3.5 and arm is not confounded with plate position (see the policy's FOV
+    # LAYOUT note), and folding two edge fields into one arm breaks both that
+    # balance and the n=2-per-arm symmetry the analysis constraint rests on.
+    _unpolicied = sorted(set(data_all["fov"].unique().to_list()) - set(FOV_META))
+    if _unpolicied:
+        _declared_max = max(
+            (
+                int(_m["arm_declared"])
+                for _m in FOV_META.values()
+                if _m["arm_declared"] is not None
+            ),
+            default=0,
+        )
+        for _f in _unpolicied:
+            _dm = dict(DEFAULT_META)
+            # Marked, or it collides with the arm whose config it copies and the two
+            # merge back into one group — the exact silent pooling this exists to stop.
+            _dm["arm_spec"] = f"{_dm['arm_spec']} · [default policy]"
+            # Numbered, never None: ARM_NUM only honours the policy's OWN declared
+            # numbers when EVERY arm has one, so a single un-numbered arm would throw
+            # the run back on derived numbering and silently renumber arms 1-4.
+            _dm["arm_declared"] = _declared_max + 1
+            FOV_META[int(_f)] = _dm
 
     # --- ARMS -------------------------------------------------------------
     # The arms are read OUT OF THE POLICY, never from the FOV index. The policy
@@ -956,7 +1035,7 @@ def _(data, fov_sel, min_len, pl, readout_sel, track_len):
         ["hours", "timestep", "track_key", "particle", "light_on", "exposure_ms",
          "r_t", "segment", "phase_offset_min", y_col]
     ).sort(["track_key", "timestep"])
-    # Every-2nd-minute view for the dense all-track backgrounds (halves the point
+    # Every-2nd-minute view for the3 dense all-track backgrounds (halves the point
     # count); single-track detail below still uses full-resolution plot_df.
     plot_df_sparse = plot_df.filter(pl.col("timestep") % 2 == 0)
 
@@ -1063,20 +1142,45 @@ def _(FOV_META, REF_KIND, SEL_FOVS, fov_df, pl):
     #
     # Settle frames are dropped: the reference is flat there and the start-up
     # transient is still running, so they describe neither tracking nor the cycle.
+    #
+    # When NO cell carries a phase spread — a `hold` run (one flat reference), a
+    # `schedule` run (a step train every cell follows at the same frame), or a
+    # `frequency_staircase` whose cells all sit at φ=0 — there is no antiphase
+    # fold to do. The frame below then degenerates to the wall-clock frame:
+    # offsets fill to 0, bins floor to whole minutes, the trim is a no-op. The
+    # population plot renders that plain axis instead, so the panel's summary
+    # view is available on every run, not just the oscillations.
+    _offs = (
+        fov_df["phase_offset_min"].drop_nulls()
+        if "phase_offset_min" in fov_df.columns
+        else fov_df["phase_offset_min"].clear()
+    )
+    # A phase shift worth folding exists only when the offsets actually SPREAD
+    # the cells. An objective that logs one constant offset (e.g. a staircase
+    # with every cell at φ=0) has no antiphase populations to fold, and its
+    # wall-clock summary stays meaningful — treating a logged 0.0 as "phase
+    # shift" would silently kill the plot for that arm and for any pooled view
+    # that contains it.
+    HAS_PHASE_SPREAD = _offs.len() > 0 and float(_offs.abs().max() or 0.0) > 0.0
     _pers = {FOV_META[_f].get("period_min") for _f in SEL_FOVS if _f in FOV_META}
     _pers = {_p for _p in _pers if _p}
     # Alignment is only meaningful when every field in scope shares one cycle —
     # two different periods on one axis is a meaningless overlay, not a cleaner
-    # plot.
+    # plot. The cells must also be spread in phase to be shifted: without spread
+    # the "alignment" would claim a shift that did nothing.
     PERIOD_MIN = next(iter(_pers)) if len(_pers) == 1 else None
-    CAN_ALIGN = bool(PERIOD_MIN) and REF_KIND == "varying" and fov_df.height > 0
+    CAN_ALIGN = (
+        bool(PERIOD_MIN)
+        and REF_KIND == "varying"
+        and fov_df.height > 0
+        and HAS_PHASE_SPREAD
+    )
 
-    # Computed unconditionally so `aligned` always has the same schema — an
-    # un-alignable selection yields zero rows, not a frame missing the columns
-    # every plot below would then have to test for.
-    _src = fov_df if CAN_ALIGN else fov_df.clear()
+    # Computed unconditionally so `aligned` always has the same schema — every
+    # plot below reads the same columns whether a shift happened or not. With no
+    # phase spread the shift is zero and this IS the wall-clock frame.
     aligned = (
-        _src.filter((pl.col("segment") != "settle") | pl.col("segment").is_null())
+        fov_df.filter((pl.col("segment") != "settle") | pl.col("segment").is_null())
         .with_columns(
             (pl.col("timestep") + pl.col("phase_offset_min").fill_null(0.0)).alias("aligned_min")
         )
@@ -1103,7 +1207,8 @@ def _(FOV_META, REF_KIND, SEL_FOVS, fov_df, pl):
     # the median is taken over a shrinking subset of the groups — i.e. it decays
     # back toward the unaligned, partly-cancelling average exactly at the two ends.
     # Same class of error as the sawtooth: a statistic whose underlying population
-    # silently changes along the axis.
+    # silently changes along the axis. With no spread every offset is 0 and the
+    # window is the full axis — a no-op.
     if aligned.height:
         _o = aligned["phase_offset_min"].fill_null(0.0)
         _tmax = float(aligned["timestep"].max())
@@ -1111,7 +1216,8 @@ def _(FOV_META, REF_KIND, SEL_FOVS, fov_df, pl):
             (pl.col("aligned_min") >= float(_o.max()))
             & (pl.col("aligned_min") <= _tmax + float(_o.min()))
         )
-    return CAN_ALIGN, PERIOD_MIN, aligned
+
+    return CAN_ALIGN, HAS_PHASE_SPREAD, PERIOD_MIN, aligned
 
 
 @app.cell
@@ -1269,10 +1375,17 @@ def _(mo):
     change across twelve hours. Settle frames are dropped.
 
     **This is the view to read for tracking quality.** With more than one arm in
-    scope it draws one curve per arm against the single shared reference — the
-    comparison the run exists to make. The dashed reference doubles as the check
-    that the shift is right; any residual disagreement between the phase groups is
+    scope it draws one curve per arm against the shared reference — the comparison
+    the run exists to make. The dashed reference doubles as the check that the
+    shift is right; any residual disagreement between the phase groups is
     quantified in the title.
+
+    When there is **no phase shift** — a `hold` run (flat reference), a `schedule`
+    run (a step train every cell follows at the same frame), or any selection
+    whose offsets carry no spread — there is nothing to fold, and this panel
+    falls back to the plain wall-clock population summary: the same per-arm
+    median + IQR, each arm drawn against its **own** reference (the arms may hold
+    different setpoints, so there is no one shared curve to overlay).
     """)
     return
 
@@ -1282,7 +1395,10 @@ def _(
     ARM_OF,
     CAN_ALIGN,
     FOV_META,
+    HAS_PHASE_SPREAD,
     PERIOD_MIN,
+    REF_KIND,
+    REF_VALUE,
     TARGET_COLS,
     aligned,
     mo,
@@ -1290,16 +1406,28 @@ def _(
     plt,
     y_col,
 ):
+    # The panel doubles as the plain population summary when there is no phase
+    # shift to fold — a `hold` run (one flat reference), a `schedule` run (a step
+    # train every cell follows at the same frame), or a `frequency_staircase`
+    # whose cells all sit at φ=0 carry offsets with no spread, so `aligned`
+    # degenerates to the wall-clock frame and this draws the per-arm median + IQR
+    # on an honest time axis. Only a selection whose cells ARE spread in phase
+    # but cannot be aligned (no one shared cycle) stops here: that axis would be
+    # an antiphase overlay, not a cleaner plot.
     mo.stop(
-        not CAN_ALIGN,
+        HAS_PHASE_SPREAD and not CAN_ALIGN,
         mo.md(
-            "_Nothing to align — this needs an oscillating reference and one shared "
-            "cycle length across the selected FOVs._"
+            "_The cells are offset in phase but the selection has no single shared "
+            "cycle length — the populations are in antiphase and cannot be folded "
+            "onto one clock._"
         ),
     )
     mo.stop(
         y_col not in TARGET_COLS,
-        mo.md(f"_Phase alignment is only meaningful on a controlled readout, not `{y_col}`._"),
+        mo.md(
+            f"_Not a controlled readout — the reference lives on "
+            f"`{'/'.join(sorted(TARGET_COLS))}`, not `{y_col}`._"
+        ),
     )
 
     # One curve per ARM, because that is the contrast; with a single arm in scope
@@ -1333,22 +1461,21 @@ def _(
         _ax.plot(_x, _g["mid"].to_numpy(), color=_col, lw=2.0,
                  label=f"arm {_a} — {_spec}")
 
-    # The shared reference, put through the SAME alignment. Every arm tracks this
-    # one curve — that is what makes them comparable at all. It doubles as the
-    # check that the shift is right: `r_t` is per-cell, so a wrong shift makes the
-    # four groups' references disagree inside a bin and this comes out smeared
-    # rather than as a clean waveform. That disagreement is measured below.
-    _r = (
-        _d.drop_nulls("r_t").group_by("aligned_bin")
-        .agg(pl.col("r_t").median().alias("r"),
-             (pl.col("r_t").max() - pl.col("r_t").min()).alias("spread"))
-        .sort("aligned_bin")
-    )
-    _ax.plot(_r["aligned_bin"].to_numpy() / 60.0, _r["r"].to_numpy(),
-             color="black", ls="--", lw=1.8, zorder=5, label="reference")
+    def _draw_ref(_g, _col, _lab, _lw):
+        """One arm's reference as a dashed overlay. Falls back to the policy's
+        flat target when the run predates the per-cell `r_t` annotation."""
+        if _g.height:
+            _ax.plot(_g["aligned_bin"].to_numpy() / 60.0, _g["r"].to_numpy(),
+                     color=_col, ls="--", lw=_lw, alpha=0.9, zorder=4, label=_lab)
+        elif REF_KIND == "constant":
+            _ax.axhline(REF_VALUE, color=_col, ls="--", lw=_lw, alpha=0.9,
+                        zorder=4, label=_lab)
 
     # Worst disagreement between the phase groups' own references inside one bin.
-    # Zero means they are exactly in phase. Non-zero is NOT automatically a bug:
+    # Meaningful only when a shift was actually applied — on an unaligned axis
+    # every cell shares one reference, so the spread is zero by construction.
+    #
+    # Zero is NOT automatically a bug:
     #
     #   EXPECTED — when the period does not divide by the group count the offsets
     #     are half-integers (50/4 = 12.5) and whole-minute bins leave one group up
@@ -1356,23 +1483,70 @@ def _(
     #     (max per-minute step)/2 of reference disagreement and nothing more.
     #   REAL — materially above that bound means the shift itself is wrong and
     #     every curve above is a blend of phases rather than a population in phase.
-    _mis = float(_r["spread"].max() or 0.0)
-    _rv = _r["r"].to_numpy()
-    _bound = 0.5 * float(abs(_rv[1:] - _rv[:-1]).max()) if len(_rv) > 1 else 0.0
-    if _mis <= _bound * 1.5 + 1e-9:
-        _mtxt = f"  ·  ±{_mis:.3f} half-frame quantisation" if _mis > 1e-6 else ""
+    _mtxt = ""
+    if CAN_ALIGN:
+        # One shared reference, put through the SAME alignment. Every arm tracks
+        # this one curve — that is what makes them comparable at all. It doubles
+        # as the check that the shift is right: `r_t` is per-cell, so a wrong
+        # shift makes the phase groups' references disagree inside a bin and this
+        # comes out smeared rather than as a clean waveform.
+        _r = (
+            _d.drop_nulls("r_t").group_by("aligned_bin")
+            .agg(pl.col("r_t").median().alias("r"),
+                 (pl.col("r_t").max() - pl.col("r_t").min()).alias("spread"))
+            .sort("aligned_bin")
+        )
+        _draw_ref(_r, "black", "reference", 1.8)
+        _mis = float(_r["spread"].max() or 0.0)
+        _rv = _r["r"].to_numpy()
+        _bound = 0.5 * float(abs(_rv[1:] - _rv[:-1]).max()) if len(_rv) > 1 else 0.0
+        if _mis <= _bound * 1.5 + 1e-9:
+            _mtxt = f"  ·  ±{_mis:.3f} half-frame quantisation" if _mis > 1e-6 else ""
+        else:
+            _mtxt = f"  ⚠ PHASE MISMATCH {_mis:.3f} (expected ≤ {_bound:.3f}) — curves are a blend"
+    elif len(_arms) == 1:
+        # No shift, one arm: the reference is a single curve (flat, schedule, or
+        # staircase), drawn like the aligned case for readability.
+        _ra = (
+            _d.drop_nulls("r_t").group_by("aligned_bin")
+            .agg(pl.col("r_t").median().alias("r"))
+            .sort("aligned_bin")
+        )
+        _draw_ref(_ra, "black", "reference", 1.8)
     else:
-        _mtxt = f"  ⚠ PHASE MISMATCH {_mis:.3f} (expected ≤ {_bound:.3f}) — curves are a blend"
+        # No shift, several arms: their references DIFFER (a hold next to a
+        # schedule next to a staircase), so a pooled `r_t` median would smear into
+        # a line none of them followed. Draw each arm against its own.
+        for _i, _a in enumerate(_arms):
+            _col = _cmap(_i % 10)
+            _ra = (
+                _d.filter(pl.col("arm") == _a).drop_nulls("r_t")
+                .group_by("aligned_bin")
+                .agg(pl.col("r_t").median().alias("r"))
+                .sort("aligned_bin")
+            )
+            _draw_ref(_ra, _col, f"arm {_a} ref", 1.2)
 
-    _ax.set_xlabel("phase-aligned time (h)")
+    if CAN_ALIGN:
+        _title = (
+            f"Phase-aligned {y_col} — {PERIOD_MIN:g}-min cycle, aligned by each "
+            f"cell's own φ · {_d['track_key'].n_unique()} tracks, {_d.height} "
+            f"cell-frames" + _mtxt
+        )
+        _xlab = "phase-aligned time (h)"
+    else:
+        _title = (
+            f"Population {y_col} · {_d['track_key'].n_unique()} tracks, "
+            f"{_d.height} cell-frames — no phase shift, wall-clock axis"
+        )
+        _xlab = "time (h)"
+    _ax.set_xlabel(_xlab)
     _ax.set_ylabel(y_col)
-    _ax.set_title(
-        f"Phase-aligned {y_col} — {PERIOD_MIN:g}-min cycle, aligned by each cell's "
-        f"own φ · {_d['track_key'].n_unique()} tracks, {_d.height} cell-frames" + _mtxt
-    )
+    _ax.set_title(_title)
     _ax.legend(fontsize=8, ncol=2)
     plt.tight_layout()
     plt.gca()
+
     return
 
 

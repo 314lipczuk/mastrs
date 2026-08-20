@@ -968,7 +968,7 @@ def _drive_at_cadence(svc, interval_s, n_frames=12, n_fovs=2, monkeypatch=None):
 
 def test_cadence_guard_stays_quiet_when_the_rig_keeps_time(tmp_path, monkeypatch):
     log = tmp_path / "run.jsonl"
-    svc = InferenceService(_cfg(predict_log_path=str(log), frame_interval_min=1.0))
+    svc = InferenceService(_cfg(predict_log_path=str(log)))
     try:
         _drive_at_cadence(svc, 60.0, monkeypatch=monkeypatch)
         assert svc.cadence_degraded is False
@@ -984,7 +984,7 @@ def test_cadence_guard_flags_a_run_that_is_silently_running_slow(tmp_path, monke
     """The v12 failure: 12 h declared, 40 h delivered, discovered only afterwards
     from the parquet timestamps. Every reference period was multiplied by 3.4."""
     log = tmp_path / "run.jsonl"
-    svc = InferenceService(_cfg(predict_log_path=str(log), frame_interval_min=1.0))
+    svc = InferenceService(_cfg(predict_log_path=str(log)))
     try:
         _drive_at_cadence(svc, 202.0, monkeypatch=monkeypatch)   # v12's real cadence
         assert svc.cadence_degraded is True
@@ -1005,7 +1005,7 @@ def test_cadence_is_measured_per_field_not_between_requests(monkeypatch):
     """Fields are imaged sequentially within a round, so consecutive requests are a
     slot apart, not a frame apart. Measuring across fields would read an 8-field
     round as 8x faster than it is and never fire."""
-    svc = InferenceService(_cfg(frame_interval_min=1.0))
+    svc = InferenceService(_cfg())
     try:
         # 8 fields inside a 60 s round: each field is 60 s apart from its own last
         # frame, but successive requests are only 7.5 s apart.
@@ -1015,3 +1015,49 @@ def test_cadence_is_measured_per_field_not_between_requests(monkeypatch):
         )
     finally:
         svc.close()
+
+
+# ---------------------------------------------------------------------------
+# the cadence invariant is not configurable
+# ---------------------------------------------------------------------------
+
+def test_frame_interval_is_a_constant_not_a_setting():
+    """One frame per minute, one inference per frame — nothing may configure it.
+
+    It used to be a ServerConfig field behind --frame-interval-min, declared TWICE
+    in the same dataclass. Raising it to match a slow rig silenced the only alarm
+    that catches the slip AND rescaled every waveform's frame count, so two runs
+    came out looking clean while measuring something else. This test is the guard
+    against it coming back by either route: the config field or the objective spec.
+    """
+    from dataclasses import fields as dc_fields
+
+    from optoerk.serving.config import FRAME_INTERVAL_MIN, FRAME_INTERVAL_S, ServerConfig
+
+    assert FRAME_INTERVAL_MIN == 1.0
+    assert FRAME_INTERVAL_S == 60.0
+    names = {f.name for f in dc_fields(ServerConfig)}
+    assert not {n for n in names if "frame_interval" in n or "cadence" in n}, (
+        "the cadence invariant is back on ServerConfig"
+    )
+    with pytest.raises(TypeError):
+        ServerConfig(frame_interval_min=2.0)
+
+
+@pytest.mark.parametrize("spec", [
+    {"type": "oscillation", "low": 1.0, "high": 1.2, "t_low_min": 12,
+     "t_rise_min": 2, "t_high_min": 18, "t_fall_min": 18},
+    {"type": "frequency_staircase", "blocks": [
+        {"low": 1.0, "high": 1.2, "t_low_min": 12, "t_rise_min": 2,
+         "t_high_min": 18, "t_fall_min": 18, "n_cycles": 1}]},
+])
+def test_no_objective_may_declare_its_own_frame_interval(spec):
+    """The second route in, and the one a policy file can reach. This is exactly
+    what policy_8fov_diverse.toml carried into v14: frame_interval_min = 2.0 on the
+    staircase, which halved every period's frame count without touching the rig."""
+    from optoerk.serving.config import FRAME_INTERVAL_MIN
+    from optoerk.serving.objectives import build_objective
+
+    assert build_objective(dict(spec)).reference.frame_interval_min == FRAME_INTERVAL_MIN
+    with pytest.raises(TypeError, match="frame_interval_min"):
+        build_objective({**spec, "frame_interval_min": 2.0})

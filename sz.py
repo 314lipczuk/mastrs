@@ -14,7 +14,7 @@ def is_js_token(s): return len(s) and not s.startswith('//')
 
 def gen_stats(base_path="."):
   table = []
-  for path, _, files in os.walk(os.path.join(base_path, "experiments")):
+  for path, _, files in os.walk(os.path.join(base_path, "optoerk")):
     for name in files:
       if not (name.endswith(".py") or name.endswith(".js")): continue
       filepath = os.path.join(path, name)

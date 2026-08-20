@@ -350,14 +350,32 @@ def test_live_and_override_together_is_refused():
         InferenceService(_cfg(override_optortk_expr=True, optortk_expr_value=0.5))
 
 
-def test_default_is_still_the_neutral_constant():
-    """Off by default: turning this on is a change of experimental condition, so it
-    must never happen because a payload happened to carry C0."""
+def test_live_is_the_default_since_2026_08_14():
+    """The default is now `live`, because that is what every real run since v13
+    passed explicitly. A default nobody wants is not a safe default: it makes the
+    flag mandatory ceremony, and OFF is the silently-degrading state — every cell
+    gets the neutral median rank and the run looks fine."""
     cfg = ServerConfig(dark_baseline=False, warmup=False, gpu_sample_interval_s=0)
-    assert cfg.live_optortk_expr is False
+    assert cfg.live_optortk_expr is True
+    svc = InferenceService(cfg)
+    try:
+        assert svc.optortk_expr_mode()["mode"] == "live"
+    finally:
+        svc.close()
+
+
+def test_the_mode_is_never_decided_by_payload_content():
+    """The guarantee the old default was standing in for, kept explicitly: which
+    optoRTK regime a run is in comes from the config alone. A payload that happens
+    to carry C0 must never promote a `neutral` run to `live` behind the operator."""
+    cfg = ServerConfig(live_optortk_expr=False, dark_baseline=False,
+                       warmup=False, gpu_sample_interval_s=0)
     svc = InferenceService(cfg)
     try:
         assert svc.cohort is None
+        assert svc.optortk_expr_mode()["mode"] == "neutral"
+        svc.predict(_payload(0, 0, 2, _c0_grid(1, 2, 2)[1]))
+        assert svc.cohort is None, "a payload promoted the run to live"
         assert svc.optortk_expr_mode()["mode"] == "neutral"
     finally:
         svc.close()
