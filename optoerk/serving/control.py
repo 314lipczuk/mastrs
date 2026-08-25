@@ -505,11 +505,148 @@ class OpenLoopController(Controller):
         }
 
 
+class PopulationMPC(SequenceMPC):
+    """One dose for a whole group of cells, planned for a typical member of it.
+
+    The comparison arm for per-cell control, and the reason it is worth having: an
+    open-loop arm removes feedback AND the ability to treat cells differently at the
+    same time, so when it loses you cannot say which of the two mattered. This
+    removes exactly one thing. Same model, same objective, same ladder, same horizon,
+    same optimizer — the group's dose still answers to what the cells are doing, frame
+    by frame. What is gone is only the freedom to send two cells different doses.
+
+    It also needs no recordings and no donor cells, so nothing in it depends on a
+    second cell staying tracked.
+
+    ``share``:
+      ``"all"``   every cell in the field gets the same dose.
+      ``"half"``  cells with ``(particle // group_stride) % 2 == 1`` share a dose;
+                  the rest are planned individually. One field then carries both
+                  arms, so anything field-level — focus, medium, illumination —
+                  cancels inside it rather than landing in the contrast. Dividing
+                  by ``group_stride`` before taking the parity keeps the split
+                  independent of the phase group, which is ``particle % 4``; a plain
+                  ``particle % 2`` would put phase groups 0 and 2 in one arm and 1
+                  and 3 in the other.
+
+    The broadcast group is (arm x PHASE GROUP), never the arm alone. With four phase
+    groups, cells at one wall-clock frame are being asked for opposite things — half
+    to sit at the low level, half at the high — and one dose for all of them is not
+    population control, it is an incoherent arm that loses for a reason nobody is
+    asking about. Measured on v19: the cross-cell median command taken WITHIN a phase
+    group tracks the demand (17-20 ms through the low phase, 39-63 ms through the
+    high, averaging 36.9 ms against a mean of 52.2). Taken across the whole field it
+    reads 19.9 ms, dragged down by whichever half is meant to be resting.
+
+    The representative is whichever cell sits at the median CNR of its broadcast group
+    this frame, re-chosen every frame, and its own encoder state is what the plan is
+    computed from. Averaging hidden states instead would build a state no cell was
+    ever in and that the model has never been asked about. Re-choosing every frame is
+    consistent with the receding horizon: the plan is recomputed from scratch anyway.
+
+    Padding rows duplicate the last real cell, so the median is taken over distinct
+    particle ids only — otherwise a bucket of 31 copies could decide who is typical.
+    """
+
+    name = "population_mpc"
+
+    def __init__(
+        self,
+        levels_ms: np.ndarray,
+        share: str = "half",
+        group_stride: int = 4,
+        **mpc_kwargs: Any,
+    ):
+        super().__init__(levels_ms=levels_ms, **mpc_kwargs)
+        if share not in ("all", "half"):
+            raise ValueError(f"share must be 'all' or 'half', got {share!r}")
+        if int(group_stride) < 1:
+            raise ValueError(f"group_stride must be >= 1, got {group_stride}")
+        self.share = share
+        self.group_stride = int(group_stride)
+
+    def shares_dose(self, particle: int) -> bool:
+        """Is this cell in the group that receives one shared dose?"""
+        if self.share == "all":
+            return True
+        return ((int(particle) // self.group_stride) % 2) == 1
+
+    def _shared_mask(self, ctx: GoalContext, device) -> torch.Tensor:
+        return torch.tensor(
+            [self.shares_dose(f.state.particle) for f in ctx.cells],
+            dtype=torch.bool, device=device,
+        )
+
+    @staticmethod
+    def _condition_of(objective, cell) -> float:
+        """What this cell is currently being asked for, as a groupable key.
+
+        Read from the objective's own reference rather than recomputed here, so the
+        split can never drift from the waveform the cells are actually tracking. A
+        reference with no per-cell phase puts every cell in one condition.
+        """
+        ref = getattr(objective, "reference", None)
+        fn = getattr(ref, "phase_offset_min", None)
+        return 0.0 if fn is None else float(fn(cell))
+
+    def _representative(self, cnr_fb, idx) -> int:
+        """Index of the cell at the median CNR of ``idx``."""
+        if not idx:
+            return -1
+        order = torch.argsort(cnr_fb.reshape(-1)[idx])
+        return int(idx[int(order[len(order) // 2])])
+
+    def _broadcast_groups(self, shared, ctx, objective) -> list[list[int]]:
+        """Row indices per broadcast group: shared cells, split by what they are
+        being asked for, deduplicated by particle so padding copies cannot vote."""
+        groups: dict[float, list[int]] = {}
+        seen: set[int] = set()
+        for i, f in enumerate(ctx.cells):
+            if not bool(shared[i]):
+                continue
+            p = int(f.state.particle)
+            if p in seen:
+                continue
+            seen.add(p)
+            groups.setdefault(self._condition_of(objective, f), []).append(i)
+        return list(groups.values())
+
+    def plan(self, engine, h, c, cnr_fb, objective, ctx):
+        ms, cost = super().plan(engine, h, c, cnr_fb, objective, ctx)
+        shared = self._shared_mask(ctx, ms.device)
+        if not bool(shared.any()):
+            return ms, cost
+        ms = ms.clone()
+        cost = cost.clone()
+        for idx in self._broadcast_groups(shared, ctx, objective):
+            rep = self._representative(cnr_fb, idx)
+            if rep < 0:
+                continue
+            same = torch.tensor(
+                [bool(shared[j]) and self._condition_of(objective, ctx.cells[j])
+                 == self._condition_of(objective, ctx.cells[rep])
+                 for j in range(len(ctx.cells))],
+                dtype=torch.bool, device=ms.device,
+            )
+            # The cost is broadcast with the dose on purpose: every cell in the group
+            # is being commanded on the strength of one plan, and the log should say
+            # so rather than report a per-cell cost nothing acted on.
+            ms[same] = ms[rep]
+            cost[same] = cost[rep]
+        return ms, cost
+
+    def describe(self) -> dict[str, Any]:
+        d = super().describe()
+        d.update({"share": self.share, "group_stride": self.group_stride})
+        return d
+
+
 CONTROLLERS: dict[str, type[Controller]] = {
     ConstantDoseSearch.name: ConstantDoseSearch,
     SequenceMPC.name: SequenceMPC,
     StaggeredCadenceMPC.name: StaggeredCadenceMPC,
     OpenLoopController.name: OpenLoopController,
+    PopulationMPC.name: PopulationMPC,
 }
 
 

@@ -10,6 +10,7 @@ already parse (``experiments/inference_cnrhold_tracks.py``):
     each cell carries ``{particle, raw_cnr, cnr_norm, baseline, fov_density,
     n_cells_200px, u_t_in, n_frames_seen, first_seen, exposure_ms, fluence_out,
     dark, optortk_expr, optortk_source, nuc_area, plan_cost, pred_cnr_h1}``, plus
+    ``shared_dose`` when the controller splits the field into arms, plus
     whatever the objective's reference annotates (``r_t`` always; ``segment`` /
     ``phase_offset_min`` for an oscillation; also ``block_index`` /
     ``sweep_index`` / ``block_period_min`` for a frequency staircase).

@@ -1,0 +1,113 @@
+# 8-FOV PER-CELL vs POPULATION CLOSED LOOP — individuation is the arm.
+#
+# THE QUESTION. Every tracking result in this project comes from a controller that
+# reads each cell and commands each cell separately. None of them shows that the
+# per-cell part is doing anything: a controller watching the population median and
+# broadcasting one dose might do as well. This run puts the two side by side.
+#
+# WHY NOT AN OPEN-LOOP ARM. Open loop removes feedback AND per-cell individuation at
+# the same time, so when it loses you cannot say which of the two mattered. It was
+# also already attempted — v13, `policy_8fov_openloop.toml` — and failed for three
+# unrelated reasons (target above the ceiling, 1.83x cadence slip, no one-step model
+# skill). v19 clears all three, so that run is worth repeating one day, but it is a
+# different question from this one. This policy changes exactly one variable.
+#
+# THE SPLIT IS INSIDE EVERY FIELD. `population_mpc` with share = "half" plans
+# individually for cells with (particle // 4) % 2 == 0 and broadcasts one dose to the
+# rest, chosen by planning for whichever of them sits at the median CNR this frame.
+# Both arms therefore live in every field and anything field-level — focus, medium
+# age, illumination flatness — cancels inside it. That matters: v19's fields 3 and 4
+# ran identical policies and produced pooled swings of 0.21 and 0.10.
+#
+# Dividing by 4 before taking the parity keeps the arm independent of the phase group,
+# which is particle % 4. A plain particle % 2 would put phase groups 0 and 2 in one
+# arm and 1 and 3 in the other, so the arms would differ by phase as well as by
+# control. tests/test_serving_control.py guards this.
+#
+# NO PHASE GROUPS, AND THAT IS DELIBERATE. n_phase_groups = 1 here, unlike v19.
+# The shared arm broadcasts one dose per (arm x phase group) — cells being asked for
+# opposite things at the same instant cannot share a command, or the arm loses for a
+# reason nobody is asking about. But splitting by phase divides the shared half by
+# four, and a typical field carries 44 cells: 22 in the shared arm, and only ~6 per
+# broadcast group once phases are separated. A median over six cells is noise, and in
+# a bench run with two per group it degenerated to permanent darkness. With one phase
+# group the broadcast group is the whole shared half, ~22 cells.
+#
+# What that costs: this run cannot separate "a property of the cell" from "a property
+# of the moment" the way v19 could. It does not need to — v19 answered that, and this
+# run asks something else. policy_8fov_openloop.toml forces n_phase_groups = 1 for the
+# same class of reason.
+#
+# WHY 60 MINUTES, AND ONLY 60. It is the discriminating middle. At 70 min everything
+# tracks well enough that three schemes would look alike; at 20 min nothing tracks and
+# they would look alike again. At 60 min v19 delivered 0.45 of the demanded swing
+# hold-to-hold against a fundamental gain of 0.59 — room for a scheme to be visibly
+# better or worse. The period sweep is done; this run spends its fields on replicates.
+#
+# EVERYTHING ELSE IS v19. Same reference (0.85 / 1.10), same ladder, same checkpoint,
+# same horizon, same phase groups. The point is comparability: v19's numbers are the
+# reference this run is read against, and changing the objective would forfeit that.
+#
+# PRE-REGISTERED BEFORE THE RUN — these are commitments, not options:
+#
+#   PRIMARY OUTCOME is per-cell tracking RMSE against the cell's own reference.
+#   NOT achieved amplitude. Amplitude clusters hard by field (v19 ICC 0.23), which
+#   collapses the effective sample from ~400 cells to ~23 and puts the smallest
+#   detectable difference at 0.102 CNR against a typical amplitude of 0.113 — it
+#   could only see an effect that abolishes the response. Tracking RMSE showed no
+#   field clustering at 60 min, keeps the effective sample, and puts the floor near
+#   0.02-0.03 CNR, about a fifth of v19's 0.134. Amplitude is reported as
+#   descriptive only.
+#
+#   REACHABLE SUBSET, declared here rather than chosen after: cells whose resting
+#   level sits inside the demanded band. Roughly 40% of v19's cells sat outside it
+#   and could not be controlled by any scheme — they will score identically badly in
+#   both arms and dilute the contrast. Report both the full and the restricted
+#   comparison.
+#
+#   TOTAL DELIVERED LIGHT PER ARM is a primary number, not a footnote. If the arms
+#   differ materially in light the contrast is contaminated and must be reported as
+#   such. Unlike an open-loop arm this one adapts its own level, so a large gap here
+#   is itself a finding rather than a design fault.
+#
+#   PAIRED WITHIN FIELD. Every field contributes both arms; the contrast is computed
+#   within field and then pooled.
+#
+# WHAT A NULL WOULD MEAN. If the two arms track equally well, the per-cell machinery
+# is not earning its place at this objective and timescale, and that is the finding.
+# It is only interpretable because the floor above was computed in advance — an
+# underpowered null says nothing. Read it as "individuation buys less than the floor",
+# not as "individuation does nothing".
+
+[default]
+checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
+control_horizon = 30
+levels_ms = [0, 20, 45, 85, 150]
+controller = { type = "population_mpc", share = "half", group_stride = 4 }
+kernel = "l2"
+lambda_move = 0.0
+objective = { type = "oscillation", low = 0.85, high = 1.1, t_low_min = 24, t_rise_min = 2, t_high_min = 24, t_fall_min = 10, settle_periods = 1.0, n_phase_groups = 1 }
+
+[fov.0]
+arm = 1
+
+[fov.1]
+arm = 1
+
+[fov.2]
+arm = 1
+
+[fov.3]
+arm = 1
+
+[fov.4]
+arm = 1
+
+[fov.5]
+arm = 1
+
+[fov.6]
+arm = 1
+
+[fov.7]
+arm = 1

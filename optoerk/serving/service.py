@@ -546,6 +546,11 @@ class InferenceService:
             )
             # What the controller believed about the plan it picked. `None` on the
             # stub, which has neither a cost nor a forward model.
+            # Controllers that split the field into arms expose the membership test;
+            # everything else leaves the key off the record entirely rather than
+            # writing a constant that looks like a measurement.
+            _ctrl = getattr(engine, "controller", None)
+            _shares_dose = getattr(_ctrl, "shares_dose", None)
             costs = getattr(engine, "last_plan_cost", None) or [None] * len(frames)
             preds = getattr(engine, "last_pred_cnr_h1", None) or [None] * len(frames)
             for rec, f, ms, note, cost, pred in zip(
@@ -574,6 +579,13 @@ class InferenceService:
                 # real area or a constant. None here means the fallback was fed.
                 rec["nuc_area"] = None if f.nuc_area is None else float(f.nuc_area)
                 rec["plan_cost"] = None if cost is None else float(cost)
+                # Which control arm this cell was in, when the controller runs more
+                # than one. Without it the run cannot be analysed at all: the split
+                # is a function of the particle id and the controller's parameters,
+                # and reconstructing it afterwards from a policy file means trusting
+                # that the file on disk is the one that ran.
+                if _shares_dose is not None:
+                    rec["shared_dose"] = bool(_shares_dose(f.state.particle))
                 # decide() predicted under the dose it commanded; a dark cell is
                 # forced to 0 ms afterwards, so that prediction is for a dose that
                 # was never applied. Null rather than log a number that is wrong.
