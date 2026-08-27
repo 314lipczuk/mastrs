@@ -47,6 +47,7 @@ bit-for-bit the historical behaviour. Register custom objectives with
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
@@ -213,6 +214,357 @@ class ScheduleReference(Reference):
 
     def describe(self):
         return {"type": self.name, "points": [list(p) for p in self.points]}
+
+
+class PiecewiseLinearReference(Reference):
+    """Setpoint linearly interpolated between ``points = [[t0, cnr0], ...]``.
+
+    The ramp counterpart to :class:`ScheduleReference`, and deliberately the same
+    interface: a list of ``[control_frame, target_cnr]`` knots written out in the
+    policy file and echoed verbatim at startup, so the analysis reads the waveform
+    rather than regenerating it from parameters.
+
+    Between two knots the setpoint moves linearly; before the first and after the
+    last it is held. A **flat segment is written as two knots with the same value**,
+    which is why holds and ramps compose in one list — ``[[0, 0.9], [25, 0.9],
+    [35, 1.1]]`` is a 25 min hold followed by a 10 min ramp.
+
+    **Why this exists rather than a period parameter.** :class:`StepTrainReference`
+    generates one waveform and repeats it, so every cycle is identical; the
+    frequency staircase varies the period on its own block schedule. Neither can
+    express an arbitrary, counterbalanced *order* of differing blocks — which is
+    what an experiment that varies the demand block by block needs, and what
+    ``schedule`` already provides for piecewise-constant demands. This is that,
+    with ramps.
+
+    **No phase groups.** A per-cell phase offset (see
+    :class:`StepTrainReference`) is incompatible with a frame-indexed
+    :class:`ScoreMask`: the mask is a pure function of the frame, so an unscored
+    window would land at a different point in each cell's waveform and an arm would
+    stop denoting one thing. Every cell here sees the same waveform at the same
+    time. The aliasing that phase groups defend against must instead be broken by
+    counterbalancing the blocks against the clock.
+
+    ``marks`` optionally labels stretches of the timeline — ``[[t, "label"], ...]``,
+    piecewise-constant in the same way ``schedule`` is. The active label is written
+    into the prediction log every frame, so block identity never has to be
+    recovered by pattern-matching the waveform offline. That recovery has a known
+    trap: a block whose demand returns to the anchor mid-block is indistinguishable
+    from a block boundary by value alone.
+    """
+
+    name = "piecewise_linear"
+
+    def __init__(
+        self,
+        points: Sequence[Sequence[float]],
+        marks: Sequence[Sequence[Any]] | None = None,
+    ):
+        self.points = sorted((float(t), float(v)) for t, v in points)
+        if not self.points:
+            raise ValueError(
+                "piecewise_linear needs at least one [control_frame, target_cnr] point"
+            )
+        ts = [t for t, _ in self.points]
+        if len(set(ts)) != len(ts):
+            dupes = sorted({t for t in ts if ts.count(t) > 1})
+            raise ValueError(
+                f"piecewise_linear: duplicate knot times {dupes}. Two values at one "
+                f"time is an ambiguous jump; to hold then move, repeat the VALUE at "
+                f"two different times."
+            )
+        self.marks = sorted((float(t), str(m)) for t, m in (marks or []))
+        self.frame_interval_min = FRAME_INTERVAL_MIN
+
+    def value_at(self, t: float) -> float:
+        pts = self.points
+        if t <= pts[0][0]:
+            return pts[0][1]
+        if t >= pts[-1][0]:
+            return pts[-1][1]
+        lo = 0
+        hi = len(pts) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if pts[mid][0] <= t:
+                lo = mid
+            else:
+                hi = mid
+        t0, v0 = pts[lo]
+        t1, v1 = pts[hi]
+        return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+
+    def slope_at(self, t: float) -> float:
+        """Rate of change of the setpoint at ``t``, in CNR per minute.
+
+        Reported into the log because "which way is the reference moving when this
+        block opens" is the quantity a phase contrast is about, and it is not
+        recoverable from a single logged setpoint value.
+        """
+        pts = self.points
+        if t < pts[0][0] or t >= pts[-1][0] or len(pts) == 1:
+            return 0.0
+        lo = 0
+        hi = len(pts) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if pts[mid][0] <= t:
+                lo = mid
+            else:
+                hi = mid
+        t0, v0 = pts[lo]
+        t1, v1 = pts[hi]
+        return (v1 - v0) / (t1 - t0) / self.frame_interval_min
+
+    def mark_at(self, t: float) -> str | None:
+        """The label in force at ``t``; piecewise-constant, like ``schedule``."""
+        out = None
+        for t_mark, label in self.marks:
+            if t >= t_mark:
+                out = label
+            else:
+                break
+        return out
+
+    def values(self, ctx, horizon, device):
+        row = [self.value_at(ctx.control_frame + h) for h in range(horizon)]
+        return torch.tensor(
+            [row] * len(ctx.cells), dtype=torch.float32, device=device
+        )
+
+    def annotate(self, ctx):
+        t = ctx.control_frame
+        rec = {
+            "r_t": self.value_at(t),
+            "r_slope_per_min": self.slope_at(t),
+        }
+        mark = self.mark_at(t)
+        if mark is not None:
+            rec["block"] = mark
+        return [dict(rec) for _ in ctx.cells]
+
+    def describe(self):
+        out = {
+            "type": self.name,
+            "points": [list(p) for p in self.points],
+            "frame_interval_min": self.frame_interval_min,
+        }
+        if self.marks:
+            out["marks"] = [list(m) for m in self.marks]
+        return out
+
+
+class SegmentedReference(Reference):
+    """A labelled sequence of waveform segments, each starting where the last ended.
+
+    Written for experiments whose demand varies **block by block** in a
+    counterbalanced order — which neither :class:`StepTrainReference` (one waveform,
+    repeated) nor :class:`FrequencyStaircaseReference` (blocks ordered by period)
+    can express, and which :class:`ScheduleReference` and
+    :class:`PiecewiseLinearReference` can only express as a knot list too long to
+    read or argue about in a policy file.
+
+    A segment is ``{kind, minutes, label, ...}`` and there are three kinds::
+
+        {kind = "hold", minutes = 24, label = "runup_01_A"}          # holds where it is
+        {kind = "hold", minutes = 12, value = 0.80, label = "dark"}  # or at a stated value
+        {kind = "ramp", minutes = 18, to = 0.97, label = "settle"}   # linear, to `to`
+        {kind = "sine", minutes = 40, period_min = 20, direction = 1,
+         amplitude_pp = 0.16, label = "demand_01_A"}
+
+    **Continuity is structural, not the author's job.** A segment with no stated
+    value begins at the value the previous one ended on, and a ``sine`` oscillates
+    about that value rather than about a number written separately. A block
+    therefore cannot drift away from the anchor the run-up was holding, because it
+    is not given the opportunity to name a different one.
+
+    **Whole cycles are enforced.** A ``sine`` segment's duration must be an integer
+    number of its own periods, so it closes on its midline — the value it opened
+    at. Blocks then butt together with no step anywhere in the run, which matters
+    because a demanded step is a dead-time failure that every arm shares equally
+    and so contributes nothing but common error to a between-arm contrast. A
+    fractional cycle count is a :class:`PolicyViolation`: it parses, it runs, and
+    it silently puts a step at every block boundary.
+
+    **Why a sine rather than ramps.** These cells are first order with dead time,
+    so a corner — a discontinuity in the first derivative — is unreachable. On a
+    triangle at period 20 a corner arrives every 10 minutes against a 3-5 min dead
+    time, and the corner preceding a block's opening falls inside it, so what the
+    cells are doing when the block opens is set by an untrackable feature rather
+    than by whatever the controller did beforehand. A sine puts its steepest point
+    and zero curvature exactly at the midline crossing, and demands zero rate at
+    the peaks where a triangle is unreachable. (:class:`StepTrainReference` argues
+    the other way — correctly, for a bandwidth sweep, where separating rise time
+    from hold error IS the measurement. It is not the measurement here.)
+
+    No per-cell phase offsets, for the reason given on
+    :class:`PiecewiseLinearReference`: they cannot coexist with a frame-indexed
+    :class:`ScoreMask`.
+    """
+
+    name = "segments"
+
+    KINDS = ("hold", "ramp", "sine")
+
+    def __init__(self, segments: Sequence[dict[str, Any]], initial: float | None = None):
+        if not segments:
+            raise ValueError("segments: needs at least one segment")
+        self.initial = initial
+        self.frame_interval_min = FRAME_INTERVAL_MIN
+
+        self._segs: list[dict[str, Any]] = []
+        t = 0.0
+        current = initial
+        for i, raw in enumerate(segments):
+            spec = dict(raw)
+            kind = spec.pop("kind", None)
+            if kind not in self.KINDS:
+                raise ValueError(
+                    f"segments[{i}]: unknown kind {kind!r}; known: {list(self.KINDS)}"
+                )
+            minutes = float(spec.pop("minutes"))
+            if minutes <= 0:
+                raise ValueError(f"segments[{i}]: minutes must be > 0, got {minutes}")
+            label = spec.pop("label", None)
+
+            seg = {"kind": kind, "t0": t, "minutes": minutes, "label": label}
+
+            if kind == "hold":
+                v = spec.pop("value", None)
+                v = current if v is None else float(v)
+                if v is None:
+                    raise ValueError(
+                        f"segments[{i}]: the first segment has nothing to continue "
+                        f"from — give it a `value`, or pass `initial`."
+                    )
+                seg["v0"] = seg["v1"] = v
+            elif kind == "ramp":
+                if "to" not in spec:
+                    raise ValueError(f"segments[{i}]: a ramp needs `to`")
+                v1 = float(spec.pop("to"))
+                v0 = float(spec.pop("value", current)) if (
+                    "value" in spec or current is not None
+                ) else None
+                if v0 is None:
+                    raise ValueError(
+                        f"segments[{i}]: the first segment has nothing to continue "
+                        f"from — give it a `value`, or pass `initial`."
+                    )
+                seg["v0"], seg["v1"] = v0, v1
+            else:  # sine
+                if current is None and "value" not in spec:
+                    raise ValueError(
+                        f"segments[{i}]: a sine oscillates about the value it "
+                        f"begins at, and there is none — give it a `value`, or "
+                        f"pass `initial`."
+                    )
+                mid = float(spec.pop("value", current))
+                period = float(spec.pop("period_min"))
+                amp_pp = float(spec.pop("amplitude_pp"))
+                direction = int(spec.pop("direction", 1))
+                if period <= 0:
+                    raise ValueError(f"segments[{i}]: period_min must be > 0")
+                if amp_pp <= 0:
+                    raise ValueError(f"segments[{i}]: amplitude_pp must be > 0")
+                if direction not in (1, -1):
+                    raise ValueError(
+                        f"segments[{i}]: direction must be +1 (opens rising) or "
+                        f"-1 (opens falling), got {direction}"
+                    )
+                cycles = minutes / period
+                if abs(cycles - round(cycles)) > 1e-9:
+                    raise PolicyViolation(
+                        f"segments[{i}] ({label!r}): {minutes} min is {cycles:.4f} "
+                        f"cycles of a {period} min period. A sine segment must run a "
+                        f"whole number of cycles so it closes on the value it opened "
+                        f"at; a fractional count puts a demanded STEP at the segment "
+                        f"boundary, which no cell can follow and which charges every "
+                        f"arm the same dead-time error."
+                    )
+                seg.update(mid=mid, period=period, amp=amp_pp / 2.0,
+                           direction=direction, cycles=int(round(cycles)))
+                seg["v0"] = seg["v1"] = mid
+
+            if spec:
+                raise ValueError(
+                    f"segments[{i}]: unexpected keys for kind {kind!r}: {sorted(spec)}"
+                )
+            self._segs.append(seg)
+            current = seg["v1"]
+            t += minutes
+        self.total_min = t
+
+    # -- lookup ------------------------------------------------------------
+    def _seg_at(self, t: float) -> dict[str, Any]:
+        if t <= 0:
+            return self._segs[0]
+        if t >= self.total_min:
+            return self._segs[-1]
+        lo, hi = 0, len(self._segs) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._segs[mid]["t0"] <= t:
+                lo = mid
+            else:
+                hi = mid - 1
+        return self._segs[lo]
+
+    def value_at(self, t: float) -> float:
+        seg = self._seg_at(t)
+        u = min(max(t - seg["t0"], 0.0), seg["minutes"])
+        if seg["kind"] == "hold":
+            return seg["v0"]
+        if seg["kind"] == "ramp":
+            return seg["v0"] + (seg["v1"] - seg["v0"]) * u / seg["minutes"]
+        return seg["mid"] + seg["direction"] * seg["amp"] * math.sin(
+            2.0 * math.pi * u / seg["period"]
+        )
+
+    def slope_at(self, t: float) -> float:
+        """Rate of change of the setpoint, CNR per minute. Analytic, not differenced."""
+        if t < 0 or t >= self.total_min:
+            return 0.0
+        seg = self._seg_at(t)
+        u = min(max(t - seg["t0"], 0.0), seg["minutes"])
+        if seg["kind"] == "hold":
+            return 0.0
+        if seg["kind"] == "ramp":
+            return (seg["v1"] - seg["v0"]) / seg["minutes"] / self.frame_interval_min
+        w = 2.0 * math.pi / seg["period"]
+        return (seg["direction"] * seg["amp"] * w * math.cos(w * u)
+                / self.frame_interval_min)
+
+    def label_at(self, t: float) -> str | None:
+        return self._seg_at(t)["label"]
+
+    # -- Reference interface ----------------------------------------------
+    def values(self, ctx, horizon, device):
+        row = [self.value_at(ctx.control_frame + h) for h in range(horizon)]
+        return torch.tensor([row] * len(ctx.cells), dtype=torch.float32, device=device)
+
+    def annotate(self, ctx):
+        t = ctx.control_frame
+        rec = {"r_t": self.value_at(t), "r_slope_per_min": self.slope_at(t)}
+        label = self.label_at(t)
+        if label is not None:
+            rec["block"] = label
+        return [dict(rec) for _ in ctx.cells]
+
+    def describe(self):
+        out = []
+        for seg in self._segs:
+            d = {k: seg[k] for k in ("kind", "label", "t0", "minutes", "v0", "v1")}
+            if seg["kind"] == "sine":
+                d.update(period_min=seg["period"], amplitude_pp=2 * seg["amp"],
+                         direction=seg["direction"], cycles=seg["cycles"],
+                         peak_rate_per_min=seg["amp"] * 2 * math.pi / seg["period"])
+            out.append(d)
+        return {
+            "type": self.name,
+            "total_min": self.total_min,
+            "frame_interval_min": self.frame_interval_min,
+            "segments": out,
+        }
 
 
 # segment labels, in the order they occur within one period.
@@ -605,14 +957,29 @@ class FrequencyStaircaseReference(Reference):
 
 
 class Kernel:
-    """Score one candidate plan's predicted trajectory against the reference."""
+    """Score one candidate plan's predicted trajectory against the reference.
+
+    A kernel scores each horizon step (:meth:`terms`) and reduces over the horizon
+    (:meth:`cost`). The split exists so :class:`MaskedKernel` can reweight the
+    per-step scores of *any* kernel without reimplementing it.
+    """
 
     name = "kernel"
     needs_mixture = False
 
-    def cost(self, pred: Prediction, r: torch.Tensor) -> torch.Tensor:
-        """``r`` is (N, H); returns (N, M). Lower is better."""
+    def terms(self, pred: Prediction, r: torch.Tensor) -> torch.Tensor:
+        """Per-horizon-step cost. ``r`` is (N, H); returns (N, M, H)."""
         raise NotImplementedError
+
+    def cost(self, pred: Prediction, r: torch.Tensor,
+             ctx: GoalContext) -> torch.Tensor:
+        """``r`` is (N, H); returns (N, M). Lower is better.
+
+        ``ctx`` is passed so a kernel can condition on absolute time — which frame
+        of the experiment this horizon starts at. Kernels that weigh every step
+        alike ignore it.
+        """
+        return self.terms(pred, r).mean(dim=-1)
 
     def describe(self) -> dict[str, Any]:
         return {"type": self.name}
@@ -623,8 +990,8 @@ class L2Kernel(Kernel):
 
     name = "l2"
 
-    def cost(self, pred, r):
-        return ((pred.cnr - r.unsqueeze(1)) ** 2).mean(dim=-1)
+    def terms(self, pred, r):
+        return (pred.cnr - r.unsqueeze(1)) ** 2
 
 
 class BandKernel(Kernel):
@@ -662,7 +1029,7 @@ class BandKernel(Kernel):
                 f"band: half_width (delta) must be > 0, got {half_width}"
             )
 
-    def cost(self, pred, r):
+    def terms(self, pred, r):
         pi, mu, sigma = pred.require_mixture("band kernel")
         r4 = r.unsqueeze(1).unsqueeze(-1)                    # (N, 1, H, 1)
         s = sigma.clamp(min=self.SIGMA_FLOOR)
@@ -672,15 +1039,173 @@ class BandKernel(Kernel):
         hi = torch.special.ndtr((r4 + self.half_width - mu) / s)
         lo = torch.special.ndtr((r4 - self.half_width - mu) / s)
         p_in = (pi * (hi - lo)).sum(dim=-1)                  # (N, M, H)
-        return (1.0 - p_in).mean(dim=-1)                     # (N, M)
+        return 1.0 - p_in                                    # (N, M, H)
 
     def describe(self):
         return {"type": self.name, "half_width": self.half_width}
 
 
+# ---------------------------------------------------------------------------
+# scoring masks — which frames of the horizon count at all
+# ---------------------------------------------------------------------------
+
+
+class ScoreMask:
+    """Which control frames contribute to the cost, and which are left free.
+
+    Frames are counted from the start of control (``GoalContext.control_frame``),
+    the clock every reference schedule already uses — not faro's ``timestep``.
+
+    A mask is a pure function of the frame index. That is deliberate: which frames
+    were scored, and which were unscored, is fully recoverable offline from
+    :meth:`describe` in the startup log, so nothing has to be written per frame.
+    """
+
+    name = "mask"
+
+    def scored(self, frame: int) -> bool:
+        raise NotImplementedError
+
+    def describe(self) -> dict[str, Any]:
+        return {"type": self.name}
+
+
+class SpanMask(ScoreMask):
+    """Score only inside the half-open frame intervals ``[start, end)``.
+
+    Outside every span the reference is not scored, so the controller may put the
+    cells wherever it likes — and does so only in service of a scored frame later
+    inside its horizon. This is the "unscored preparation window" shape: one span
+    that begins after the window ends.
+    """
+
+    name = "spans"
+
+    def __init__(self, spans: Sequence[Sequence[float]]):
+        self.spans = [(int(a), int(b)) for a, b in spans]
+        if not self.spans:
+            raise ValueError("spans mask needs at least one [start, end) interval")
+        for a, b in self.spans:
+            if b <= a:
+                raise ValueError(f"spans mask: empty interval [{a}, {b})")
+
+    def scored(self, frame):
+        return any(a <= frame < b for a, b in self.spans)
+
+    def describe(self):
+        return {"type": self.name, "spans": [list(s) for s in self.spans]}
+
+
+class CombMask(ScoreMask):
+    """Score ``width`` frames out of every ``every``, the first at ``first``.
+
+    The sparse-waypoint shape: ``every = 5, width = 1`` scores frames first,
+    first+5, first+10, ... and nothing in between, so the reference states where to
+    be at those moments and says nothing about the path between them.
+    """
+
+    name = "comb"
+
+    def __init__(self, every: int, width: int = 1, first: int = 0):
+        self.every, self.width, self.first = int(every), int(width), int(first)
+        if self.every < 1:
+            raise ValueError(f"comb mask: every must be >= 1, got {every}")
+        if not 1 <= self.width <= self.every:
+            raise ValueError(
+                f"comb mask: width must be in [1, every={self.every}], got {width}"
+            )
+        if self.first < 0:
+            raise ValueError(f"comb mask: first must be >= 0, got {first}")
+
+    def scored(self, frame):
+        if frame < self.first:
+            return False
+        return (frame - self.first) % self.every < self.width
+
+    def describe(self):
+        return {"type": self.name, "every": self.every,
+                "width": self.width, "first": self.first}
+
+
+MASKS: dict[str, Callable[..., ScoreMask]] = {
+    "spans": lambda **kw: SpanMask(**kw),
+    "comb": lambda **kw: CombMask(**kw),
+}
+
+
+def build_mask(spec: dict[str, Any]) -> ScoreMask:
+    """``{type = "comb", every = 5}`` or ``{type = "spans", spans = [[45, 105]]}``."""
+    spec = dict(spec)
+    kind = spec.pop("type", None)
+    if kind not in MASKS:
+        raise KeyError(f"unknown score mask {kind!r}; known: {sorted(MASKS)}")
+    try:
+        return MASKS[kind](**spec)
+    except TypeError as e:
+        raise TypeError(f"bad params for score mask {kind!r}: {e}") from e
+
+
+class MaskedKernel(Kernel):
+    """Score ``inner`` on the frames ``mask`` selects and ignore the rest.
+
+    **Why this is a kernel and not a reference.** The target trajectory is
+    unchanged; only which parts of it count. Living here means a controlled
+    comparison can vary *which frames are scored* per arm through
+    ``PolicySpec.kernel`` while the reference stays byte-identical across every
+    arm — the invariant the policy file is built around. A mask on the reference
+    would break it for exactly the experiments that need masks.
+
+    **The reduction is a mean over the scored frames, not over the horizon.** A sum
+    would scale the cost with how many frames an arm happens to score, and since
+    the regularizers are added in absolute units, an arm scoring 5 frames of 30
+    would end up with a six-times-stronger effective ``lambda_move`` /
+    ``lambda_dose`` than an arm scoring all 30. Two arms meant to differ only in
+    sparsity would differ in their controller too.
+
+    **A horizon containing no scored frame costs exactly zero for every plan.** The
+    controller is then *indifferent*, not free: what it commands is decided by the
+    regularizers if any are switched on and by CEM sampling noise if none are. With
+    the production checkpoint's ``future_len`` of 30 this is the state more than 30
+    frames ahead of the next scored frame, so a free window longer than the horizon
+    does not buy longer planning — it buys undefined behaviour. Design the window
+    to fit inside the horizon, or switch on ``lambda_dose`` so indifference resolves
+    to darkness rather than to noise.
+    """
+
+    name = "masked"
+
+    def __init__(self, inner: Kernel | str | dict[str, Any], mask: ScoreMask | dict):
+        self.inner = inner if isinstance(inner, Kernel) else build_kernel(inner)
+        self.mask = mask if isinstance(mask, ScoreMask) else build_mask(mask)
+
+    @property
+    def needs_mixture(self) -> bool:
+        return self.inner.needs_mixture
+
+    def terms(self, pred, r):
+        return self.inner.terms(pred, r)
+
+    def cost(self, pred, r, ctx):
+        terms = self.inner.terms(pred, r)                    # (N, M, H)
+        t0 = ctx.control_frame
+        w = torch.tensor(
+            [float(self.mask.scored(t0 + h)) for h in range(terms.shape[-1])],
+            dtype=terms.dtype, device=terms.device,
+        )
+        n_scored = float(w.sum())
+        if n_scored == 0.0:
+            return terms.new_zeros(terms.shape[:2])
+        return (terms * w).sum(dim=-1) / n_scored
+
+    def describe(self):
+        return {"type": self.name, "inner": self.inner.describe(),
+                "mask": self.mask.describe()}
+
+
 KERNELS: dict[str, Callable[..., Kernel]] = {
     "l2": lambda **kw: L2Kernel(**kw),
     "band": lambda **kw: BandKernel(**kw),
+    "masked": lambda **kw: MaskedKernel(**kw),
 }
 
 
@@ -818,7 +1343,7 @@ class Objective:
 
     def cost(self, pred: Prediction, ctx: GoalContext) -> torch.Tensor:
         r = self.targets(ctx, pred.cnr.shape[-1], pred.cnr.device)
-        total = self.kernel.cost(pred, r)
+        total = self.kernel.cost(pred, r, ctx)
         for reg in self.regularizers:
             total = total + reg.cost(pred)
         return total
@@ -933,6 +1458,42 @@ def schedule(
         build_kernel(kernel),
         _regularizers(lambda_move, lambda_dose),
         name="schedule",
+    )
+
+
+@register("piecewise_linear")
+def piecewise_linear(
+    points: Sequence[Sequence[float]],
+    marks: Sequence[Sequence[Any]] | None = None,
+    kernel: str | dict[str, Any] = "l2",
+    lambda_move: float = 0.0,
+    lambda_dose: float = 0.0,
+) -> Objective:
+    """Linearly interpolated setpoint over time; see
+    :class:`PiecewiseLinearReference`."""
+    return Objective(
+        PiecewiseLinearReference(points, marks=marks),
+        build_kernel(kernel),
+        _regularizers(lambda_move, lambda_dose),
+        name="piecewise_linear",
+    )
+
+
+@register("segments")
+def segments(
+    segments: Sequence[dict[str, Any]],
+    initial: float | None = None,
+    kernel: str | dict[str, Any] = "l2",
+    lambda_move: float = 0.0,
+    lambda_dose: float = 0.0,
+) -> Objective:
+    """A labelled sequence of hold / ramp / sine segments; see
+    :class:`SegmentedReference`."""
+    return Objective(
+        SegmentedReference(segments, initial=initial),
+        build_kernel(kernel),
+        _regularizers(lambda_move, lambda_dose),
+        name="segments",
     )
 
 

@@ -119,6 +119,177 @@ def _positions_index(tracks_dir) -> dict | None:
     }
 
 
+#: Track columns a ``/predict`` payload is rebuilt from. ``cnr_median`` is the
+#: model's cnr channel, ``x``/``y`` feed the crowding features, and the last two
+#: are the optoRTK-expression measurement and the nuclear area, which reach the
+#: service under these exact names (see ``features.OPTORTK_KEYS`` / ``AREA_KEYS``).
+TRACK_PAYLOAD_COLS = (
+    "timestep", "particle", "cnr_median", "x", "y",
+    "ref_mean_intensity", "area_nuc",
+)
+
+#: The phase whose frames the server was actually sent. faro's track files are
+#: cumulative and contain the optocheck rows too, but the optocheck is its own
+#: acquisition phase and never reaches ``/predict`` — replaying it would advance
+#: every cell's encoder by frames the live run never took.
+CONTROLLED_PHASE = "CNRhold"
+
+
+def load_track_frames(source: str | Path, phase: str = CONTROLLED_PHASE) -> pl.DataFrame:
+    """Faro's own per-cell output, reduced to what a payload needs.
+
+    ``source`` is either a ``tracks/`` directory of ``<fov>_*.parquet`` files, in
+    which case the FOV comes from the leading integer of the filename, or a single
+    consolidated parquet carrying its own ``fov`` column.
+
+    **This is the path that does not need the serving log.** Everything the
+    controller consumes is here, and the one thing that is not — the previous
+    frame's commanded dose — is held in the service's own per-cell state and
+    carried forward by replaying the frames in order.
+    """
+    def _prepare(df: pl.DataFrame, where: str) -> pl.DataFrame | None:
+        """Filter to the controlled phase and reduce to the payload columns.
+
+        Done per file rather than after concatenating: faro writes one parquet per
+        (fov, phase) and their schemas differ, so a whole-file concat fails on the
+        optocheck files — which carry no controlled frames and are dropped here.
+        """
+        if "phase_name" in df.columns:
+            df = df.filter(pl.col("phase_name") == phase)
+        if df.is_empty():
+            return None
+        missing = [c for c in ("timestep", "particle", "cnr_median", "x", "y")
+                   if c not in df.columns]
+        if missing:
+            raise KeyError(f"{where} is missing required track columns: {missing}")
+        # The optional two are filled with nulls rather than dropped, so a run with
+        # no optocheck replays with expression falling back to the population mean
+        # — exactly what the live service would have done.
+        for c in ("ref_mean_intensity", "area_nuc"):
+            if c not in df.columns:
+                df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias(c))
+        return df.select("fov", *TRACK_PAYLOAD_COLS).with_columns(
+            pl.col("fov").cast(pl.Int64),
+            pl.col("particle").cast(pl.Int64),
+            *[pl.col(c).cast(pl.Float64) for c in TRACK_PAYLOAD_COLS if c != "timestep"
+              and c != "particle"],
+            pl.col("timestep").cast(pl.Int64),
+        )
+
+    src = Path(source)
+    if src.is_dir():
+        parts = []
+        for path in sorted(src.glob("*.parquet")):
+            stem = path.stem.split("_")[0]
+            if not stem.isdigit():
+                continue
+            df = pl.read_parquet(path).with_columns(
+                pl.lit(int(stem)).cast(pl.Int64).alias("fov"))
+            got = _prepare(df, str(path))
+            if got is not None:
+                parts.append(got)
+        if not parts:
+            raise FileNotFoundError(
+                f"no <fov>_*.parquet under {src} carried phase {phase!r}")
+        out = pl.concat(parts, how="vertical")
+    else:
+        df = pl.read_parquet(src)
+        if "fov" not in df.columns:
+            raise KeyError(f"{src} has no `fov` column; pass a tracks/ directory instead")
+        got = _prepare(df, str(src))
+        if got is None:
+            raise ValueError(
+                f"{src} has no rows for phase {phase!r}. Replaying the wrong phase "
+                f"feeds the encoder frames the live run never saw."
+            )
+        out = got
+    return out.sort(["timestep", "fov", "particle"])
+
+
+def iter_track_payloads(frames: pl.DataFrame) -> Iterator[dict]:
+    """``/predict`` payloads in the order the live service received them.
+
+    Ordered by ``timestep`` then ``fov``, which is how faro walks the stage. The
+    order is load-bearing: every FOV's encoder state, baseline and last-applied
+    dose advance one frame per call, and the expression cohort is shared across
+    FOVs, so a shuffled replay is a different run.
+    """
+    for (ts, fov), grp in frames.group_by(["timestep", "fov"], maintain_order=True):
+        cells = [
+            {"particle": int(r["particle"]), "cnr_median": r["cnr_median"],
+             "x": r["x"], "y": r["y"],
+             "ref_mean_intensity": r["ref_mean_intensity"],
+             "area_nuc": r["area_nuc"]}
+            for r in grp.iter_rows(named=True)
+        ]
+        yield {"fov": int(fov), "timestep": int(ts), "cells": cells}
+
+
+def replay_from_tracks(
+    source: str | Path,
+    cfg: ServerConfig,
+    policy_file=None,
+    limit: int | None = None,
+    phase: str = CONTROLLED_PHASE,
+) -> pl.DataFrame:
+    """Reconstruct the commanded exposures from faro's tracks alone.
+
+    One row per (fov, timestep, particle) with the exposure this configuration
+    commands. There is nothing to compare against here — that is the point, it is
+    for runs whose serving log did not survive. Validate the procedure on a run
+    whose log DID survive first (:func:`compare_track_replay`), because a
+    reconstruction with no reference is only as good as the evidence that the same
+    recipe reproduces a known answer.
+    """
+    frames = load_track_frames(source, phase=phase)
+    service = InferenceService(cfg, policy_file=policy_file)
+    rows = []
+    try:
+        for i, payload in enumerate(iter_track_payloads(frames)):
+            if limit is not None and i >= limit:
+                break
+            out = service.predict(payload)
+            got = out["exposures"]
+            for cell in payload["cells"]:
+                rows.append({
+                    "fov": payload["fov"], "timestep": payload["timestep"],
+                    "particle": cell["particle"],
+                    "cnr_median": cell["cnr_median"],
+                    "exposure_ms": got.get(str(cell["particle"])),
+                })
+    finally:
+        service.close()
+    return pl.DataFrame(rows)
+
+
+def compare_track_replay(
+    reconstructed: pl.DataFrame, log_path: str | Path
+) -> tuple[pl.DataFrame, dict]:
+    """Score a track-driven reconstruction against a run's real serving log.
+
+    This is the acceptance gate for :func:`replay_from_tracks`. ``match_frac`` is
+    the fraction of cell-frames whose reconstructed exposure equals the one the
+    run actually commanded; anything below 1.0 means the reconstruction is an
+    estimate and must be reported as one.
+    """
+    rec = pl.DataFrame([
+        {"fov": r["fov"], "timestep": r["timestep"],
+         "particle": c["particle"], "exposure_recorded": c["exposure_ms"]}
+        for r in iter_predict_records(log_path) for c in r.get("cells", [])
+    ])
+    j = reconstructed.join(rec, on=["fov", "timestep", "particle"], how="inner")
+    if j.is_empty():
+        return j, {"n": 0, "match_frac": float("nan")}
+    d = (j["exposure_ms"] - j["exposure_recorded"]).abs()
+    return j, {
+        "n": j.height,
+        "match_frac": float((d < 1e-6).mean()),
+        "mean_abs_error_ms": float(d.mean()),
+        "max_abs_error_ms": float(d.max()),
+        "frames": int(j.select(["fov", "timestep"]).unique().height),
+    }
+
+
 def replay(
     log_path: str | Path,
     cfg: ServerConfig,

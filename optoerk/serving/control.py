@@ -505,6 +505,161 @@ class OpenLoopController(Controller):
         }
 
 
+class PrescribedWindowController(Controller):
+    """Commands a written-down dose on some frames and defers to an inner
+    controller on the rest.
+
+    This exists for experiments where the cells' LIGHT HISTORY is the variable and
+    their state at the moment of measurement is not. An arm that leaves the history
+    to a controller cannot separate those two things: the controller picks the
+    history using the model, so a difference between arms is a difference in what
+    the model believed rather than in what the cells did, and the arms also finish
+    the window in different states, so a difference afterwards may be position
+    rather than history. Prescribing the window removes both. Every arm delivers a
+    stated pattern of light, and the inner controller then brings every arm to the
+    same level before the measured part begins.
+
+    ``windows`` are in CONTROL frames — frames since this FOV's first controlled
+    frame — never faro's ``timestep``, which starts wherever the acquisition's
+    earlier phases left off. That is the same clock every reference schedule uses,
+    so a window and a waveform written against it stay aligned.
+
+    With ``period`` set the windows repeat every ``period`` frames, which is what
+    lets one run hold many blocks and makes the comparison within-field.
+
+    The plan cost logged on a prescribed frame is the model's score for the rest of
+    the window followed by its last dose held. Past the window's end that is a
+    fiction — the inner controller will actually choose — but it is only logged,
+    never acted on, and it keeps ``plan_cost`` on the same scale as the closed-loop
+    frames so the two kinds of frame stay comparable.
+    """
+
+    name = "prescribed_window"
+
+    def __init__(
+        self,
+        levels_ms: np.ndarray,
+        windows: Sequence[dict[str, Any]],
+        inner: dict[str, Any] | None = None,
+        period: int | None = None,
+        offset: int = 0,
+    ):
+        self.levels_ms = np.asarray(levels_ms, dtype=np.float64)
+        self.period = None if period is None else int(period)
+        # Frames before the blocks begin — a settle, typically. Without it the
+        # block period would have to divide the settle length exactly, and a
+        # window written against block minutes would silently sit at the wrong
+        # phase of every block for the whole run.
+        self.offset = int(offset)
+        if self.offset < 0:
+            raise ValueError(f"prescribed_window: offset must be >= 0, got {offset}")
+        if self.period is not None and self.period < 1:
+            raise ValueError(f"prescribed_window: period must be >= 1, got {period}")
+        if not windows:
+            raise ValueError("prescribed_window needs at least one window")
+        self.windows: list[tuple[int, int, np.ndarray]] = []
+        for w in windows:
+            start, stop = int(w["start"]), int(w["stop"])
+            seq = np.asarray(list(w["sequence_ms"]), dtype=np.float64)
+            if stop <= start:
+                raise ValueError(
+                    f"prescribed_window: empty window [{start}, {stop})"
+                )
+            if seq.size == 0:
+                raise ValueError("prescribed_window: window has empty sequence_ms")
+            if np.any(seq < 0):
+                raise ValueError(
+                    f"prescribed_window: negative doses in {seq.tolist()}"
+                )
+            if self.period is not None and stop > self.period:
+                raise ValueError(
+                    f"prescribed_window: window [{start}, {stop}) runs past "
+                    f"period={self.period}; it would wrap into the next block"
+                )
+            # A window shorter than its sequence would silently truncate the
+            # history the arm is defined by, which is the one thing that must not
+            # happen quietly here.
+            if seq.size != stop - start:
+                raise ValueError(
+                    f"prescribed_window: window [{start}, {stop}) is "
+                    f"{stop - start} frames but sequence_ms has {seq.size}. The "
+                    f"sequence IS the arm; it must be written out frame by frame."
+                )
+            self.windows.append((start, stop, seq))
+        self.windows.sort()
+        for (a0, a1, _), (b0, _b1, _) in zip(self.windows, self.windows[1:]):
+            if b0 < a1:
+                raise ValueError(
+                    f"prescribed_window: windows [{a0}, {a1}) and [{b0}, ...) "
+                    f"overlap; a frame cannot have two prescribed doses"
+                )
+        self.inner = build_controller(dict(inner or {"type": SequenceMPC.name}),
+                                      self.levels_ms)
+
+    def _phase(self, control_frame: int) -> int | None:
+        """Frame index within the block, or None while still in the offset."""
+        f = int(control_frame) - self.offset
+        if f < 0:
+            return None
+        return f % self.period if self.period is not None else f
+
+    def window_at(self, control_frame: int):
+        f = self._phase(control_frame)
+        if f is None:
+            return None
+        for start, stop, seq in self.windows:
+            if start <= f < stop:
+                return start, stop, seq
+        return None
+
+    def dose_at(self, control_frame: int) -> float | None:
+        """The prescribed dose at this frame, or None if the inner controller owns it."""
+        w = self.window_at(control_frame)
+        if w is None:
+            return None
+        start, _stop, seq = w
+        return float(seq[self._phase(control_frame) - start])  # _phase is not None here
+
+    def _dose_or_hold(self, control_frame: int, fallback: float) -> float:
+        """Prescribed dose, else the last prescribed dose held. Used only to build
+        the logged horizon plan, never to command."""
+        d = self.dose_at(control_frame)
+        return fallback if d is None else d
+
+    def plan(self, plant, h, c, cnr_fb, objective, ctx):
+        ms = self.dose_at(ctx.control_frame)
+        if ms is None:
+            return self.inner.plan(plant, h, c, cnr_fb, objective, ctx)
+
+        N, H = h.shape[1], plant.horizon
+        device = plant.device
+        future = torch.tensor(
+            [self._dose_or_hold(ctx.control_frame + i, ms) for i in range(H)],
+            dtype=torch.float32, device=device,
+        )
+        fut = plant.std_fluence(future).view(1, 1, H).expand(N, 1, H)
+        plan_ms = future.view(1, 1, H).expand(N, 1, H) if objective.needs_plan else None
+        cost = self._score(plant, h, c, cnr_fb, fut, plan_ms, objective, ctx)
+        return torch.full((N,), float(ms), device=device), cost[:, 0]
+
+    def describe(self) -> dict[str, Any]:
+        # The sequences go in the startup record in full. An arm that is only named
+        # and not written down cannot be reconstructed from the log, and these arms
+        # ARE their sequences.
+        return {
+            "type": self.name,
+            "levels_ms": self.levels_ms.tolist(),
+            "period": self.period,
+            "offset": self.offset,
+            "windows": [
+                {"start": a, "stop": b, "sequence_ms": s.tolist(),
+                 "total_ms": float(s.sum())}
+                for a, b, s in self.windows
+            ],
+            "inner": self.inner.describe(),
+        }
+
+
 class PopulationMPC(SequenceMPC):
     """One dose for a whole group of cells, planned for a typical member of it.
 
@@ -616,8 +771,13 @@ class PopulationMPC(SequenceMPC):
         shared = self._shared_mask(ctx, ms.device)
         if not bool(shared.any()):
             return ms, cost
-        ms = ms.clone()
-        cost = cost.clone()
+        # Built with `torch.where` rather than index assignment. `ms[same] = ms[rep]`
+        # reads a VIEW of the tensor it writes into, which CUDA rejects outright
+        # ("elements of the input tensor and the written-to tensor refer to a single
+        # memory location") while CPU tolerates it silently — so it passes every test
+        # on a laptop and fails on the rig. Both reads below come from the untouched
+        # originals, so the result cannot depend on the order groups are visited in.
+        ms_out, cost_out = ms.clone(), cost.clone()
         for idx in self._broadcast_groups(shared, ctx, objective):
             rep = self._representative(cnr_fb, idx)
             if rep < 0:
@@ -631,9 +791,9 @@ class PopulationMPC(SequenceMPC):
             # The cost is broadcast with the dose on purpose: every cell in the group
             # is being commanded on the strength of one plan, and the log should say
             # so rather than report a per-cell cost nothing acted on.
-            ms[same] = ms[rep]
-            cost[same] = cost[rep]
-        return ms, cost
+            ms_out = torch.where(same, ms[rep], ms_out)
+            cost_out = torch.where(same, cost[rep], cost_out)
+        return ms_out, cost_out
 
     def describe(self) -> dict[str, Any]:
         d = super().describe()
@@ -646,6 +806,7 @@ CONTROLLERS: dict[str, type[Controller]] = {
     SequenceMPC.name: SequenceMPC,
     StaggeredCadenceMPC.name: StaggeredCadenceMPC,
     OpenLoopController.name: OpenLoopController,
+    PrescribedWindowController.name: PrescribedWindowController,
     PopulationMPC.name: PopulationMPC,
 }
 

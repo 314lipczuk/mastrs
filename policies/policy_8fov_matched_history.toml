@@ -1,0 +1,286 @@
+# 8 FOVs, four LIGHT HISTORIES, two replicates each. Every arm arrives at the
+# same activity when the measured part begins; they differ only in how they got
+# there. Checkpoint, ladder, horizon, reference and the closed-loop controller are
+# identical across all eight fields.
+#
+#   arm 1  fov 0, 7   dark             no light in the run-up
+#   arm 2  fov 2, 5   sustained low    45 ms every minute
+#   arm 3  fov 1, 6   pulsed high      150 ms every 4th minute
+#   arm 4  fov 3, 4   front loaded     150 ms for 5 minutes, then dark
+#
+#   fov   0  1  2  3  4  5  6  7
+#   arm   1  3  2  4  4  2  3  1
+#
+# Arms 2, 3 and 4 deliver 765, 750 and 750 ms of light respectively — matched to
+# within 2%. Arm 1 delivers none. So a difference among 2, 3 and 4 is a difference
+# in the PATTERN of light, not in how much; arm 1 is the zero.
+#
+# Run:
+#   uv run python -m optoerk.serving.app --device cuda \
+#       --policy-file policies/policy_8fov_matched_history.toml \
+#       --live-optortk-expr --optortk-cohort-frames 10 \
+#       --frame-interval-min 1.0 --predict-log run.jsonl
+#
+# PAIRED WITH policy_8fov_free_runup.toml. Same checkpoint, ladder, block geometry,
+# reference and demand; that file leaves the run-up to the controller, this one
+# writes it down. The demand windows are directly comparable between the two runs.
+
+
+# --- WHAT THIS RUN ASKS -----------------------------------------------------
+# Does the cells' response depend on their light history once their measured
+# activity has been matched?
+#
+# If the system were first-order — one state, which is the activity you can see —
+# the answer is no by construction: two cells at 0.85 are in the same state
+# whatever happened before. Every reachability and lead-time number computed for
+# these experiments assumed exactly that. The candidates for extra state are the
+# optoRTK pool, the cascade's feedback variable, and refractoriness, and any of
+# them would make history matter after activity has returned to the anchor.
+#
+# WHY THE RUN-UP IS WRITTEN DOWN RATHER THAN CHOSEN. An arm that lets a controller
+# pick the history cannot separate two things. The controller picks it using the
+# model, so a difference between arms is a difference in what the MODEL believed
+# rather than in what the cells did. And among plans that satisfy the demand
+# equally the controller is indifferent, so part of what it does is sampling noise
+# and will not repeat. Prescribing removes both. Nothing in the run-up is left to
+# discretion, so anything that survives into the demand is the cells.
+#
+# THE MATCHED HOLD IS WHAT MAKES IT A CONTROLLED COMPARISON. Minutes 17 to 24 of
+# every block are closed-loop at the anchor, so all four arms are driven to the
+# same measured activity before the demand opens. Any difference afterwards cannot
+# be position, because the positions are equal.
+#
+#   THE HOLD LENGTH SETS THE TIMESCALE THE RUN CAN SEE. Eight minutes is a few
+#   times the measured decay constant of ~3 min, so any state that relaxes faster
+#   than that will have relaxed away. A difference that survives it is therefore
+#   SLOW state, and the hold length is the lower bound to quote. Shortening it
+#   would admit faster state and weaken the matching; lengthening it would erase
+#   more and demand slower state.
+#
+# TWELVE BLOCKS, so each field runs twelve trials and the comparison is within
+# field. It also shows whether the effect itself weakens as the run goes on, which
+# matters given the gain collapses by about 2.5x over twelve hours.
+
+
+# --- WHAT TO MEASURE --------------------------------------------------------
+# PRIMARY, per cell per block: tracking error over the 25-minute demand, and
+# minutes from the demand opening to first reaching 1.05. Compared across arms
+# after confirming the match.
+#
+# CONFIRM THE MATCH FIRST, and report it. Mean and spread of CNR over the last
+# three frames of the hold, per arm per block. If the arms are not matched there,
+# nothing downstream is interpretable and the hold needs to be longer.
+#
+# SECONDARY: whether any arm difference grows or shrinks across the twelve blocks,
+# and whether it tracks optoRTK expression — which is measured per cell anyway and
+# costs nothing to add.
+
+
+# --- WHERE THE NUMBERS COME FROM --------------------------------------------
+# Measured 2026-08-19 from v16 (2026-08-07_InferenceCNRhold_12h_v16), same
+# checkpoint, same rig, verified 1.000 min/frame, phase-aligned on
+# control_frame = timestep - 16.
+#
+#   sweep    0 ms    +85     +150    +300    +600
+#     0      0.745  +0.261  +0.378  +0.604  +0.574
+#     3      0.818  +0.067  +0.161  +0.294  +0.359
+#     7      0.787  +0.069  +0.151  +0.215  +0.298
+#
+#   tau ~2.9-3.6 min | dead time 3-5 min both directions | rise constant ~4 min
+#
+# WHERE EACH ARM SHOULD BE WHEN THE HOLD OPENS, under those dynamics: dark ~0.79,
+# sustained low ~0.82, pulsed high ~0.90, front loaded ~0.80. All four are within
+# reach of 0.85 inside eight minutes, upward by driving and downward by free decay,
+# so the hold can do its job. The one to watch is pulsed high, which arrives from
+# ABOVE and can only come down by decaying — 0.90 to 0.85 is about 6 min including
+# dead time, which fits in 8 but not with much to spare.
+#
+# WHY THE LADDER STOPS AT 300 ms. 600 ms buys LESS than 300 ms early in the run
+# (+0.574 against +0.604 at sweep 0) and only +0.08 more late; the response
+# saturates and turns over, so the top rung is not headroom.
+#
+# WHY THE PRESCRIBED DOSES ARE 45 AND 150. Both are rungs of the ladder the
+# closed-loop parts search, so the arms are not delivering light the controller
+# could never have commanded. 150 is the largest rung the v12-v16 runs used, so its
+# effect on these cells is measured rather than extrapolated.
+
+
+# --- WHAT THIS RUN CANNOT SAY -----------------------------------------------
+# It tests four histories, chosen in advance. It cannot find a fifth. That is the
+# cost of prescribing, and it is the reason to run policy_8fov_free_runup.toml
+# first: look at what the controller chooses when the run-up is free, and if it
+# picks something unlike all four of these, prescribe that instead before booking
+# this one.
+# --- FOUR DEMAND PATTERNS, CYCLED ACROSS BLOCKS -----------------------------
+# The arm is not the pattern. Every field sees all four, so pattern costs no
+# fields and stays a within-field comparison; a single demand could not separate
+# "preparation helps" from "preparation helps on this one demand".
+#
+# Minutes are counted from the start of each 50-min block. The run-up is always
+# minutes 0-24 at the anchor; the patterns differ in what minutes 25-49 ask for.
+#
+#   step      1.05 from minute 25. The jump lands exactly where the run-up ends,
+#             so preparation can pre-position for it.
+#   ramp      0.85 at minute 25 rising to 1.05 by minute 39, then held. It OPENS
+#             AT THE ANCHOR, so pre-positioning buys nothing: a benefit from
+#             preparation on this pattern can only be internal state, not
+#             position. That makes it the one pattern that tests the hypothesis
+#             the matched-history run is built around.
+#   peak      1.05 for minutes 30-34 only, then back to the anchor. The sharpest
+#             timing demand, and the only one that must be released as well as
+#             reached.
+#   delayed   anchor until minute 34, then 1.05. The jump is ten minutes clear of
+#             the end of the run-up, so the controller has graded anchor frames in
+#             which to prepare. Expect the arms to separate LEAST here — that is
+#             the control for "the free window is what mattered".
+#
+# BLOCK ORDER, counterbalanced. Each pattern appears once in blocks 1-4, once in
+# 5-8, once in 9-12, and none is always first. Without that, pattern would be
+# confounded with the gain collapse, which runs on the clock and not on block
+# count.
+#
+#   block    1     2     3     4     5     6     7     8     9    10    11    12
+#   pattern  step  ramp  peak  del   ramp  peak  del   step  peak  del   step  ramp
+#
+# THREE REPEATS PER ARM-PATTERN CELL, not twelve per arm. That is the price of
+# four patterns and it is worth paying, but it means a per-pattern claim rests on
+# three blocks x two fields x the cells in them. Pool across blocks before
+# comparing arms within a pattern, and report the block-to-block spread.
+placeholders_resolved = true
+
+
+[default]
+
+# future_len 30, cnr_mode "raw", norm_channels [cnr, u_t, n_cells_200px,
+# optortk_expr, nuc_area]. The name contains no "raw" — the server logs cnr_mode at
+# startup; trust that, not the name.
+checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
+control_horizon = 30
+levels_ms = [0, 20, 45, 85, 150, 300]
+
+# Identical in all four arms. Here the arms vary the CONTROLLER, so the reference,
+# the kernel and the regularizers are what must be byte-identical — the mirror of
+# policy_8fov_free_runup.toml, where the arms vary the kernel and the controller is
+# shared. Nothing below overrides any of these.
+kernel = "l2"
+lambda_move = 0.0
+
+# Zero, unlike the paired file. There it exists to make a FREE window
+# deterministic; here there is no free window, so it would only bias the
+# closed-loop parts away from the light they need.
+lambda_dose = 0.0
+
+
+# 60 min settle at the anchor, then twelve blocks of (25 min run-up at 0.85,
+# 25 min demand). Byte-identical to the paired file, patterns included, so the
+# demand windows of the two runs can be compared directly.
+objective = { type = "schedule", points = [
+  [0, 0.85], [85, 1.05], [110, 0.85], [135, 0.85], [136, 0.8643], [137, 0.8786],
+  [138, 0.8929], [139, 0.9071], [140, 0.9214], [141, 0.9357], [142, 0.95], [143, 0.9643],
+  [144, 0.9786], [145, 0.9929], [146, 1.0071], [147, 1.0214], [148, 1.0357], [149, 1.05],
+  [160, 0.85], [190, 1.05], [195, 0.85], [245, 1.05], [260, 0.85], [285, 0.85],
+  [286, 0.8643], [287, 0.8786], [288, 0.8929], [289, 0.9071], [290, 0.9214], [291, 0.9357],
+  [292, 0.95], [293, 0.9643], [294, 0.9786], [295, 0.9929], [296, 1.0071], [297, 1.0214],
+  [298, 1.0357], [299, 1.05], [310, 0.85], [340, 1.05], [345, 0.85], [395, 1.05],
+  [410, 0.85], [435, 1.05], [460, 0.85], [490, 1.05], [495, 0.85], [545, 1.05],
+  [560, 0.85], [585, 1.05], [610, 0.85], [635, 0.85], [636, 0.8643], [637, 0.8786],
+  [638, 0.8929], [639, 0.9071], [640, 0.9214], [641, 0.9357], [642, 0.95], [643, 0.9643],
+  [644, 0.9786], [645, 0.9929], [646, 1.0071], [647, 1.0214], [648, 1.0357], [649, 1.05],
+  [660, 0.85] ] }
+
+# Fallback for a field this file does not declare: the closed-loop controller with
+# no prescribed history at all. That is none of the four arms and is instantly
+# visible in the startup log as a missing `windows` block.
+controller = { type = "sequence_mpc" }
+
+
+# --- ARM 1: dark --------------------------------------------------------------
+# No light for the first 17 minutes of every block. The zero-light reference the
+# other three are read against.
+[fov.0]
+arm = 1
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ] },
+] }
+
+[fov.7]
+arm = 1
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ] },
+] }
+
+
+# --- ARM 2: sustained low -----------------------------------------------------
+# 45 ms every minute, 765 ms total. A steady trickle: activity settles a little
+# above resting and stays there.
+[fov.2]
+arm = 2
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  45, 45, 45, 45, 45, 45, 45, 45, 45,
+  45, 45, 45, 45, 45, 45, 45, 45
+  ] },
+] }
+
+[fov.5]
+arm = 2
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  45, 45, 45, 45, 45, 45, 45, 45, 45,
+  45, 45, 45, 45, 45, 45, 45, 45
+  ] },
+] }
+
+
+# --- ARM 3: pulsed high -------------------------------------------------------
+# 150 ms every fourth minute, 750 ms total. The same light as arm 2 to within 2%,
+# delivered in five bursts instead of continuously. Arm 2 against arm 3 is the
+# clean test of whether these cells integrate delivered light or respond to how
+# bright it is at the moment.
+[fov.1]
+arm = 3
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  150, 0, 0, 0, 150, 0, 0, 0, 150,
+  0, 0, 0, 150, 0, 0, 0, 150
+  ] },
+] }
+
+[fov.6]
+arm = 3
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  150, 0, 0, 0, 150, 0, 0, 0, 150,
+  0, 0, 0, 150, 0, 0, 0, 150
+  ] },
+] }
+
+
+# --- ARM 4: front loaded ------------------------------------------------------
+# 150 ms for the first five minutes, then dark for twelve, 750 ms total. Same
+# amount of light as arms 2 and 3, all of it early, so activity has the longest
+# possible time to return to baseline before the hold. Arm 3 against arm 4 asks
+# whether WHEN the light arrived matters once the total is fixed.
+[fov.3]
+arm = 4
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  150, 150, 150, 150, 150, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ] },
+] }
+
+[fov.4]
+arm = 4
+controller = { type = "prescribed_window", period = 50, offset = 60, inner = { type = "sequence_mpc" }, windows = [
+  { start = 0, stop = 17, sequence_ms = [
+  150, 150, 150, 150, 150, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+  ] },
+] }

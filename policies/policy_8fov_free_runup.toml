@@ -1,0 +1,341 @@
+# 8 FOVs, four amounts of PREPARATION TIME, two replicates each. The arm is how
+# much of the run-up to a demand the controller is graded on; everything else —
+# checkpoint, ladder, horizon, controller, dose penalty, and the reference itself
+# — is identical across all eight fields.
+#
+#   arm 1  fov 0, 7    0 free min      graded for the whole run-up
+#   arm 2  fov 2, 5    4 free min      short of what the demand needs
+#   arm 3  fov 1, 6   10 free min      clears it
+#   arm 4  fov 3, 4   20 free min      clears it with room
+#
+#   fov   0  1  2  3  4  5  6  7
+#   arm   1  3  2  4  4  2  3  1
+#
+# Mirrored so no arm sits only in one half of the stage travel.
+#
+# Run:
+#   uv run python -m optoerk.serving.app --device cuda \
+#       --policy-file policies/policy_8fov_free_runup.toml \
+#       --live-optortk-expr --optortk-cohort-frames 10 \
+#       --frame-interval-min 1.0 --predict-log run.jsonl
+#
+# PAIRED WITH policy_8fov_matched_history.toml. Same checkpoint, same ladder,
+# same block geometry, same reference, same demand. That file prescribes the
+# run-up instead of leaving it free, so the two runs answer different halves of
+# one question and their demand windows are directly comparable.
+
+
+# --- WHAT THIS RUN ASKS -----------------------------------------------------
+# Given room to act before a demand arrives, does the controller use it, and does
+# using it help? The run-up is graded at the anchor in arm 1, so preparing costs
+# something; by arm 4 the last twenty minutes are unscored and preparing is free.
+#
+# WHY BLOCKS RATHER THAN A UNIFORM SPARSE PATTERN. Leaving frames unscored only
+# creates freedom if some plan can move them without also moving the scored ones.
+# Dead time is 3-5 min in both directions and the rise constant is about 4 min, so
+# an excursion away from a level and back takes roughly ten minutes. Scored frames
+# closer together than that are joined by a path the controller cannot bend, and a
+# uniform comb cannot be both wide enough to be free and tight enough to demand
+# anything. A block sizes the free part by the biology and the demand by the
+# experiment, independently. Twelve blocks fit the booking, so each field runs
+# twelve trials and the comparison is within-field.
+#
+#   The offline sweep is consistent with this: at spacings of 2 and 3 frames the
+#   cost statistics were identical to dense scoring on both checkpoints.
+#
+# HOW MUCH LEAD TIME THE DEMAND NEEDS. From the anchor at 0.85 to the demand at
+# 1.05 is 0.20 of CNR. The headroom is taken from v20's OBSERVED reach rather
+# than from v16's steady-state rungs: v20 held a 60-min oscillation for twelve
+# hours and its fields were still peaking at 1.14 in the last cycle, against a
+# resting of about 0.81. So 0.20 is 69% of what the actuator still delivers at
+# hour twelve:
+#
+#     lead = dead_time + tau_rise * ln(1 / (1 - 0.69)) = 4.0 + 4.7 = 8.7 min
+#
+# Arms 1 and 2 are short of that, arms 3 and 4 clear it. The four bracket the
+# requirement rather than merely spanning it, so the threshold can be located. A
+# measured threshold far from 8.7 min would say the cells carry state the
+# first-order description does not have, which is the real prize here.
+#
+# THE DEMAND IS AT THE SAME CLOCK MINUTE IN EVERY ARM. The block period is 50 min
+# throughout; only the point where grading stops moves. Varying free time by
+# moving the demand later would confound preparation with the gain collapse, which
+# runs on the clock.
+
+
+# --- A KNOWN DEFECT, STATED BEFORE THE RUN RATHER THAN AFTER ----------------
+# "Graded throughout" does not PREVENT preparation. It penalises it. The lookahead
+# reaches 30 frames, which spans the whole 25-minute run-up, so arm 1 sees the
+# demand coming from the first frame of the run-up and can choose to pay the
+# anchor penalty in exchange for arriving on time.
+#
+# A forward simulation of the measured dynamics says it does exactly that: arm 1
+# starts driving about seven minutes early, absorbs a small penalty over the last
+# three visible minutes, and arrives essentially with the free arms. Tracking error
+# over the demand came out equal to three decimals in every pattern tried.
+#
+#   SO DO NOT MAKE TRACKING ERROR THE PRIMARY ENDPOINT. In the same simulation the
+#   RUN-UP TRAJECTORIES differed enormously — the free arm drove to the ceiling and
+#   coasted down into the demand, the graded arm crept up in the last few minutes.
+#   That is where the arm difference lives.
+#
+#   PRIMARY: the run-up trajectory and the dose trace. Peak CNR reached during the
+#   run-up, minute at which driving begins, total light delivered per block, and
+#   whether the pattern repeats block to block within a field.
+#   SECONDARY: tracking error over the demand, and minutes to first reach 1.05.
+#
+# To make the grading actually bind rather than merely charge for it, the run-up
+# would have to be longer than the 30-frame lookahead. That is a different design
+# and is deliberately not this one: a run-up longer than the horizon puts the
+# controller in a region where no scored frame is in view, and what it commands
+# there is decided by sampling noise rather than by anything.
+
+
+# --- WHERE THE NUMBERS COME FROM --------------------------------------------
+# Measured 2026-08-19 from v16 (2026-08-07_InferenceCNRhold_12h_v16), same
+# checkpoint, same rig, verified 1.000 min/frame, phase-aligned on
+# control_frame = timestep - 16.
+#
+#   sweep    0 ms    +85     +150    +300    +600
+#     0      0.745  +0.261  +0.378  +0.604  +0.574
+#     3      0.818  +0.067  +0.161  +0.294  +0.359
+#     7      0.787  +0.069  +0.151  +0.215  +0.298
+#
+#   tau ~2.9-3.6 min | dead time 3-5 min both directions | rise constant ~4 min
+#   within-cell sd of successive CNR differences: 0.014 dark to 0.020 at 150 ms
+#
+# WHY THE LADDER STOPS AT 300 ms. 600 ms buys LESS than 300 ms early in the run
+# (+0.574 against +0.604 at sweep 0) and only +0.08 more late. The response
+# saturates and turns over, so the top rung is not headroom. 300 ms is added over
+# the v12-v16 ladder because the demand needs margin above it; the cost is that
+# delivered-light totals here do not read directly against v12-v16, whose ladder is
+# a strict subset. Compare within this run.
+#
+# WHY THE ANCHOR IS 0.85. Resting measured 0.745-0.823 and wanders inside that band
+# rather than trending. 0.85 clears the top of it by 0.03, so it is reachable all
+# run and cheap. It is close to resting, so a field doing nothing scores much of
+# the anchor — deliberate. The anchor is not the measurement; it exists to put
+# every arm in the same state when the free part opens.
+#
+# WHY THE DEMAND IS 1.05, RAISED FROM 0.92. The first draft used 0.92 because a
+# ceiling of 1.00 had been derived from v16's steady-state dose rungs. That number
+# was wrong. v20 ran the same rig and checkpoint for twelve hours and its fields
+# peaked at 1.14 to 1.20 in the last cycles, so the actuator reaches well past
+# 1.00 late in a run. At 0.92 the demand sat only 0.11 above resting, which is
+# close enough that a field doing very little scores much of it, and the lead time
+# it required was only 6.5 min — too short to separate the arms cleanly.
+#
+# 1.05 is 0.24 above resting, needs 8.7 min of lead, and still leaves about 0.09
+# of margin below what v20 actually reached at hour twelve. The bracket is also
+# better centred: 8.7 falls between arm 2 (4 min) and arm 3 (10 min).
+#
+#   WHAT IS STILL UNMEASURED. v20 had no surviving dose log, so its reach of 1.14
+#   is an achieved CNR, not a dose-response. The margin above is therefore an
+#   observation that cells got there, not a calculation that they can. Score per
+#   block and report each cell's fraction of frames at the top rung, as before.
+#
+#   Even so, score PER BLOCK rather than pooled, and report each cell's fraction of
+#   frames at the top rung. A cell at the rail has no preparation to express.
+
+
+# --- THE DOSE PENALTY, AND WHY IT IS NOT ZERO -------------------------------
+# lambda_dose = 0.089, identical in all four arms.
+#
+# Inside a free window many plans reach the demand equally well. With nothing to
+# separate them the controller picks among them by CEM sampling noise and the
+# run-up trace is unrepeatable by construction — which would destroy the primary
+# endpoint above, since "does the run-up repeat block to block" is one of the
+# things being measured. A dose penalty makes the free region deterministic. It
+# biases it toward less light, but that bias is common to all four arms and cannot
+# generate the contrast.
+#
+# The value is measured, not guessed. From the offline sweep
+# (uncertainty_traction_2026-08-25_19.59.10, enc_e_area_lean, dense mask, target
+# 0.95) the median typical plan cost is 0.2365. plan_norm averages ~0.4 over this
+# ladder, so
+#
+#     lambda_dose = 0.15 * 0.2365 / 0.4 = 0.089
+#
+# puts the dose term at about 15% of a typical tracking term: enough to break ties,
+# not enough to bend the tracking.
+# --- FOUR DEMAND PATTERNS, CYCLED ACROSS BLOCKS -----------------------------
+# The arm is not the pattern. Every field sees all four, so pattern costs no
+# fields and stays a within-field comparison; a single demand could not separate
+# "preparation helps" from "preparation helps on this one demand".
+#
+# Minutes are counted from the start of each 50-min block. The run-up is always
+# minutes 0-24 at the anchor; the patterns differ in what minutes 25-49 ask for.
+#
+#   step      1.05 from minute 25. The jump lands exactly where the run-up ends,
+#             so preparation can pre-position for it.
+#   ramp      0.85 at minute 25 rising to 1.05 by minute 39, then held. It OPENS
+#             AT THE ANCHOR, so pre-positioning buys nothing: a benefit from
+#             preparation on this pattern can only be internal state, not
+#             position. That makes it the one pattern that tests the hypothesis
+#             the matched-history run is built around.
+#   peak      1.05 for minutes 30-34 only, then back to the anchor. The sharpest
+#             timing demand, and the only one that must be released as well as
+#             reached.
+#   delayed   anchor until minute 34, then 1.05. The jump is ten minutes clear of
+#             the end of the run-up, so the controller has graded anchor frames in
+#             which to prepare. Expect the arms to separate LEAST here — that is
+#             the control for "the free window is what mattered".
+#
+# BLOCK ORDER, counterbalanced. Each pattern appears once in blocks 1-4, once in
+# 5-8, once in 9-12, and none is always first. Without that, pattern would be
+# confounded with the gain collapse, which runs on the clock and not on block
+# count.
+#
+#   block    1     2     3     4     5     6     7     8     9    10    11    12
+#   pattern  step  ramp  peak  del   ramp  peak  del   step  peak  del   step  ramp
+#
+# THREE REPEATS PER ARM-PATTERN CELL, not twelve per arm. That is the price of
+# four patterns and it is worth paying, but it means a per-pattern claim rests on
+# three blocks x two fields x the cells in them. Pool across blocks before
+# comparing arms within a pattern, and report the block-to-block spread.
+placeholders_resolved = true
+
+
+[default]
+
+# future_len 30, cnr_mode "raw", norm_channels [cnr, u_t, n_cells_200px,
+# optortk_expr, nuc_area]. The name contains no "raw" — the server logs cnr_mode at
+# startup; trust that, not the name.
+checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
+
+# The checkpoint's future_len, so it is not clamped, and what makes the longest
+# free window admissible. Arm 4's free part is 20 min; from its first free frame
+# the demand opens 20 frames ahead against a 30-frame horizon, so a scored frame is
+# always in view and the controller is never indifferent for lack of a target. A
+# free window longer than 30 would buy no extra planning, only undefined behaviour
+# in its far part.
+control_horizon = 30
+
+levels_ms = [0, 20, 45, 85, 150, 300]
+
+# Identical in all four arms. The reference lives here and is inherited by every
+# FOV, so all eight fields track the same trajectory by construction rather than by
+# careful copying — an arm can only compose a kernel and the regularizer
+# coefficients onto it, which is all these arms do.
+controller = { type = "sequence_mpc" }
+lambda_move = 0.0
+lambda_dose = 0.089
+
+
+# 60 min settle at the anchor, then twelve blocks of (25 min run-up at 0.85,
+# 25 min demand). The demand cycles through four patterns; see the block above.
+# Written out rather than generated: the server logs this verbatim at startup,
+# so the analysis never re-derives the waveform and gets it subtly wrong.
+objective = { type = "schedule", points = [
+  [0, 0.85], [85, 1.05], [110, 0.85], [135, 0.85], [136, 0.8643], [137, 0.8786],
+  [138, 0.8929], [139, 0.9071], [140, 0.9214], [141, 0.9357], [142, 0.95], [143, 0.9643],
+  [144, 0.9786], [145, 0.9929], [146, 1.0071], [147, 1.0214], [148, 1.0357], [149, 1.05],
+  [160, 0.85], [190, 1.05], [195, 0.85], [245, 1.05], [260, 0.85], [285, 0.85],
+  [286, 0.8643], [287, 0.8786], [288, 0.8929], [289, 0.9071], [290, 0.9214], [291, 0.9357],
+  [292, 0.95], [293, 0.9643], [294, 0.9786], [295, 0.9929], [296, 1.0071], [297, 1.0214],
+  [298, 1.0357], [299, 1.05], [310, 0.85], [340, 1.05], [345, 0.85], [395, 1.05],
+  [410, 0.85], [435, 1.05], [460, 0.85], [490, 1.05], [495, 0.85], [545, 1.05],
+  [560, 0.85], [585, 1.05], [610, 0.85], [635, 0.85], [636, 0.8643], [637, 0.8786],
+  [638, 0.8929], [639, 0.9071], [640, 0.9214], [641, 0.9357], [642, 0.95], [643, 0.9643],
+  [644, 0.9786], [645, 0.9929], [646, 1.0071], [647, 1.0214], [648, 1.0357], [649, 1.05],
+  [660, 0.85] ] }
+
+# Fallback mask for a field this file does not declare. v13 declared 8 fields and
+# the rig imaged 10, and the two undeclared ones ran the default for 3.3 h. Because
+# the reference is shared, a stray field cannot be given a distinguishing TARGET
+# without breaking that sharing, so it gets a distinguishing amount of freedom
+# instead: 4 free minutes is arm 2's value, so this fallback is deliberately NOT
+# unique — check the declared FOV list in the startup log, not the kernel, if the
+# field count is wrong.
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 83], [85, 110], [110, 133],
+  [135, 160], [160, 183], [185, 210], [210, 233],
+  [235, 260], [260, 283], [285, 310], [310, 333],
+  [335, 360], [360, 383], [385, 410], [410, 433],
+  [435, 460], [460, 483], [485, 510], [510, 533],
+  [535, 560], [560, 583], [585, 610], [610, 633],
+  [635, 660] ] } }
+
+
+# --- ARM 1: graded for the whole run-up -------------------------------------
+# A bare l2 kernel scores every horizon step, which is the whole run graded — the
+# objective v12-v16 ran, unchanged. Preparing costs anchor error the entire time.
+[fov.0]
+arm = 1
+kernel = "l2"
+
+[fov.7]
+arm = 1
+kernel = "l2"
+
+
+# --- ARM 2: 4 free minutes — short of the 8.7 the demand needs --------------
+[fov.2]
+arm = 2
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 81], [85, 110], [110, 131],
+  [135, 160], [160, 181], [185, 210], [210, 231],
+  [235, 260], [260, 281], [285, 310], [310, 331],
+  [335, 360], [360, 381], [385, 410], [410, 431],
+  [435, 460], [460, 481], [485, 510], [510, 531],
+  [535, 560], [560, 581], [585, 610], [610, 631],
+  [635, 660] ] } }
+
+[fov.5]
+arm = 2
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 81], [85, 110], [110, 131],
+  [135, 160], [160, 181], [185, 210], [210, 231],
+  [235, 260], [260, 281], [285, 310], [310, 331],
+  [335, 360], [360, 381], [385, 410], [410, 431],
+  [435, 460], [460, 481], [485, 510], [510, 531],
+  [535, 560], [560, 581], [585, 610], [610, 631],
+  [635, 660] ] } }
+
+
+# --- ARM 3: 10 free minutes — just clears it --------------------------------
+[fov.1]
+arm = 3
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 75], [85, 110], [110, 125],
+  [135, 160], [160, 175], [185, 210], [210, 225],
+  [235, 260], [260, 275], [285, 310], [310, 325],
+  [335, 360], [360, 375], [385, 410], [410, 425],
+  [435, 460], [460, 475], [485, 510], [510, 525],
+  [535, 560], [560, 575], [585, 610], [610, 625],
+  [635, 660] ] } }
+
+[fov.6]
+arm = 3
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 75], [85, 110], [110, 125],
+  [135, 160], [160, 175], [185, 210], [210, 225],
+  [235, 260], [260, 275], [285, 310], [310, 325],
+  [335, 360], [360, 375], [385, 410], [410, 425],
+  [435, 460], [460, 475], [485, 510], [510, 525],
+  [535, 560], [560, 575], [585, 610], [610, 625],
+  [635, 660] ] } }
+
+
+# --- ARM 4: 20 free minutes — the longest the horizon supports --------------
+[fov.3]
+arm = 4
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 65], [85, 110], [110, 115],
+  [135, 160], [160, 165], [185, 210], [210, 215],
+  [235, 260], [260, 265], [285, 310], [310, 315],
+  [335, 360], [360, 365], [385, 410], [410, 415],
+  [435, 460], [460, 465], [485, 510], [510, 515],
+  [535, 560], [560, 565], [585, 610], [610, 615],
+  [635, 660] ] } }
+
+[fov.4]
+arm = 4
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 65], [85, 110], [110, 115],
+  [135, 160], [160, 165], [185, 210], [210, 215],
+  [235, 260], [260, 265], [285, 310], [310, 315],
+  [335, 360], [360, 365], [385, 410], [410, 415],
+  [435, 460], [460, 465], [485, 510], [510, 515],
+  [535, 560], [560, 565], [585, 610], [610, 615],
+  [635, 660] ] } }
