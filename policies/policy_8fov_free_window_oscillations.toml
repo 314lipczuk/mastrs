@@ -1,0 +1,379 @@
+# FREE WINDOW ON OSCILLATIONS — 8 FOVs, four amounts of unscored preparation time,
+# two replicates each. Follow-up to policy_8fov_free_runup_v2.toml (run v21).
+#
+#   arm 1  fov 0, 7    0 free min      graded for the whole run-up
+#   arm 2  fov 2, 5    8 free min      just clears dead time + ~1 tau
+#   arm 3  fov 1, 6   14 free min      comfortable margin
+#   arm 4  fov 3, 4   20 free min      the most the 30-frame horizon supports
+#
+#   fov   0  1  2  3  4  5  6  7
+#   arm   1  3  2  4  4  2  3  1
+#
+# Mirrored so no arm sits only in one half of the stage travel.
+#
+# Run:
+#   uv run python -m optoerk.serving.app --device cuda \
+#       --policy-file policies/policy_8fov_free_window_oscillations.toml \
+#       --live-optortk-expr --optortk-cohort-frames 10 \
+#       --frame-interval-min 1.0 --predict-log run.jsonl
+
+
+# --- WHAT THIS RUN ASKS -----------------------------------------------------
+# Can the free window prepare cells for DIFFERENT OSCILLATIONS — and does the
+# preparation differ depending on which oscillation is coming?
+#
+# v21 half-answered this. Its "across the demand that is coming" axis measured
+# between-pattern dose spread over the last 10 run-up minutes against that arm's own
+# two-field replicate noise: 0.58, 0.90, 0.59, 1.48 for arms 1-4, where 1.0 is the
+# null. Only 20 free minutes cleared it, and the result was post-hoc.
+#
+# THE REASON IT WAS MARGINAL IS FIXABLE. All four of v21's demand patterns opened at
+# the SAME VALUE, 1.05 — deliberately, so the free window stayed load-bearing in every
+# block. But that made the required preparation nearly identical across patterns;
+# only what came AFTER arrival differed. A second-order difference.
+#
+# Here the blocks differ in what is demanded AT THE OPENING INSTANT: the direction and
+# the rate the reference is moving. That is first-order in the preparation required,
+# for the same eight fields and the same twelve blocks.
+
+
+# --- HOW THE 8 FOVs ARE SPENT, AND WHY NOT ON THE OSCILLATIONS ---------------
+# Free minutes vary ACROSS fields; oscillation type varies WITHIN a field, across the
+# twelve blocks. Not the other way around, for two reasons.
+#
+# v21's specialisation measure divides between-block spread by THAT ARM'S OWN two-field
+# replicate noise. Spending fields on oscillation type gives one field per grid cell and
+# the denominator does not exist; a raw variance ratio in its place gives a spurious
+# null, which v21 recorded. Two replicate fields per arm is what makes the measure
+# computable at all.
+#
+# And specialisation is intrinsically a WITHIN-CELL contrast. If a field saw one
+# oscillation for twelve hours, "the run-up differs by which oscillation is coming"
+# would be confounded with everything else about that field. Here the same cells face
+# all four.
+
+
+# --- THE FOUR BLOCK TYPES ---------------------------------------------------
+#   A  period 15, opens rising     C  period 30, opens rising
+#   B  period 15, opens falling    D  period 30, opens falling
+#
+# Two axes at six blocks per level, three repeats per type per field.
+#
+# PHASE (A vs B, C vs D) IS THE MATCHED-DIFFICULTY CONTRAST. Both phases open at the
+# anchor, so neither has to arrive at a different LEVEL — both have to arrive MOVING.
+# Rising must release below the anchor and come back up through it; falling must drive
+# above and come back down through it. Symmetric excursions from one state: ~9 min of
+# lead either way. A run-up that differs by phase cannot be explained by effort.
+#
+# PERIOD (A/B vs C/D) IS A PURE RATE CONTRAST, because the amplitude is equal at both:
+# peak 0.0335 vs 0.0168 CNR/min, exactly 2x, at an identical excursion. A step train
+# cannot do this — its quarter-split gives the rise only P/4, so amplitude has to shrink
+# with period and the two vary together.
+#
+# AND THE PERIODS STRADDLE THE BANDWIDTH. Open-loop phase lag is
+# omega*dead + arctan(omega*tau); reactive tracking dies near 180 deg.
+#
+#   period 15 -> 149 deg   anticipation is the ONLY route
+#   period 30 ->  82 deg   reactively trackable
+#   (period 20 -> 117, period 40 -> 63: both trackable, so a 20/40 pair risks the free
+#    window buying little at EITHER and the contrast collapsing. That pair was the first
+#    draft and was dropped for this reason, not for the schedule.)
+#
+# Dead time does not make period 15 impossible — it makes it impossible to REACT to.
+# The controller sees 30 frames, so a known reference is trackable feedforward. That
+# faculty is what this run measures, and period 30 is the control where it is not needed.
+
+
+# --- WHY SINE AND NOT RAMPS -------------------------------------------------
+# These cells are first order with dead time, so a corner — a discontinuity in the first
+# derivative — cannot be produced. On a triangle at period 15 a corner arrives every 7.5
+# min against a 3-5 min dead time, so most of every window would sit in a transient no
+# controller can follow, and the corner before each opening would land INSIDE the dead
+# time: what the cells are doing when the block opens would be set by an untrackable
+# feature rather than by whatever the arm did with its free window. That is the
+# measurement.
+#
+# A sine puts its steepest point and ZERO CURVATURE exactly at the opening, and demands
+# zero rate at the peaks where a triangle is unreachable.
+#
+#   StepTrainReference argues the other way — correctly, for v19's frequency staircase,
+#   where separating rise time from overshoot from hold error IS the measurement. It is
+#   not the measurement here.
+
+
+# --- FEASIBILITY, AGAINST v16's MEASURED DYNAMICS ---------------------------
+# tau_decay ~3.2 min | tau_rise ~4 min | dead time 3-5 min | resting 0.745-0.823
+# late-run reach above the anchor driving flat out ~0.29 (v20, hour twelve)
+#
+#   period 15: peak demanded rate 0.0335 CNR/min = 46% of the cells' rise slew.
+#              Steepest demanded fall against free decay, worst point on the limb:
+#              0.665 -> BRAKED, so the descending half is actively lit, not free decay.
+#   period 30: 0.0168 CNR/min = 23% of rise slew; worst fall ratio 0.333 -> braked.
+#
+# THE ANCHOR IS THE SINE'S OWN MIDLINE, 0.97, and this is load-bearing rather than
+# tidy. Blocks open at the midline crossing; if the anchor were any other value the
+# opening would demand a STEP, which no cell can follow and which charges every arm the
+# same dead-time error — common error, zero contrast. With anchor == midline, and each
+# window running a whole number of its own cycles, every block opens AND closes at
+# 0.97 and the waveform is continuous end to end. No frame in the run demands more than
+# 0.04 CNR of movement. SegmentedReference enforces the whole-cycle rule; a fractional
+# count is a PolicyViolation rather than a silent step at every boundary.
+#
+# 0.97 is 0.18 above resting — 62% of the late-run headroom, leaving room to excurse in
+# BOTH directions after the gain collapse. Peak 1.05 sits well under the 1.14 v20 still
+# reached at hour twelve.
+
+
+# --- THE SETTLE CARRIES A DARK WINDOW, AND IT IS NOT PADDING ----------------
+# In raw-cnr mode `baseline` is null, so resting CNR — which dominates the response,
+# rho^2 0.12-0.56 against 0.04 for nuclear area — has to be measured from each cell's
+# own trace. v21 could take it from the first ten run-up minutes because its anchor
+# 0.85 was essentially at resting. THIS anchor is 0.97, so no minute of this run sits
+# dark unless the settle provides one.
+#
+#   12 min at 0.80 — the top of the measured resting band, so the controller commands
+#                    ~0 ms and the cells sit where they rest
+#   18 min ramp onto the anchor
+#   30 min at the anchor, so every field enters block 1 settled
+#
+# It precedes every arm's free window, so it is identical across arms by construction.
+
+
+# --- THE ARM LADDER CHANGED FROM v21 ----------------------------------------
+# v21 ran 0 / 4 / 10 / 20 and concluded that 4 was wasted: shorter than the 3-5 min dead
+# time, so arms 1 and 2 interleaved on nearly every statistic — the effect tracks USABLE
+# lead time, not the count of unscored frames. 0 / 8 / 14 / 20 samples the ~9 min these
+# openings need from both sides instead. Arm 2 falls just short, arms 3 and 4 clear it,
+# so a threshold sits between them.
+#
+#   THE COST: run-up statistics no longer read directly against v21's arms. Compare
+#   within this run.
+
+
+# --- BLOCK ORDER, COUNTERBALANCED -------------------------------------------
+# Each type once in blocks 1-4, once in 5-8, once in 9-12; none always first; none
+# follows itself across a group boundary. Without it, type is confounded with the gain
+# collapse, which runs on the clock and not on block count.
+#
+#   block    1  2  3  4   5  6  7  8   9 10 11 12
+#   type     A  B  C  D   B  D  A  C   D  A  C  B
+#
+# THREE REPEATS PER ARM-TYPE CELL. A per-type claim rests on three blocks x two fields
+# x the cells in them. Pool across blocks before comparing arms within a type, and report
+# the block-to-block spread.
+#
+# ALSO: with two cycles per period-15 block, the FIRST cycle can be scored against the
+# SECOND within the same block. A preparation advantage should be largest on the opening
+# cycle and decay; that within-block decay is the cleanest signature available, and it
+# is why the period-15 window is 30 min rather than 15.
+
+
+# --- NO PER-CELL PHASE OFFSETS, DELIBERATELY --------------------------------
+# StepTrainReference offsets each cell's waveform by particle % n_phase_groups. That
+# CANNOT coexist with a frame-indexed score mask: the mask is a pure function of the
+# frame, so an unscored window would land at a different point in each cell's waveform
+# and an arm would stop denoting one thing. Every cell here sees the same waveform at
+# the same time.
+#
+# The aliasing that phase groups defend against — any global drift perfectly aligned
+# with the reference — is broken instead by counterbalancing the block types against
+# the clock, which is the same argument v21 relied on.
+
+
+# --- THE DOSE PENALTY -------------------------------------------------------
+# lambda_dose = 0.089, identical in all four arms, carried over from v21 unchanged.
+# Inside a free window many plans reach the opening equally well; with nothing to
+# separate them the controller picks by CEM sampling noise and the run-up trace is
+# unrepeatable by construction — which would destroy "does the run-up repeat block to
+# block", one of the primary endpoints. Derivation is in policy_8fov_free_runup_v2.toml.
+
+
+# --- PRIMARY ENDPOINTS ------------------------------------------------------
+# As in v21, tracking error over the demand is SECONDARY: the 30-frame lookahead spans
+# the whole 24-min run-up, so arm 1 sees the demand coming and can choose to pay anchor
+# error to arrive on time. Grading does not prevent preparation, it prices it.
+#
+#   PRIMARY:   the run-up trajectory and dose trace — where the excursion goes, which
+#              minute driving begins, total light per block, whether the pattern repeats
+#              block to block within a field, and whether it differs BY BLOCK TYPE
+#              (v21's 1.48 measure, recomputed here against two-field replicate noise).
+#   SECONDARY: tracking error over the demand window; achieved/demanded amplitude and
+#              phase lag per period; first cycle against second within period-15 blocks.
+#
+# Report each cell's fraction of frames at the top rung per block. A cell at the rail
+# has no preparation to express.
+
+placeholders_resolved = true
+
+
+[default]
+
+# future_len 30, cnr_mode "raw". The name contains no "raw" — the server logs cnr_mode
+# at startup; trust that, not the name.
+checkpoint = "enc_e_area_lean_2026-08-07_02.05.26"
+
+# The checkpoint's future_len, so it is not clamped, and what makes arm 4's 20-minute
+# window admissible: from its first free frame the opening is 20 frames ahead against a
+# 30-frame horizon, so a scored frame is always in view and the controller is never
+# indifferent for lack of a target.
+control_horizon = 30
+
+levels_ms = [0, 20, 45, 85, 150, 300]
+
+controller = { type = "sequence_mpc" }
+lambda_move = 0.0
+lambda_dose = 0.089
+
+# The reference lives here and is inherited by every FOV, so all eight fields track the
+# same trajectory by construction rather than by careful copying. An arm can only compose
+# a kernel onto it, which is all these arms do.
+#
+# Each segment begins at the value the previous one ended on, so the anchor is named
+# ONCE and no block can drift off it; a sine oscillates about the value it opened at.
+# Durations are minutes, and one frame is one minute.
+#   708 min total = 11.80 h.
+objective = { type = "segments", segments = [
+  { kind = "hold", minutes = 12, value = 0.8, label = "settle_dark" },
+  { kind = "ramp", minutes = 18, to = 0.97, label = "settle_ramp" },
+  { kind = "hold", minutes = 30, label = "settle_anchor" },
+  # block  1 — A: period 15, opens rising; run-up 60-84, demand 84-114
+  { kind = "hold", minutes = 24, label = "runup_01_A" },
+  { kind = "sine", minutes = 30, period_min = 15, direction = +1, amplitude_pp = 0.16, label = "demand_01_A" },
+  # block  2 — B: period 15, opens falling; run-up 114-138, demand 138-168
+  { kind = "hold", minutes = 24, label = "runup_02_B" },
+  { kind = "sine", minutes = 30, period_min = 15, direction = -1, amplitude_pp = 0.16, label = "demand_02_B" },
+  # block  3 — C: period 30, opens rising; run-up 168-192, demand 192-222
+  { kind = "hold", minutes = 24, label = "runup_03_C" },
+  { kind = "sine", minutes = 30, period_min = 30, direction = +1, amplitude_pp = 0.16, label = "demand_03_C" },
+  # block  4 — D: period 30, opens falling; run-up 222-246, demand 246-276
+  { kind = "hold", minutes = 24, label = "runup_04_D" },
+  { kind = "sine", minutes = 30, period_min = 30, direction = -1, amplitude_pp = 0.16, label = "demand_04_D" },
+  # block  5 — B: period 15, opens falling; run-up 276-300, demand 300-330
+  { kind = "hold", minutes = 24, label = "runup_05_B" },
+  { kind = "sine", minutes = 30, period_min = 15, direction = -1, amplitude_pp = 0.16, label = "demand_05_B" },
+  # block  6 — D: period 30, opens falling; run-up 330-354, demand 354-384
+  { kind = "hold", minutes = 24, label = "runup_06_D" },
+  { kind = "sine", minutes = 30, period_min = 30, direction = -1, amplitude_pp = 0.16, label = "demand_06_D" },
+  # block  7 — A: period 15, opens rising; run-up 384-408, demand 408-438
+  { kind = "hold", minutes = 24, label = "runup_07_A" },
+  { kind = "sine", minutes = 30, period_min = 15, direction = +1, amplitude_pp = 0.16, label = "demand_07_A" },
+  # block  8 — C: period 30, opens rising; run-up 438-462, demand 462-492
+  { kind = "hold", minutes = 24, label = "runup_08_C" },
+  { kind = "sine", minutes = 30, period_min = 30, direction = +1, amplitude_pp = 0.16, label = "demand_08_C" },
+  # block  9 — D: period 30, opens falling; run-up 492-516, demand 516-546
+  { kind = "hold", minutes = 24, label = "runup_09_D" },
+  { kind = "sine", minutes = 30, period_min = 30, direction = -1, amplitude_pp = 0.16, label = "demand_09_D" },
+  # block 10 — A: period 15, opens rising; run-up 546-570, demand 570-600
+  { kind = "hold", minutes = 24, label = "runup_10_A" },
+  { kind = "sine", minutes = 30, period_min = 15, direction = +1, amplitude_pp = 0.16, label = "demand_10_A" },
+  # block 11 — C: period 30, opens rising; run-up 600-624, demand 624-654
+  { kind = "hold", minutes = 24, label = "runup_11_C" },
+  { kind = "sine", minutes = 30, period_min = 30, direction = +1, amplitude_pp = 0.16, label = "demand_11_C" },
+  # block 12 — B: period 15, opens falling; run-up 654-678, demand 678-708
+  { kind = "hold", minutes = 24, label = "runup_12_B" },
+  { kind = "sine", minutes = 30, period_min = 15, direction = -1, amplitude_pp = 0.16, label = "demand_12_B" },
+] }
+
+# Fallback for a field this file does not declare. v13 declared 8 fields and the rig
+# imaged 10, and the two undeclared ones ran the default for 3.3 h. Because the reference
+# is shared, a stray field cannot be given a distinguishing TARGET without breaking that
+# sharing, so it gets a distinguishing amount of freedom instead. This is arm 2's value,
+# so the fallback is deliberately NOT unique — check the declared FOV list in the
+# startup log, not the kernel, if the field count is wrong.
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 76], [84, 114], [114, 130],
+  [138, 168], [168, 184], [192, 222], [222, 238],
+  [246, 276], [276, 292], [300, 330], [330, 346],
+  [354, 384], [384, 400], [408, 438], [438, 454],
+  [462, 492], [492, 508], [516, 546], [546, 562],
+  [570, 600], [600, 616], [624, 654], [654, 670],
+  [678, 708] ] } }
+
+# --- ARM 1: 0 free min ---------------------------------------------------
+# A bare l2 kernel scores every horizon step — the objective v12-v16 ran, unchanged.
+# Preparing costs anchor error the entire time. This is the control, and a cleaner one
+# than a control PATTERN would be, because it varies the thing under test.
+[fov.0]
+arm = 1
+kernel = "l2"
+
+[fov.7]
+arm = 1
+kernel = "l2"
+
+# --- ARM 2: 8 free min ---------------------------------------------------
+# Eight minutes: dead time (3-5) plus about one tau, so light commanded at the start of
+# the window is only just beginning to move the cell as the block opens. Falls a little
+# short of the ~9 min these openings need — which is the point of putting it here.
+[fov.2]
+arm = 2
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 76], [84, 114], [114, 130],
+  [138, 168], [168, 184], [192, 222], [222, 238],
+  [246, 276], [276, 292], [300, 330], [330, 346],
+  [354, 384], [384, 400], [408, 438], [438, 454],
+  [462, 492], [492, 508], [516, 546], [546, 562],
+  [570, 600], [600, 616], [624, 654], [654, 670],
+  [678, 708] ] } }
+
+[fov.5]
+arm = 2
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 76], [84, 114], [114, 130],
+  [138, 168], [168, 184], [192, 222], [222, 238],
+  [246, 276], [276, 292], [300, 330], [330, 346],
+  [354, 384], [384, 400], [408, 438], [438, 454],
+  [462, 492], [492, 508], [516, 546], [546, 562],
+  [570, 600], [600, 616], [624, 654], [654, 670],
+  [678, 708] ] } }
+
+# --- ARM 3: 14 free min --------------------------------------------------
+# Fourteen minutes: clears the requirement with margin, but not enough to excurse far
+# and return.
+[fov.1]
+arm = 3
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 70], [84, 114], [114, 124],
+  [138, 168], [168, 178], [192, 222], [222, 232],
+  [246, 276], [276, 286], [300, 330], [330, 340],
+  [354, 384], [384, 394], [408, 438], [438, 448],
+  [462, 492], [492, 502], [516, 546], [546, 556],
+  [570, 600], [600, 610], [624, 654], [654, 664],
+  [678, 708] ] } }
+
+[fov.6]
+arm = 3
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 70], [84, 114], [114, 124],
+  [138, 168], [168, 178], [192, 222], [222, 232],
+  [246, 276], [276, 286], [300, 330], [330, 340],
+  [354, 384], [384, 394], [408, 438], [438, 448],
+  [462, 492], [492, 502], [516, 546], [546, 556],
+  [570, 600], [600, 610], [624, 654], [654, 664],
+  [678, 708] ] } }
+
+# --- ARM 4: 20 free min --------------------------------------------------
+# Twenty minutes: the most the 30-frame horizon supports, and enough to overshoot the
+# anchor in either direction and coast back through it at the demanded rate.
+[fov.3]
+arm = 4
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 64], [84, 114], [114, 118],
+  [138, 168], [168, 172], [192, 222], [222, 226],
+  [246, 276], [276, 280], [300, 330], [330, 334],
+  [354, 384], [384, 388], [408, 438], [438, 442],
+  [462, 492], [492, 496], [516, 546], [546, 550],
+  [570, 600], [600, 604], [624, 654], [654, 658],
+  [678, 708] ] } }
+
+[fov.4]
+arm = 4
+kernel = { type = "masked", inner = "l2", mask = { type = "spans", spans = [
+  [0, 60], [60, 64], [84, 114], [114, 118],
+  [138, 168], [168, 172], [192, 222], [222, 226],
+  [246, 276], [276, 280], [300, 330], [330, 334],
+  [354, 384], [384, 388], [408, 438], [438, 442],
+  [462, 492], [492, 496], [516, 546], [546, 550],
+  [570, 600], [600, 604], [624, 654], [654, 658],
+  [678, 708] ] } }
+
