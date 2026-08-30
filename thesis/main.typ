@@ -642,7 +642,7 @@ improvemnt in MAE error over a fresh context.
 #todo[gap: "feature relevance over time" (7c in the outline). No such figure
 exists yet.]
 
-== Quantifying uncertainty calibration
+== Quantifying uncertainty 
 
 // Outline brief: reliability — for every prediction and its confidence
 // interval, count the observations that fall inside it. Does the 90% interval
@@ -650,11 +650,24 @@ exists yet.]
 // single-Gaussian head. Is there symmetry in the tails — does the model tend to
 // under- or over-estimate? Does coverage change with forecast lead time?
 
-Uncertainty mechanisms employed by the MDN approach have a beneficial 
-effect when compared to a single gaussian head. 
-Forecast lead time has an effect on the calibration of uncertainty of the model - 
-model tends to an underconfident coverage at forecasts below 5 minutes into the future.
-Longer forecasts converge to a confidence interval that matches empirical coverage.
+The gaussian mixture model employed outputs a 3-compoent gaussian mixture for each prediction step it makes. 
+Since every prediction carries its own distribution (different mixture weights, means and variances), we used
+Probability Integral Transform as a way to evaluate if the calibration is correct. 
+We computed CDF of our mixture model and compared it to the empirical observations. 
+The tests were conducted on n=7237 forecast starting points, computing 30 predictions steps for each. 
+As a comparison, a gaussian z-score of the mixture was also used, to see if a single gaussian with full mixture's 
+total spread would be sufficient to replicate its coverage. 
+We observe that exact mixture is well calibrated by its coverage. Comparatively, the z-scored gaussian is underconfident, signifying that 
+the choice of using a mixture was beneficial.
+
+Former analysis is symmetric in nature, as coverage scans central intervals. Evaluating raw PIT densites, we notice that the model is generous in the lower tail of the distribution.
+It anticipates more downward movement than there are in reality, especially so in the early steps of a forecast - at the fist prediction step lower
+tail is -4.3 percentage points, and it reduces to 0 at step 30.
+
+A separate issue from accuracy itself, is whether the mixture's standard deviation is tracking factual error.
+To do that, RMSE over predictions is plotted against prediction's standard deviation binned into deciles,
+falling on an identity line - the predicted standard deviation matches the realised RMSE in magnitude and not only in rank.
+Across deciles the predicted standard deviation spans roughly a tenfold range and the realised error tracks it, so σ discriminates between easy and hard predictions rather than reporting one width everywhere.
 
 #thesisfig(
   "uncertainty-calibration",
@@ -669,6 +682,13 @@ dropout is promised in the outline and has not been run.
 it is an offline analysis.]
 
 == Live experiment controller
+
+Data from live experiments has a caveat in that all single-cell tracks being evaluated must 
+necessarily have been tracked for at least 9 out of 12 hours of the experiment. 
+
+This leaves a possibility of a survivorship bias. 
+
+#todo[Figure idea from lab notebook - plot all of the events of a cell that stops being tracked at a given point in time. In order to see if there is some pattern and how the cells drop out of the experiment.  ]
 
 // Outline brief: is the calibration of real vs. trained good — does the model
 // have the same predictive characteristics on the rig? Overall accuracy
