@@ -138,8 +138,15 @@
 //   whether a learned controller distinguishes distinct stimulation strategies
 //   based on its internal representation. We investigate the limits of
 //   controllability of such system.
-
 #heading(numbering: none, outlined: true)[Abstract]
+
+In this work, I aim to create a practical method of controlling ERK signalling dynamics 
+on a single-cell level in a live experiment using optogenetic stimulation. 
+Deep learning model is used for forecasting future ERK levels, 
+utilising MDN head for communicating uncertainty. Predicive model is then integrated into a 
+Model Predictive Control (MPC) controller, and used to steer experiments in real time. 
+We demonstrate ... #todo[what? ]
+
 
 #todo[write the abstract last]
 
@@ -196,7 +203,7 @@ statistic measured under closed-loop control becomes the comparison. Indicative
 and cross-plate: the closed-loop within-field spread in v21 is 1.02 against this
 1.73, i.e. roughly 40% narrower.]
 
-== Mechanistic models and where they run out
+== Mechanistic models
 
 Using ODE or PDE models of a signalling cascade together with standard
 statistical machine-learning techniques, we can fit a model and use it to
@@ -545,10 +552,10 @@ trajectory. Three different ranges of unscored frame lengths are tested across m
 objective patterns.
 
 #thesisfig(
-  "free-window-design",
+  "proposed-demands",
   [The free-window design: how much unscored time the controller is given before each
    demand opens.],
-  "fig-free-window-design",
+  "free window design",
 )
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -564,6 +571,21 @@ and consisted of 8-12 fields of view on the microscope.
 == Repeating objective pattern
 
 First group of experiments revolves around a repeating pattern being asked of cells to reproduce. 
+Various frequencies were chosen in order to avoid accidentally settling in a frequency regime that 
+is 'natural' to the cell.
+Initial experiments served as calibration of controller parameters and methods. In experiment marked `v10`, 
+8 fields of view were split into 4 experimental arms. The goal was to compare scoring functions and mechanisms of 
+sampling new stimulations.
+Arm 1 was a control, not utilising full MPC: it evaluated 5 possible futures at 30 frames - one for each choice of 
+next stimulation, pretending that this exact stimulation will be applied on the next 30 frames. 
+Arm 2 was a base MPC configuration - using L2 norm to score predictions and starting the sampling from a 
+uniform distribution across choices of stimulation.
+Arm 3 was a base MPC configuration with additional penalty for big 'jumps' between stimulation choices at 
+subsequent frames - effectively promoting a smooth stimulation patterns over time.
+Arm 4 had the same configuration as Arm 3, except the scoring method was changed into a band kernel.  
+
+
+
 
 == Diversity of stimulation types found by the model
 Early experiments #todo[figure xxx ] showed that model can encode single cell history into an embedding that is useful for predictions of its future state. 
@@ -576,6 +598,13 @@ In the standard
 // ═════════════════════════════════════════════════════════════════════════════
 //  RESULTS
 // ═════════════════════════════════════════════════════════════════════════════
+// Questions to answer:
+// How does the offline model behave? Accuracy, uncertainty calibration, which features are important (encoder)
+// Live experiment:
+// - explanation of experiments, cadence slips, and moving resting CNR
+// - comparison of prediction accuracy to the offline model. 
+// - quantifying control drift (repeats, )
+// - 
 
 = Results
 
@@ -592,8 +621,6 @@ We evaluated the trained model on held-out trajectories from all the open-loop e
 Model achieved #todo[RMSE, R^2 stats for the whole held-out dataset]. on a 8-min horizon. 
 This horizon is also the control horizon for the live experiment runs. 
 Beyond this horizon, we observe the flattening of model's error. 
-This property validates the use of 30 future frames when using this model for 
-generating solutions for live experiments
 
 #thesisfig(
   "model-accuracy",
@@ -612,23 +639,15 @@ generating solutions for live experiments
 
 Model showed heavy reliance on the encoded history of the cell. Using full history shows over 2-fold 
 improvemnt in MAE error over a fresh context. 
+Input features showed a large dependance on the encoded context.
+OptoRTK expression rank in particular is very helpful early in the run (contributing 0.24 R^2), superseding even fluence. 
+Spatial features (local crowding, field density) are not used by the model. 
 
 #thesisfig(
   "encoder-needs",
   [Forecast error falls #todo[2.2]#sym.times as the encoder is given more of the
    cell's own past, saturating around 20 minutes.],
   "fig-encoder",
-)
-
-#thesisfig(
-  "response-identity",
-  [*The structure the model exploits is there in the data.* A cell's response
-   over one window resembles its own response in other windows more closely than
-   it resembles its neighbours' over the same window, compared at matched time
-   separation so that drift over the run cancels on both sides. Measured with no
-   model and no controller in the loop, on the fixed pulse train of
-   #raw("bo_v8"), the effect is positive in 58 of 58 fields.],
-  "fig-identity",
 )
 
 #thesisfig(
@@ -642,7 +661,9 @@ improvemnt in MAE error over a fresh context.
 #todo[gap: "feature relevance over time" (7c in the outline). No such figure
 exists yet.]
 
+// ------------------------------------------------------------------------------------
 == Quantifying uncertainty 
+// ------------------------------------------------------------------------------------
 
 // Outline brief: reliability — for every prediction and its confidence
 // interval, count the observations that fall inside it. Does the 90% interval
@@ -678,10 +699,12 @@ Across deciles the predicted standard deviation spans roughly a tenfold range an
 )
 
 #todo[gap: the comparison of the mixture-density head against ensembles and MC
-dropout is promised in the outline and has not been run. 
+dropout is in the outline and has not been run. 
 it is an offline analysis.]
 
+// ------------------------------------------------------------------------------------
 == Live experiment controller
+// ------------------------------------------------------------------------------------
 
 Data from live experiments has a caveat in that all single-cell tracks being evaluated must 
 necessarily have been tracked for at least 9 out of 12 hours of the experiment. 
@@ -694,6 +717,49 @@ This leaves a possibility of a survivorship bias.
 // have the same predictive characteristics on the rig? Overall accuracy
 // (residuals); comparison of closed loop to open loop; distribution of
 // residuals across stimulation-pattern types.
+
+// The ledger comes first: it is the run-selection argument. Everything the rest
+// of this section quotes is drawn from the four runs that clear both gates, and
+// this is where that choice is stated rather than assumed.
+#thesisfig(
+  "run-ledger",
+  [#todo[caption. Every live run scored on the same two gates. (a) achieved
+   cadence, median to p90, against the 1 min interval the model was trained on;
+   seven runs slipped, from 1.16 to 5.72 min per frame. (b) share of closed-loop
+   cell-frames sitting on the top rung of their own field's ladder, annotated
+   with the ladders issued. Saturation must be measured per field: v14--v16 gave
+   their closed-loop fields a 150 ms ladder while driving their open-loop fields
+   to 600 ms, so a run-wide figure understates v16 by more than a factor of ten
+   (5% against 73%). Three runs of nineteen clear both gates (v21, v23, v24);
+   v16 and v19 hold cadence but saturate 73% and 32% of the time; v22 is
+   excluded for a mis-set objective.]],
+  "fig-ledger",
+)
+
+#thesisfig(
+  "arm-tracks",
+  [#todo[Describe the tracks] ],
+  "experiment tracks",
+)
+
+=== Experiment v10 - finding beneficial controller mechanisms 
+
+Experiment v10 evaluated based MPC controller against two addioinal mechanisms: 
+move penalty, and band kernel scoring. #todo[RMSE comparison between arms] . 
+This establishes a working experimental run and an early sign of success. Notably, the run 
+did encounter some problems. Cadence slip is a failure mode where as the microscope 
+moves between fields of view, the full rotation through all fields takes longer than planned minute.
+Early experiments encountered such problems early, due to a misconfiguration.
+Experiment v10 worked at a cadence of 85s per frame instead of standard 60s. 
+However, as this circumstance affects all conditions equally, the conclusions from this experiment
+are not invalidated. #todo[The run is not suitable for evaluating model's timing ...]
+
+#thesisfig(
+  "exp_v10_arm2_plot",
+  [Experiment v10 demonstrates the model working in a real experiment, even despite cadence slips.],
+  "exp_v10_arm2"
+)
+
 
 // This figure opens the section on purpose. It states what the instrument can
 // and cannot do BEFORE any tracking number is quoted, so the limits read as a
@@ -711,38 +777,32 @@ This leaves a possibility of a survivorship bias.
   "fig-reachability",
 )
 
-#thesisfig(
-  "rig-calibration",
-  [*Whether a model trained under whole-field illumination is calibrated for a
-   rig that lights one nucleus at a time.* (a) The model is worse than assuming
-   the cell stays put until it has seen a few frames of that cell, and better
-   after; counts per bin are printed at the foot of each column. (b) The signed
-   error, so its direction is visible: the model expects more than it gets, and
-   most of that offset clears once the encoder has context. (c) What survives
-   when a cold start cannot be the explanation, using only cells with 150 or
-   more frames of history. In the dark the forecast is unbiased; the offset
-   grows with the commanded dose, which is what a model trained under
-   whole-field light and then served one nucleus at a time would do.
-   (d) The control: the gap between the two history bands is open at every hour
-   of the run, so the cold start is not the cells drifting over the session --
-   fresh cells are picked up throughout and each pays the same entry cost.],
-  "fig-rig-calibration",
-)
+//#thesisfig(
+//  "rig-calibration",
+//  [*Whether a model trained under whole-field illumination is calibrated for a
+//   rig that lights one nucleus at a time.* (a) The model is worse than assuming
+//   the cell stays put until it has seen a few frames of that cell, and better
+//   after; counts per bin are printed at the foot of each column. (b) The signed
+//   error, so its direction is visible: the model expects more than it gets, and
+//   most of that offset clears once the encoder has context. (c) What survives
+//   when a cold start cannot be the explanation, using only cells with 150 or
+//   more frames of history. In the dark the forecast is unbiased; the offset
+//   grows with the commanded dose, which is what a model trained under
+//   whole-field light and then served one nucleus at a time would do.
+//   (d) The control: the gap between the two history bands is open at every hour
+//   of the run, so the cold start is not the cells drifting over the session --
+//   fresh cells are picked up throughout and each pays the same entry cost.],
+//  "fig-rig-calibration",
+//)
 
-#thesisfig(
-  "controller-behaviour",
-  [What the controller does: it acts before the demand rises, times its light to
-   the cells' own lag rather than to the waveform, chooses a different dose for
-   each cell under an identical demand, and had actuator room to do so.],
-  "fig-controller",
-)
+//#thesisfig(
+//  "tracking",
+//  [How well the demand was met, and by how much of the population — each cell
+//   judged against its own drift.],
+//  "fig-tracking",
+//)
 
-#thesisfig(
-  "tracking",
-  [How well the demand was met, and by how much of the population — each cell
-   judged against its own drift.],
-  "fig-tracking",
-)
+todo[describe the runs?]
 
 #thesisfig(
   "bandwidth",
@@ -774,11 +834,7 @@ and no valid experiment exists for it yet. The feedback-ladder policy
 // dimensionality reduction then clustering, ordered by L2 so the result is
 // steerable cells and not dead ones?
 
-#thesisfig(
-  "dose-diversity",
-  [What the controller does minute by minute of the cycle.],
-  "fig-dose-by-phase",
-)
+#todo[Dose diversity analysis - How?]
 
 #thesisfig(
   "response-modality",
@@ -792,17 +848,18 @@ and no valid experiment exists for it yet. The feedback-ladder policy
 // against elapsed time, against the integral of fluence, and as the increase in
 // fluence needed per cycle over 12 h.
 
+#todo[decline in sensitivity fig]
+
 #thesisfig(
   "sensitivity-decline",
-  [The same demand, four hours apart: a weaker answer, for more light.],
-  "fig-decline",
+  [],
+  "sensitivity-decline",
 )
 
-#todo[@fig-decline puts the clock and cumulative light near-tied
+#todo[fig-decline puts the clock and cumulative light near-tied
 (#todo[4.2] vs #todo[4.3]), not clock-dominant. The text must say that, and
 separating them would need a duty-cycle arm — same total light, different
 elapsed time.]
-
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  DISCUSSION
@@ -818,7 +875,7 @@ elapsed time.]
 
 #todo[the candidate readings: receptor internalisation and downregulation;
 photobleaching or phototoxicity of the construct; medium exhaustion over a
-12 h starved run; adaptation in the pathway itself. @fig-decline bears on
+12 h starved run; adaptation in the pathway itself. fig-decline bears on
 which of these can be told apart with the data in hand, and which cannot.]
 
 // ═════════════════════════════════════════════════════════════════════════════
