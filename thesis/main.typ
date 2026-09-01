@@ -568,29 +568,40 @@ Experiments on the live cells were designed to probe the biological system as we
 Standard length of the experiment lasted 12 hours,
 and consisted of 8-12 fields of view on the microscope. 
 
-== Repeating objective pattern
+=== Search for useful controller mechanisms
 
-First group of experiments revolves around a repeating pattern being asked of cells to reproduce. 
-Various frequencies were chosen in order to avoid accidentally settling in a frequency regime that 
-is 'natural' to the cell.
-Initial experiments served as calibration of controller parameters and methods. In experiment marked `v10`, 
-8 fields of view were split into 4 experimental arms. The goal was to compare scoring functions and mechanisms of 
-sampling new stimulations.
+Predictive model can be evaluated offline, by observing its errors on already existing data. Due to its counterfactual nature,
+controller is impossible to evaluate offline. Because of this, the first experiment (v10) aimed to evaluate usefulness of the base MPC controller and two
+variations on its theme. I designed 4 experimental arms :
 Arm 1 was a control, not utilising full MPC: it evaluated 5 possible futures at 30 frames - one for each choice of 
 next stimulation, pretending that this exact stimulation will be applied on the next 30 frames. 
 Arm 2 was a base MPC configuration - using L2 norm to score predictions and starting the sampling from a 
 uniform distribution across choices of stimulation.
 Arm 3 was a base MPC configuration with additional penalty for big 'jumps' between stimulation choices at 
 subsequent frames - effectively promoting a smooth stimulation patterns over time.
-Arm 4 had the same configuration as Arm 3, except the scoring method was changed into a band kernel.  
+Arm 4 had the same configuration as Arm 3, except the scoring method was changed into a band kernel.
+We considered band kernel as a mechanism that could help specifically with asymetricity of control of our system - since 
+we can only control to activate the optogenetic receptor but can only decrease CNR by waiting, overshooting the target has 
+more serious implications than undershooting (since we can re-stimulate to correct for the undershoot in the next frame). 
+L2 method is symmetric, scoring overshot and undershot predictions the same way. 
+Band kernel could be designed to be more lenient on undershooting cells. 
 
+=== Diversity of stimulation types found by the model
 
+Early experiments (@fig-encoder) showed that model can encode single cell history into an embedding that is useful for predictions of its future state. #todo[weird sentence. feels discussion'y]
 
-
-== Diversity of stimulation types found by the model
-Early experiments #todo[figure xxx ] showed that model can encode single cell history into an embedding that is useful for predictions of its future state. 
 We wanted to investigate if this encoding is ever used as a discriminating factor not just for the quantity of the response given, but also its shape.
-In the standard 
+Orignal implementation for a controller receives an objective function, and scores the model's proposed solutions at every step, 
+even before any interesting parts objective patterns start (for example, pre-experiment resting state). 
+This limits the diversity of stimulation patterns, as it only asks the question of 'how to best follow the objective curve at every step'. 
+The alternative approach would be to consider an approach where the solution's default frame is not coutered towards the score,
+except when the frame is inside the objective interval.
+
+This way, as the frame approaches the 'scored' section, the controller can use its information about driven cell and pick a 
+pre-stimulation strategy that it considers best for crossing the 'scored' section.
+
+Practical strategy for exploring this idea was to introduce a 'free window' of varying size before an objective pattern,
+and observing stimulation patterns within this window.   
 
 == Comparing single-cell control, population-level control and open loop stimulation 
 
@@ -742,9 +753,7 @@ This leaves a possibility of a survivorship bias.
   "experiment tracks",
 )
 
-=== Experiment v10 - finding beneficial controller mechanisms 
-
-Experiment v10 evaluated based MPC controller against two addioinal mechanisms: 
+Experiment v10 (@exp_v10_arm2) evaluated based MPC controller against two addioinal mechanisms: 
 move penalty, and band kernel scoring. #todo[RMSE comparison between arms] . 
 This establishes a working experimental run and an early sign of success. Notably, the run 
 did encounter some problems. Cadence slip is a failure mode where as the microscope 
@@ -752,13 +761,18 @@ moves between fields of view, the full rotation through all fields takes longer 
 Early experiments encountered such problems early, due to a misconfiguration.
 Experiment v10 worked at a cadence of 85s per frame instead of standard 60s. 
 However, as this circumstance affects all conditions equally, the conclusions from this experiment
-are not invalidated. #todo[The run is not suitable for evaluating model's timing ...]
+are not invalidated.
 
 #thesisfig(
   "exp_v10_arm2_plot",
   [Experiment v10 demonstrates the model working in a real experiment, even despite cadence slips.],
   "exp_v10_arm2"
 )
+
+This experiment shows model's capability to push a population of cells into a desirable behavior. 
+The controller manages to keep desired frequency of the oscillations throught the experiment.
+However, across cycles controller's ability to push cells into full amplitude diminishes.
+During the first cycle median CNR reached desired level, while in the last cycle median CNR reached only halfway the objective. 
 
 
 // This figure opens the section on purpose. It states what the instrument can
@@ -852,7 +866,7 @@ and no valid experiment exists for it yet. The feedback-ladder policy
 
 #thesisfig(
   "sensitivity-decline",
-  [],
+  [Each experiment with a repeating block objective componenet, plot of mean CNR and 95% confidence interval for the first block and the last block of the experiment. In all experiments except v19, last cycle is consistently lower, while taking up more light. ],
   "sensitivity-decline",
 )
 
@@ -877,6 +891,11 @@ elapsed time.]
 photobleaching or phototoxicity of the construct; medium exhaustion over a
 12 h starved run; adaptation in the pathway itself. fig-decline bears on
 which of these can be told apart with the data in hand, and which cannot.]
+
+== Impact of resting CNR states on ridgid objectives
+
+Objective during the current experiments was pre-set. During some experiments,
+the baseline starting CNR level varies to the point, where #todo[Difficulty with designing and conducting good experiments because of a varying pre-stimulation baseline CNR.]
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  FUTURE WORK
