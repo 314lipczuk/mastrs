@@ -603,7 +603,88 @@ pre-stimulation strategy that it considers best for crossing the 'scored' sectio
 Practical strategy for exploring this idea was to introduce a 'free window' of varying size before an objective pattern,
 and observing stimulation patterns within this window.   
 
+#figure(
+  text(size: 8.5pt)[
+    #table(
+      columns: (1.15fr, 2.5fr, 1.25fr),
+      align: (left, left, left),
+      inset: 5.5pt,
+      table.header([*Design*], [*What it asks of the loop*], [*Live runs*]),
+
+      table.cell(colspan: 3, fill: luma(94%))[
+        *Objectives* --- what the cells were asked to do],
+
+      [Constant hold],
+      [Bring every cell to one fixed CNR and keep it there. The simplest demand,
+       and the only one whose reference never moves, so tracking error and
+       measurement noise are not separable by shape.],
+      [v12, v13, v14--v16],
+
+      [Periodic waveform],
+      [Drive CNR up and down on a repeating step train. Cells are split into
+       phase groups, so one field carries the same waveform started at several
+       different times.],
+      [v10, v11, v12, \ v13, v17, v19],
+
+      [Frequency staircase],
+      [Blocks of shortening period with shrinking amplitude inside a single
+       field, to find the period at which the response stops following.],
+      [v12, v14--v16],
+
+      [Arbitrary schedule],
+      [Follow a demand curve defined by breakpoints rather than by a period, so
+       that following cannot be achieved by locking to a rhythm.],
+      [v14--v16, v21],
+
+      [Segmented run-up],
+      [Re-establish an anchor before each demand block, so that every block is
+       entered from a known level rather than from wherever the previous block
+       left the cells.],
+      [v22, v23, v24],
+
+      table.cell(colspan: 3, fill: luma(94%))[
+        *Controllers and scoring* --- how the light was chosen],
+
+      [Per-cell MPC],
+      [The default: each cell's dose chosen from its own predicted trajectory
+       over the planning horizon.],
+      [every closed-loop \ run from v10 on],
+
+      [Cost-function variants],
+      [Whether the shape of the penalty matters: squared error against a
+       dead-band that ignores small deviations, and a penalty on changing the
+       dose between frames.],
+      [v10, v11],
+
+      [Open loop],
+      [A fixed light sequence with no feedback. Serves both as the control arm
+       and, when the sequence steps through the ladder, as a characterisation of
+       the actuator itself.],
+      [v13, v14--v16, v24],
+
+      [Unscored window],
+      [Leave a window before each scored span out of the cost, so the controller
+       may pre-position the cell instead of being scored at every frame.],
+      [v21, v22, v23],
+
+      [Population MPC],
+      [One dose shared across a group of cells rather than chosen per cell ---
+       the comparison that isolates what per-cell control buys.],
+      [v24],
+    )
+  ],
+  caption: [#todo[caption. The experimental designs and the live runs that used
+   them. Objectives and controllers are crossed rather than nested: one run
+   carries several objectives across its fields, and one objective appears under
+   several controllers. Runs before v10 are omitted, having been recorded
+   without a controller policy. Per-run scalars and admissibility are in
+   @fig-ledger.]],
+) <tab-designs>
+
 == Comparing single-cell control, population-level control and open loop stimulation 
+
+
+
 
 #todo[After E2 is done, fill this one in] 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -615,7 +696,6 @@ and observing stimulation patterns within this window.
 // - explanation of experiments, cadence slips, and moving resting CNR
 // - comparison of prediction accuracy to the offline model. 
 // - quantifying control drift (repeats, )
-// - 
 
 = Results
 
@@ -648,6 +728,8 @@ Beyond this horizon, we observe the flattening of model's error.
   "fig-forecast-examples",
 )
 
+=== Dependence on temporal context
+
 Model showed heavy reliance on the encoded history of the cell. Using full history shows over 2-fold 
 improvemnt in MAE error over a fresh context. 
 Input features showed a large dependance on the encoded context.
@@ -673,7 +755,7 @@ Spatial features (local crowding, field density) are not used by the model.
 exists yet.]
 
 // ------------------------------------------------------------------------------------
-== Quantifying uncertainty 
+=== Calibrating uncertainty 
 // ------------------------------------------------------------------------------------
 
 // Outline brief: reliability — for every prediction and its confidence
@@ -714,15 +796,15 @@ dropout is in the outline and has not been run.
 it is an offline analysis.]
 
 // ------------------------------------------------------------------------------------
-== Live experiment controller
+== Controling live experiments
 // ------------------------------------------------------------------------------------
+19 experiments were conducted in total. 
+experiments (v10, v11, v16, v19, 21, v23, v24) were both technically sound and contained useful information.
 
 Data from live experiments has a caveat in that all single-cell tracks being evaluated must 
 necessarily have been tracked for at least 9 out of 12 hours of the experiment. 
-
 This leaves a possibility of a survivorship bias. 
-
-#todo[Figure idea from lab notebook - plot all of the events of a cell that stops being tracked at a given point in time. In order to see if there is some pattern and how the cells drop out of the experiment.  ]
+#todo[Figure idea from lab notebook - plot all of the events of a cell that stops being tracked at a given point in time. In order to see if there is some pattern and how the cells drop out of the experiment.]
 
 // Outline brief: is the calibration of real vs. trained good — does the model
 // have the same predictive characteristics on the rig? Overall accuracy
@@ -732,34 +814,15 @@ This leaves a possibility of a survivorship bias.
 // The ledger comes first: it is the run-selection argument. Everything the rest
 // of this section quotes is drawn from the four runs that clear both gates, and
 // this is where that choice is stated rather than assumed.
-#thesisfig(
-  "run-ledger",
-  [#todo[caption. Every live run scored on the same two gates. (a) achieved
-   cadence, median to p90, against the 1 min interval the model was trained on;
-   seven runs slipped, from 1.16 to 5.72 min per frame. (b) share of closed-loop
-   cell-frames sitting on the top rung of their own field's ladder, annotated
-   with the ladders issued. Saturation must be measured per field: v14--v16 gave
-   their closed-loop fields a 150 ms ladder while driving their open-loop fields
-   to 600 ms, so a run-wide figure understates v16 by more than a factor of ten
-   (5% against 73%). Three runs of nineteen clear both gates (v21, v23, v24);
-   v16 and v19 hold cadence but saturate 73% and 32% of the time; v22 is
-   excluded for a mis-set objective.]],
-  "fig-ledger",
-)
 
-#thesisfig(
-  "arm-tracks",
-  [#todo[Describe the tracks] ],
-  "experiment tracks",
-)
-
-Experiment v10 (@exp_v10_arm2) evaluated based MPC controller against two addioinal mechanisms: 
-move penalty, and band kernel scoring. #todo[RMSE comparison between arms] . 
-This establishes a working experimental run and an early sign of success. Notably, the run 
+Experiment v10 and v11 (@exp_v10_arm2) evaluated based MPC controller against two addioinal mechanisms: 
+move penalty, and band kernel scoring across two different frequency
+settings. 
+This establishes a working experimental run and an early sign of success. Notably, the runs 
 did encounter some problems. Cadence slip is a failure mode where as the microscope 
 moves between fields of view, the full rotation through all fields takes longer than planned minute.
-Early experiments encountered such problems early, due to a misconfiguration.
-Experiment v10 worked at a cadence of 85s per frame instead of standard 60s. 
+Early experiments encountered such problems early, due to a misconfiguration of the opearting system.
+Experiments v10 and v11 worked at a cadence of 85s and 69s respectively instead of standard 60s. 
 However, as this circumstance affects all conditions equally, the conclusions from this experiment
 are not invalidated.
 
@@ -773,7 +836,35 @@ This experiment shows model's capability to push a population of cells into a de
 The controller manages to keep desired frequency of the oscillations throught the experiment.
 However, across cycles controller's ability to push cells into full amplitude diminishes.
 During the first cycle median CNR reached desired level, while in the last cycle median CNR reached only halfway the objective. 
+This prompted the design of more experiments that could help with quantifying the effect of diminishing responsivity to control. 
+The best controller arm is the base MPC one, scoring lowest RMSE values in both experiments (0.1916 in v10, 0.1554 in v11), and
+thus was used in all later experiments.
+#todo[Mann-Whitney U test w/ Holm corr for multiple testing to have p-value of the above claim?]
 
+Having obtained a stable controller configuration, we moved into a more diverse set of objectives for experiments.
+Generalization of accuracy and uncertainty from the offline evaluation into live experiment regime was done.
+Both transfer well on at the forecast horizon, but uncertainty shows degraded performance in mid-horizon range. 
+#thesisfig(
+  "rig-calibration",
+  [Accuracy and uncertainty comparison of the data from 4 live experiments running under the same controller to the results of offline evaluation.],
+  "rig-calibration",
+)
+The uncertainty quantification is the worst at the 8-15 timestep horizon, (68% nominal outcomes are matched with 61% 
+in live experiment at horizon of 15 frames, while offline evaluation returned 70),
+but returns to trustworthy levels (95% nominal coverage is matched by 93% in live model). 
+Interestingly, the direction of error of live deployment is the opposite of the offline one - while offline uncertainty was 
+slightly too 'wide' (model assigned the border values such that when it thought 68% of samples will land there ,70% actually did)
+, the live model assigned them narrowly (68% was supposed to land, but 61% did). 
+
+A visible effect in a lot of experiments with repeating block objective was the gradual 
+flattening of the response to stimulation (@sensitivity-decline).
+
+
+#thesisfig(
+  "sensitivity-decline",
+  [Experiments with a repeating objective componenet, mean CNR, goal (dotted), and 95% confidence interval for the first repeat and the last repeat of the pattern in the experiment. In all experiments except 70m arm v19, last cycle is consistently lower, while taking up more light. ],
+  "sensitivity-decline",
+)
 
 // This figure opens the section on purpose. It states what the instrument can
 // and cannot do BEFORE any tracking number is quoted, so the limits read as a
@@ -830,7 +921,7 @@ todo[describe the runs?]
    minutes, so the four arms are comparable. The medians sit within a few
    degrees of locked at every period despite three to five minutes of dead time
    in the loop -- the controller's 30-frame lookahead pays that back. The bars
-   are the interquartile range across cells, and it is wide. (d) The price of
+   are the interquartile range across cells. (d) The price of
    tracking, early against late in each run: the error barely moves while the
    dose required to hold it climbs.],
   "fig-bandwidth",
@@ -839,8 +930,6 @@ todo[describe the runs?]
 #todo[gap: closed loop against open loop. This is the section's central claim
 and no valid experiment exists for it yet. The feedback-ladder policy
 (policies/policy_8fov_feedback_ladder.toml) is written and unrun.]
-
-== Picking a path to a goal: diversity of stimulation types <sec-diversity>
 
 // Outline brief: experiment with unset parts of the objective — breakdown of
 // stimulation-pattern types under the SAME objective. Does the model find
@@ -864,11 +953,6 @@ and no valid experiment exists for it yet. The feedback-ladder policy
 
 #todo[decline in sensitivity fig]
 
-#thesisfig(
-  "sensitivity-decline",
-  [Each experiment with a repeating block objective componenet, plot of mean CNR and 95% confidence interval for the first block and the last block of the experiment. In all experiments except v19, last cycle is consistently lower, while taking up more light. ],
-  "sensitivity-decline",
-)
 
 #todo[fig-decline puts the clock and cumulative light near-tied
 (#todo[4.2] vs #todo[4.3]), not clock-dominant. The text must say that, and
@@ -902,8 +986,6 @@ the baseline starting CNR level varies to the point, where #todo[Difficulty with
 // ═════════════════════════════════════════════════════════════════════════════
 
 = Future work
-
-// Ported from the outline and from the "Future work" section of the draft.
 
 #todo[write]
 
@@ -940,6 +1022,28 @@ the baseline starting CNR level varies to the point, where #todo[Difficulty with
 belonging in the appendix rather than in the methods]
 
 == Additional figures
+
+
+#thesisfig(
+  "run-ledger",
+  [#todo[caption. Every live run scored on the same two gates. (a) achieved
+   cadence, median to p90, against the 1 min interval the model was trained on;
+   seven runs slipped, from 1.16 to 5.72 min per frame. (b) share of closed-loop
+   cell-frames sitting on the top rung of their own field's ladder, annotated
+   with the ladders issued. Saturation must be measured per field: v14--v16 gave
+   their closed-loop fields a 150 ms ladder while driving their open-loop fields
+   to 600 ms, so a run-wide figure understates v16 by more than a factor of ten
+   (5% against 73%). Three runs of nineteen clear both gates (v21, v23, v24);
+   v16 and v19 hold cadence but saturate 73% and 32% of the time; v22 is
+   excluded for a mis-set objective.]],
+  "fig-ledger",
+)
+
+#thesisfig(
+  "arm-tracks",
+  [#todo[Describe the tracks] ],
+  "experiment tracks",
+)
 
 #todo[park supplementary panels here as they are cut from the main text]
 
