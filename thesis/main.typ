@@ -145,7 +145,11 @@ on a single-cell level in a live experiment using optogenetic stimulation.
 Deep learning model is used for forecasting future ERK levels, 
 utilising MDN head for communicating uncertainty. Predicive model is then integrated into a 
 Model Predictive Control (MPC) controller, and used to steer experiments in real time. 
-We demonstrate ... #todo[what? ]
+
+The trained model is accurate and calibrated enough to drive closed-loop control experiments. 
+However, the sensitivity drift, objective geometry and the initial conditions of the controlled population 
+can greatly influence the overall success. 
+
 
 
 #todo[write the abstract last]
@@ -170,19 +174,37 @@ We demonstrate ... #todo[what? ]
 
 == ERK dynamics and cell fate
 
-Dynamics of ERK have been shown to influence cell fate.
+MAPK/ERK pathway plays key role in cellular proliferation signalling, utilising dynamics rather 
+than stable states to control cell fate decisions. Ryu2015
+Stimulation byA sustained pulse leads to differentiation while a 
+transient pulse to proliferation. 
 
-#todo[continue — per the writing strategy, first sentence of each paragraph
-first, then fill the paragraphs out]
+cells parttake in a complex spatiotemporal population-level phenomena such as ERK-waves, that affect processes such as wound healing, apoptosis resistance. 
+Cancer cells have been shown to impact these high-level communications, interfering with the surrounding healthy tissue. (talk about small population influencing dynamics of whole tissue)
 
-== Why the population average is not enough
+Predicting how a given stimulation of the pathway, be it via a growth factor 
+or an optogenetic stimulation of an upstream receptor affects the downstream ERK dynamics
+has been dominated by mechanistic approaches that encode a model of the biochemical
+cascade with each participant quantified, and utilise ODE fitting approaches to adjust
+model parameters to a real measurements. 
+This approach, while principled, can suffer from a number of issues. Data for the 
+fitting of such model often only consists of an insufficient number of  state variables of the system in question.
 
 A standard problem in studying a biological system is that while a given
 quantity might be easily modelled at the level of a summary statistic of a
 population, the same does not hold when talking about an individual.
 
-// brief: the signalling events, fates, symmetry breaking, etc. are
-// individual-level events.
+The model itself often suffers from parameter nonidentifiability, ... #todo[problems w/ mech] , requires expert knowledge for model creation
+
+and requires our system bo be encapsulable within the level of abstraction we're operating on (example: it's hard to include morphology or mechanical stimulation information in a biochemical ODE model of a pathway)
+// brief: ODE model problems — expert knowledge, costly fitting, modelling
+// changes in how a cell responds, explicit need for multiple levels of
+// phenomena encoded, parameter non-identifiability.
+
+The final state is a mechanistically interpretable model that integrates our understanding 
+of the biology while giving us ability to produce predictions. Scope is limited to the data we trained the model on.
+
+However, wide distributions of protein abundance contribute to a noisy signaling state in real populations - the same input signal can produce a wide range of responses (@fig-heterogeneity).
 
 #thesisfig(
   "heterogeneity",
@@ -197,23 +219,61 @@ population, the same does not hold when talking about an individual.
   "fig-heterogeneity",
 )
 
+Learning how cells process these signals internally can aid us in building better models of the tissues and their signalling. 
+An interesting avenue for research is taking a note from the cancer's book and asking: 'Can *we* design a small, controllable populations that will allow us to 
+influence the behavior of the big surrounding tissue?' 
+
+If the goal is not understanding but prediction in itself, we can utilise black-box approaches
+to learning the dynamics of the pathway. Deep neural networks with enough capacity can 
+approximate any continuous function to any desired accuracy. Advances such as LSTM @lstm 
+provide ways of learning sequential data, such as proxy metrics for abundance of kinases in a pathway.
+
+A work by @Klumpe2023 showed that deep neural networks were able to infer the underlying dynamics of a cell response
+even in the presence of measurement noise and stochasticity in the biochemical reactions.
+
+
+Approaches such as optogenetics can be used to control cellular processes. 
+It is a perfect tool for fine-grain control over dynamics, since it has milisecond precision, fine subcellular resolution and is not invasive.
+
+
+
+Control of dynamical systems that utilises a predictive model of the system itself rather than relying on a simple calibrated response (PID) is called 
+Model Predictive Control (MPC). In this approach, several candidate stimulation strategies are produced. The predictive model generates forecasts of future state
+of the system under proposed stimulation, and the state closest to the desired one is chosen. 
+
+In biological setting, model classes such as mechanistic ODE are good candidates for such endeavor. 
+However, machine learning keeps rapidly advancing and allows for learning complex systems from just observational
+data rather than mechanistic models, we can utilise this approach in the MPC loop.  
+
+``` klumpe
+In this type of controller, several candidate optogenetic stimulation strategies are considered and a model,
+often based on ordinary differential equations, is used to predict how the cell will respond to each strategy. Based on these predictions,
+the stimulation strategy that is expected to bring the expression level closest to a desired objective is applied to the cell
+```
+
+== Why the population average is not enough
+
+
+
+// brief: the signalling events, fates, symmetry breaking, etc. are
+// individual-level events.
+
+
+
+
 #todo[this figure is a premise, not a result: it motivates why a per-cell model
 is needed at all. It returns to Results only if E2 runs, where the same
 statistic measured under closed-loop control becomes the comparison. Indicative
 and cross-plate: the closed-loop within-field spread in v21 is 1.02 against this
 1.73, i.e. roughly 40% narrower.]
 
-== Mechanistic models
+== Mechanistic models and their limits
 
 Using ODE or PDE models of a signalling cascade together with standard
 statistical machine-learning techniques, we can fit a model and use it to
 generate predictions about future states of a system.
 
-// brief: ODE model problems — expert knowledge, costly fitting, modelling
-// changes in how a cell responds, explicit need for multiple levels of
-// phenomena encoded, parameter non-identifiability.
-
-== A data-driven alternative
+== Learning to predict from data
 
 While the mechanistic approach can test our understanding of the theory behind a
 biological system, another approach is to use data-driven techniques to predict
@@ -696,7 +756,6 @@ A split into blocks instead of splitting by field of view was used. Within FOVs 
 and other half were pooled into a shared population, their features averaged and their control signal computed from the population average. By sharing the FOVs across
 blocks, we avoid per-FOV effects confounding our result. 
 
-#todo[After E2 is done, fill this one in] 
 // ═════════════════════════════════════════════════════════════════════════════
 //  RESULTS
 // ═════════════════════════════════════════════════════════════════════════════
@@ -708,10 +767,6 @@ blocks, we avoid per-FOV effects confounding our result.
 // - quantifying control drift (repeats, )
 
 = Results
-
-#todo[if E2 runs, open Results with the closed-loop against open-loop spread
-contrast on one plate. The open-loop baseline is @fig-heterogeneity: within-field
-p90#sym.minus#h(0.1em)p10 #sym.eq 1.73.]
 
 == Model evaluation, or is a cell's response predictable from its own past?
 
@@ -955,6 +1010,13 @@ All of the demand patterns started off in a high state, meaning above the cells'
 In such a case, there is a possible failure mode where the stimulation types cluster together with different demand curves.
 Since even though they all start at the high state, it's possible that some distinct simulation types favor one type of demand curve over the other.
 
+#thesisfig(
+  "freewindow-examples",
+  [],
+  "freewindow-examples",
+)
+
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  DISCUSSION
 // ═════════════════════════════════════════════════════════════════════════════
@@ -962,6 +1024,12 @@ Since even though they all start at the high state, it's possible that some dist
 = Discussion
 
 // Outline brief: the sensitivity-drift issue — possible interpretations.
+
+1. Prediction needs personal history
+2. Uncertainty is trustworthy
+3. Feedback does work (E2 ladder)
+
+
 
 #todo[write]
 
@@ -994,6 +1062,11 @@ the baseline starting CNR level varies to the point, where #todo[Difficulty with
   physics-informed network, or similar.
 - Use it to quantify the controllability of systems of this kind, and to ask
   whether the control drift itself can be influenced.
+
+```
+In order to lower the data requirements and to improve the prediction accuracy and thus the
+control performance, incoming sensor data are used to update the RNN online. 
+```
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  APPENDIX
