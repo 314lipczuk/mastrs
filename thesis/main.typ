@@ -683,8 +683,18 @@ and observing stimulation patterns within this window.
 
 == Comparing single-cell control, population-level control and open loop stimulation 
 
+Experiment 24 was designed to compare single cell level MPC with population
+level MPC against an open loop stimulation matched to experiment beforehand.
 
+#thesisfig(
+  "e2-design",
+  [Design of population vs single-cell MPC experiment.  ],
+  "e2-design",
+)
 
+A split into blocks instead of splitting by field of view was used. Within FOVs 0,3,4,7, half of the cells were stimulated with the standard single-cell pipeline, 
+and other half were pooled into a shared population, their features averaged and their control signal computed from the population average. By sharing the FOVs across
+blocks, we avoid per-FOV effects confounding our result. 
 
 #todo[After E2 is done, fill this one in] 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -743,6 +753,11 @@ Spatial features (local crowding, field density) are not used by the model.
   "fig-encoder",
 )
 
+We investigated how much does the identity of encoded history matter to a cell by matching 
+two cells from the same experiment by their CNR level, and then using encoder state of the first to 
+predict future of second. The results show that for 89% of cells the results of such swap 
+yield prediction errors larger than cell's own.   
+
 #thesisfig(
   "history-swap",
   [The past the encoder uses is cell-specific: replacing a cell's history with a
@@ -799,6 +814,7 @@ it is an offline analysis.]
 == Controling live experiments
 // ------------------------------------------------------------------------------------
 19 experiments were conducted in total. 
+After initial prototyping and troubleshooting the technical issues, 
 experiments (v10, v11, v16, v19, 21, v23, v24) were both technically sound and contained useful information.
 
 Data from live experiments has a caveat in that all single-cell tracks being evaluated must 
@@ -846,9 +862,10 @@ Generalization of accuracy and uncertainty from the offline evaluation into live
 Both transfer well on at the forecast horizon, but uncertainty shows degraded performance in mid-horizon range. 
 #thesisfig(
   "rig-calibration",
-  [Accuracy and uncertainty comparison of the data from 4 live experiments running under the same controller to the results of offline evaluation.],
+  [Accuracy and uncertainty comparison of the data from 4 live experiments running under the same controller to the results of offline evaluation. #todo[Should this fig not be just combined all live vs offline? ]],
   "rig-calibration",
 )
+
 The uncertainty quantification is the worst at the 8-15 timestep horizon, (68% nominal outcomes are matched with 61% 
 in live experiment at horizon of 15 frames, while offline evaluation returned 70),
 but returns to trustworthy levels (95% nominal coverage is matched by 93% in live model). 
@@ -862,102 +879,81 @@ flattening of the response to stimulation (@sensitivity-decline).
 
 #thesisfig(
   "sensitivity-decline",
-  [Experiments with a repeating objective componenet, mean CNR, goal (dotted), and 95% confidence interval for the first repeat and the last repeat of the pattern in the experiment. In all experiments except 70m arm v19, last cycle is consistently lower, while taking up more light. ],
+  [Experiments with a repeating objective component: mean CNR (solid), goal (dotted), and 95% confidence interval for the first repeat and the last repeat of the pattern in the experiment. In all experiments except 70m arm v19, last cycle is consistently lower, while taking up more light. ],
   "sensitivity-decline",
 )
 
-// This figure opens the section on purpose. It states what the instrument can
-// and cannot do BEFORE any tracking number is quoted, so the limits read as a
-// measured property of the preparation rather than as an excuse offered after
-// the fact. It is also the only place the between-run drift appears.
-#thesisfig(
-  "reachability",
-  [#todo[caption. (a) resting CNR in v21/v22/v23 with each run's demand marked —
-   the population moved 0.67 → 0.92 → 1.10 between runs. (b) every cell's
-   reachable range against the demand band: 35% start above the anchor, 8%
-   cannot reach it. (c) distance from the demand predicts tracking error
-   (#sym.rho #sym.eq +0.15) where the resting level alone does not
-   (#sym.rho #sym.eq −0.01). (d) one-step forecast error does not predict
-   tracking error, and is five times smaller — the model is not the bottleneck.]],
-  "fig-reachability",
-)
-
-//#thesisfig(
-//  "rig-calibration",
-//  [*Whether a model trained under whole-field illumination is calibrated for a
-//   rig that lights one nucleus at a time.* (a) The model is worse than assuming
-//   the cell stays put until it has seen a few frames of that cell, and better
-//   after; counts per bin are printed at the foot of each column. (b) The signed
-//   error, so its direction is visible: the model expects more than it gets, and
-//   most of that offset clears once the encoder has context. (c) What survives
-//   when a cold start cannot be the explanation, using only cells with 150 or
-//   more frames of history. In the dark the forecast is unbiased; the offset
-//   grows with the commanded dose, which is what a model trained under
-//   whole-field light and then served one nucleus at a time would do.
-//   (d) The control: the gap between the two history bands is open at every hour
-//   of the run, so the cold start is not the cells drifting over the session --
-//   fresh cells are picked up throughout and each pays the same entry cost.],
-//  "fig-rig-calibration",
-//)
-
-//#thesisfig(
-//  "tracking",
-//  [How well the demand was met, and by how much of the population — each cell
-//   judged against its own drift.],
-//  "fig-tracking",
-//)
-
-todo[describe the runs?]
+The experiments were designed in a way to maintain the same goals regardless of cells' starting position, resting state, and other characteristics.
+This was done to see if a heterogeneous population can be controlled in a manner that makes it behave homogeneously, if given personalised stimulation.
+However, it also introduces problems with reachability of the goal state by populations, especially as the distribution of
+resting states across different experiments varies wildly, and are not known before starting the experiment.
 
 #thesisfig(
-  "bandwidth",
-  [*How much of the demand arrives at each timescale.* (a) One cycle of each
-   arm, folded on phase, against that arm's own demand. (b) Two ways of scoring
-   the same thing: how much the population is modulated at all, and how much of
-   what the objective actually asks -- hold to hold -- arrives. The gap between
-   them is the cost of a hold too short for a cell with a roughly three-minute
-   time constant to settle into: the 20 min arm holds high for 4 min, the 70 min
-   arm for 29. (c) Phase of the response in degrees of the cycle rather than in
-   minutes, so the four arms are comparable. The medians sit within a few
-   degrees of locked at every period despite three to five minutes of dead time
-   in the loop -- the controller's 30-frame lookahead pays that back. The bars
-   are the interquartile range across cells. (d) The price of
-   tracking, early against late in each run: the error barely moves while the
-   dose required to hold it climbs.],
-  "fig-bandwidth",
+  "reach-and-tracking",
+  [Resting states of experiments compared to the tracking error within them. Experiments ordered by median tracking error. ],
+  "reach-and-tracking",
 )
 
-#todo[gap: closed loop against open loop. This is the section's central claim
-and no valid experiment exists for it yet. The feedback-ladder policy
-(policies/policy_8fov_feedback_ladder.toml) is written and unrun.]
-
-// Outline brief: experiment with unset parts of the objective — breakdown of
-// stimulation-pattern types under the SAME objective. Does the model find
-// separate stimulation strategies for one goal? How would we show it —
-// dimensionality reduction then clustering, ordered by L2 so the result is
-// steerable cells and not dead ones?
-
-#todo[Dose diversity analysis - How?]
+Experimental outcome was better in experiments that had the objective aligned to the cells' resting CNR.  
+The population's resting spread is wider than the light can move any one cell. 
 
 #thesisfig(
-  "response-modality",
-  [Whether there are two kinds of cell or one very broad kind.],
-  "fig-modality",
+  "how-cells-move",
+  [],
+  "how-cells-move",
 )
 
-== Control and sensitivity drift
+== Comparing levels of control
+// v24 experiment
 
-// Outline brief: average L2 / residuals over the course of an experiment,
-// against elapsed time, against the integral of fluence, and as the increase in
-// fluence needed per cycle over 12 h.
+Experiment v24 aimed to compare population-level feedback control against a single-cell one and an open-loop control.
+The pattern which the cells were supposed to reach has been planned based on the resting state
+of the previous experiment (v23), which had their baseline and spread unusually high. Because of this demand,
+experiment 24 was set above what the cells were actually able to achieve. 
 
-#todo[decline in sensitivity fig]
+Because of this, the open-loop arm was pre-calculated for
+the experiment using the wrong starting points for the cells and therefore was deemed inadmissible into the results,
+as it would provide unfair advantage to adaptive closed-loop solutions.
 
+#thesisfig(
+  "e2-arms",
+  [],
+  "e2-arms",
+)
 
-#todo[fig-decline puts the clock and cumulative light near-tied
-(#todo[4.2] vs #todo[4.3]), not clock-dominant. The text must say that, and
-separating them would need a duty-cycle arm — same total light, different
-elapsed time.]
+Ultimately, the choice of a high baseline, as well as pre-computing the entire trajectory without looking at cells during the run, 
+resulted in the objective being unreachable in practice for the light controls available to the system.
+The median distribution of trajectories for a single-cell system - even though it cannot reach the demand in aptitude shape,
+the CNR curve tries to match that of the objective.
+
+Single cell control ends up with slightly smaller residual errors; however, due to a small volume of data and overall poor
+design of the experiment as a whole, this result needs further validation.
+
+== Are there multiple distinct strategies of stimulation that controller undertakes?
+
+Visualising the activations in free windows across different shows a continuum of strategies that the controller picks for single cells. 
+
+#thesisfig(
+  "freewindow-heatmap-by-demand",
+  [Heatmap of activations in every pre-demand window, binned by the length of unscored time during which the controller could come up with pre-stimulations.],
+  "freewindow-heatmap-by-demand",
+)
+
+We observe that controller realises at least two distinct strategies across all of the groups. First strategy involves little if any stimulation until about 
+7 minutes until the demand, after which they show strong stimulation. On @freewindow-heatmap-by-demand these trajectories cluster at the top of each window. 
+Conversely, clustering at the bottom we can see the opposite stimulation strategies - medium stimulation right up until the 7 minute mark, and then complete
+lack of stimulation. 
+
+The arms with a longer unscored windows exhibit more instances of using high light intensity, perhaps due to the fact that are not scored negatively
+for an overshoot before demand, enabling strategy of 'dropping' into the desired state from a strong activation. 
+
+An interesting result to tackle is that even in the control group (free window of size 0), there is diversity of stimulation types. This suggests that the model
+will in fact trade off short term reward of following the current demand exactly for ability to meet later, harder demand. 
+Nevertheless, with bigger unscored window comes higher diversity of strategies.
+
+All of the demand patterns started off in a high state, meaning above the cells' resting state.
+In such a case, there is a possible failure mode where the stimulation types cluster together with different demand curves.
+Since even though they all start at the high state, it's possible that some distinct simulation types favor one type of demand curve over the other.
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  DISCUSSION
@@ -1043,6 +1039,13 @@ belonging in the appendix rather than in the methods]
   "arm-tracks",
   [#todo[Describe the tracks] ],
   "experiment tracks",
+)
+
+
+#thesisfig(
+  "reachability-runs",
+  [#todo[Describe the tracks] ],
+  "reachability-runs",
 )
 
 #todo[park supplementary panels here as they are cut from the main text]
