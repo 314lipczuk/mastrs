@@ -160,51 +160,33 @@ can greatly influence the overall success.
 
 = Introduction
 
-//   - why we care about ERK dynamics; cell fate; knowing the components but not
-//     how they are connected
-//   - single-cell heterogeneity — the locality argument: why predicting average
-//     behaviour is not enough to understand the system
-//   - ODE models: expert construction, hard to scale, good at averages, costly
-//     to fit per cell, parameter non-identifiability, no good way to model
-//     CHANGES in how a cell responds — which we would rather learn from data
-//   - closed-loop control as a way of interacting with the system more
-//     meaningfully (Khammash; FARO)
-//   - what a closed loop needs: a predictor, a controller mapping prediction to
-//     action, and a per-cell objective
-
 == ERK dynamics and cell fate
 
-MAPK/ERK pathway plays key role in cellular proliferation signalling, utilising dynamics rather 
-than stable states to control cell fate decisions. Ryu2015
-Stimulation byA sustained pulse leads to differentiation while a 
-transient pulse to proliferation. 
+The MAPK/ERK pathway plays a key role in cellular proliferation signalling, utilising dynamics rather 
+than stable states to control cell fate decisions @Ryu2015.
+Stimulation by a sustained pulse leads to differentiation while a 
+transient pulse to proliferation.
+In PC12 cells, a sustained pulse of pathway activation drives differentiation while a
+transient pulse drives proliferation @Marshall1995; modulating the frequency of
+activation alone can rewire fate decisions @Ryu2015.
 
-cells parttake in a complex spatiotemporal population-level phenomena such as ERK-waves, that affect processes such as wound healing, apoptosis resistance. 
-Cancer cells have been shown to impact these high-level communications, interfering with the surrounding healthy tissue. (talk about small population influencing dynamics of whole tissue)
+Cells partake in a complex spatiotemporal population-level phenomena such as ERK-waves, that affect processes such as wound healing, apoptosis resistance. 
+Cancer cells have been shown to impact these high-level communications, interfering with the surrounding healthy tissue @Aoki2017. 
+#todo[citations: wound healing, cancer interference — ask MD which papers to name.]
 
-Predicting how a given stimulation of the pathway, be it via a growth factor 
-or an optogenetic stimulation of an upstream receptor affects the downstream ERK dynamics
-has been dominated by mechanistic approaches that encode a model of the biochemical
-cascade with each participant quantified, and utilise ODE fitting approaches to adjust
-model parameters to a real measurements. 
-This approach, while principled, can suffer from a number of issues. Data for the 
-fitting of such model often only consists of an insufficient number of  state variables of the system in question.
+//  Bridge note: talk about small population influencing dynamics of whole tissue — the bridge lives in the cancer's-book paragraph of the closed-loop section
+
+== Why the population average is not enough
 
 A standard problem in studying a biological system is that while a given
 quantity might be easily modelled at the level of a summary statistic of a
 population, the same does not hold when talking about an individual.
 
-The model itself often suffers from parameter nonidentifiability, ... #todo[problems w/ mech] , requires expert knowledge for model creation
+// brief: the signalling events, fates, symmetry breaking, etc. are
+// individual-level events.
 
-and requires our system bo be encapsulable within the level of abstraction we're operating on (example: it's hard to include morphology or mechanical stimulation information in a biochemical ODE model of a pathway)
-// brief: ODE model problems — expert knowledge, costly fitting, modelling
-// changes in how a cell responds, explicit need for multiple levels of
-// phenomena encoded, parameter non-identifiability.
-
-The final state is a mechanistically interpretable model that integrates our understanding 
-of the biology while giving us ability to produce predictions. Scope is limited to the data we trained the model on.
-
-However, wide distributions of protein abundance contribute to a noisy signaling state in real populations - the same input signal can produce a wide range of responses (@fig-heterogeneity).
+However, wide distributions of protein abundance @Spencer2009 contribute to a noisy signaling state in real populations --- the same input signal can produce a wide range of responses
+(@fig-heterogeneity).
 
 #thesisfig(
   "heterogeneity",
@@ -219,9 +201,41 @@ However, wide distributions of protein abundance contribute to a noisy signaling
   "fig-heterogeneity",
 )
 
-Learning how cells process these signals internally can aid us in building better models of the tissues and their signalling. 
-An interesting avenue for research is taking a note from the cancer's book and asking: 'Can *we* design a small, controllable populations that will allow us to 
-influence the behavior of the big surrounding tissue?' 
+== Mechanistic models and their limits
+
+// (superseded stub, kept for reference: Using ODE or PDE models of a signalling
+// cascade together with standard statistical machine-learning techniques, we
+// can fit a model and use it to generate predictions about future states of a
+// system.)
+
+Predicting how a given stimulation of the pathway, be it via a growth factor 
+or an optogenetic stimulation of an upstream receptor affects the downstream ERK dynamics
+has been dominated by mechanistic approaches that encode a model of the biochemical
+cascade with each participant quantified, and utilise ODE fitting approaches to adjust
+model parameters to a real measurements. 
+This approach, while principled, can suffer from a number of issues. Data for the 
+fitting of such model often only consists of an insufficient number of state variables of the system in question.
+
+The model itself often suffers from parameter nonidentifiability @Gutenkunst2007: 
+many parameter sets fit the data well, so the fitted values carry little meaning. 
+Its construction requires expert knowledge, and it demands that
+the system be encapsulable within the chosen level of abstraction — morphology or
+mechanical stimulation, for example, have no natural place in a biochemical ODE model
+of a pathway.
+
+Crucially, the fitted mechanistic model is a static description: it cannot natively represent a change
+in how a cell responds over time without being refit. Responses to change --- like the sensitivity drift measured
+in this work --- are such a case. 
+
+The final state is a mechanistically interpretable model that integrates our understanding 
+of the biology while giving us ability to produce predictions. Scope is limited to the data we fitted the model on.
+
+== Learning to predict from data
+
+// (superseded stub, kept for reference: While the mechanistic approach can test
+// our understanding of the theory behind a biological system, another approach
+// is to use data-driven techniques to predict the system's behaviour, and to
+// learn to control it.)
 
 If the goal is not understanding but prediction in itself, we can utilise black-box approaches
 to learning the dynamics of the pathway. Deep neural networks with enough capacity can 
@@ -231,54 +245,6 @@ provide ways of learning sequential data, such as proxy metrics for abundance of
 A work by @Klumpe2023 showed that deep neural networks were able to infer the underlying dynamics of a cell response
 even in the presence of measurement noise and stochasticity in the biochemical reactions.
 
-
-Approaches such as optogenetics can be used to control cellular processes. 
-It is a perfect tool for fine-grain control over dynamics, since it has milisecond precision, fine subcellular resolution and is not invasive.
-
-
-
-Control of dynamical systems that utilises a predictive model of the system itself rather than relying on a simple calibrated response (PID) is called 
-Model Predictive Control (MPC). In this approach, several candidate stimulation strategies are produced. The predictive model generates forecasts of future state
-of the system under proposed stimulation, and the state closest to the desired one is chosen. 
-
-In biological setting, model classes such as mechanistic ODE are good candidates for such endeavor. 
-However, machine learning keeps rapidly advancing and allows for learning complex systems from just observational
-data rather than mechanistic models, we can utilise this approach in the MPC loop.  
-
-``` klumpe
-In this type of controller, several candidate optogenetic stimulation strategies are considered and a model,
-often based on ordinary differential equations, is used to predict how the cell will respond to each strategy. Based on these predictions,
-the stimulation strategy that is expected to bring the expression level closest to a desired objective is applied to the cell
-```
-
-== Why the population average is not enough
-
-
-
-// brief: the signalling events, fates, symmetry breaking, etc. are
-// individual-level events.
-
-
-
-
-#todo[this figure is a premise, not a result: it motivates why a per-cell model
-is needed at all. It returns to Results only if E2 runs, where the same
-statistic measured under closed-loop control becomes the comparison. Indicative
-and cross-plate: the closed-loop within-field spread in v21 is 1.02 against this
-1.73, i.e. roughly 40% narrower.]
-
-== Mechanistic models and their limits
-
-Using ODE or PDE models of a signalling cascade together with standard
-statistical machine-learning techniques, we can fit a model and use it to
-generate predictions about future states of a system.
-
-== Learning to predict from data
-
-While the mechanistic approach can test our understanding of the theory behind a
-biological system, another approach is to use data-driven techniques to predict
-the system's behaviour, and to learn to control it.
-
 // brief: not explaining mechanisms, but uncovering more complex behaviour and
 // learning through interactions.
 
@@ -286,18 +252,33 @@ the system's behaviour, and to learn to control it.
 
 #todo[closed-loop control literature — Khammash, FARO, the preceding grant]
 
-== What a model-predictive loop requires
+Approaches such as optogenetics can be used to control cellular processes. 
+Optogenetics is well suited to fine-grained control over dynamics. 
+Light can be delivered with millisecond precision, targeted at subcellular resolution, and acts reversibly.
 
-A closed loop of this kind needs three things: a predictor, a controller that
-turns a prediction into an action, and an objective function defined at the
-level of the single cell.
+Learning how cells process these signals internally can aid us in building better models of the tissues and their signalling. 
+An interesting avenue for research is taking a note from the cancer's book and asking: 'Can *we* design a small, controllable populations that will allow us to 
+influence the behavior of the big surrounding tissue?'
+This thesis takes a step in the direction of this ambition, by reliably controlling individual cells in real time.
 
+Control of dynamical systems that utilises a predictive model of the system itself rather than relying on a simple calibrated response (PID) is called 
+Model Predictive Control (MPC) @DDSE. In this approach, several candidate stimulation strategies are produced. The predictive model generates forecasts of future state
+of the system under proposed stimulation, and the state closest to the desired one is chosen.
+
+In biological setting, model classes such as mechanistic ODE are good candidates for such an endeavour. 
+However, machine learning keeps rapidly advancing and allows for learning complex systems from just observational
+data rather than mechanistic models, we can utilise this approach in the MPC loop.  
+
+Deep MPC has been demonstrated for gene expression @Lugagne2024 steered expression levels in thousands of single cells under blue light, planning with neural predictor.
+However, gene expression is a slow readout --- it unfolds over hours on a transcriptional timescale.
+My thesis asks if the same recipe can extend to a signalling cascade operating on a minute scale: 
+can the prediction pipeline work in real time, track faster dynamics, plan on calibrated uncertainty, and handle constraints 
+of only being able to push the system to a higher state, and having to rely on its own mechanisms to go back down. 
+
+== Contributions:
+#todo[write those after final analysis]
 
 = Materials and methods
-
-// Prose below is ported verbatim from "Master thesis.md" (Obsidian). Where that
-// document carries an outline bullet rather than text, the bullet is kept as a
-// comment so the brief travels with the section.
 
 == OptoEGFR cell line and culture
 
@@ -449,9 +430,6 @@ the component datasets by the experiment:
   order to induce oscillation;
 - a bulk experiment for parametrising input space, consisting of a sweep of parameter
   space, generating 96 distinct patterns of stimulation;
-- a single, long experiment (about 20× the length of all others).
-  #todo[no experiment in the corpus matches this — the longest is 210 frames. Either it
-  was dropped, or this is conflating the training corpus with the serving runs]
 
 #thesisfig(
   "dataset-overview",
