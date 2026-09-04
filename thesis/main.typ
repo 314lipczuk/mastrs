@@ -143,7 +143,7 @@
 In this work, I aim to create a practical method of controlling ERK signalling dynamics 
 on a single-cell level in a live experiment using optogenetic stimulation. 
 Deep learning model is used for forecasting future ERK levels, 
-utilising MDN head for communicating uncertainty. Predicive model is then integrated into a 
+utilising Mixture Density Network (MDN) head for communicating uncertainty. Predicive model is then integrated into a 
 Model Predictive Control (MPC) controller, and used to steer experiments in real time. 
 
 The trained model is accurate and calibrated enough to drive closed-loop control experiments. 
@@ -152,7 +152,7 @@ can greatly influence the overall success.
 
 
 
-#todo[write the abstract last]
+#todo[abstract last]
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  INTRODUCTION
@@ -185,7 +185,7 @@ Cancer cells have been shown to impact these high-level communications, interfer
 
 == Why the population average is not enough
 
-A standard problem in studying a biological system is that a quantity easily modelled at
+A standard problem in studying  biological systems is that a quantity easily modelled at
 the level of a population statistic need not describe any individual in it. The
 difficulty is not that the average is imprecise; it is that the events of interest
 happen in single cells. A cell differentiates or it does not, commits to a cycle or
@@ -234,13 +234,13 @@ fitting of such model often only consists of an insufficient number of state var
 The model itself often suffers from parameter nonidentifiability @Gutenkunst2007: 
 many parameter sets fit the data well, so the fitted values carry little meaning. 
 Its construction requires expert knowledge, and it demands that
-the system be encapsulable within the chosen level of abstraction --- morphology or
+the system be encapsulable within the chosen level of abstraction: morphology or
 mechanical stimulation, for example, have no natural place in a biochemical ODE model
 of a pathway.
 
 Crucially, the fitted mechanistic model is a static description: it cannot natively represent a change
-in how a cell responds over time without being refit. Responses to change --- like the sensitivity drift measured
-in this work --- are such a case. 
+in how a cell responds over time without being refit. Responses to change, like the sensitivity drift measured
+in this work, are such a case. 
 
 What this approach delivers is a mechanistically interpretable model: one that encodes
 what is believed about the biology and can be interrogated as well as used to predict.
@@ -309,7 +309,7 @@ from observational data carries no such commitment, and that is the class used h
 
 Deep MPC has been demonstrated for gene expression: @Lugagne2024 steered expression levels
 in thousands of single cells under blue light, planning with a neural predictor.
-Gene expression, however, is a slow readout --- it unfolds over hours on a transcriptional
+Gene expression, however, is a slow readout: it unfolds over hours on a transcriptional
 timescale.
 
 == Contributions:
@@ -625,9 +625,25 @@ objective patterns.
 
 == Live experiments 
 
-Experiments on the live cells were designed to probe the biological system as well as test the MPC pipeline. 
+Experiments on the live cells were designed to probe the biological system as well as test the MPC pipeline.
 Standard length of the experiment lasted 12 hours,
-and consisted of 8-12 fields of view on the microscope. 
+and consisted of 8-12 fields of view on the microscope.
+
+Three levels of structure recur throughout, and the distinction between them matters for
+how the experiments are analysed. A *field of view* is one imaging position on the plate;
+a run carries eight to twelve of them, and each field keeps the same controller
+configuration for the whole experiment. A *block* is one repeat of the objective in time
+typically a run-up followed by a demand, and a run carries ten to twelve of them
+in sequence. Every field is imaged in every block, so fields and blocks are crossed
+rather than nested: the objective at a given minute is the same in all fields, and the
+controller configuration is the same in all blocks.
+
+This has a direct consequence for what counts as a replicate. A treatment applied to
+fields, such as the length of the unscored window, is replicated by fields, typically
+two of them. A treatment applied to blocks, such as which demand pattern is being asked
+for, is replicated by blocks, three of them per pattern. The individual cell is a
+replicate of neither: a cell lives in one field and survives many blocks, so its
+measurements are repeated observations rather than independent ones.
 
 === Search for useful controller mechanisms
 
@@ -673,7 +689,7 @@ and observing stimulation patterns within this window.
       table.header([*Design*], [*What it asks of the loop*], [*Live runs*]),
 
       table.cell(colspan: 3, fill: luma(94%))[
-        *Objectives* --- what the cells were asked to do],
+        *Objectives*: what the cells were asked to do],
 
       [Constant hold],
       [Bring every cell to one fixed CNR and keep it there. The simplest demand,
@@ -704,7 +720,7 @@ and observing stimulation patterns within this window.
       [v22, v23, v24],
 
       table.cell(colspan: 3, fill: luma(94%))[
-        *Controllers and scoring* --- how the light was chosen],
+        *Controllers and scoring*: how the light was chosen],
 
       [Per-cell MPC],
       [The default: each cell's dose chosen from its own predicted trajectory
@@ -729,7 +745,7 @@ and observing stimulation patterns within this window.
       [v21, v22, v23],
 
       [Population MPC],
-      [One dose shared across a group of cells rather than chosen per cell ---
+      [One dose shared across a group of cells rather than chosen per cell:
        the comparison that isolates what per-cell control buys.],
       [v24],
     )
@@ -912,7 +928,7 @@ Generalization of accuracy and uncertainty from the offline evaluation into live
 Both transfer well on at the forecast horizon, but uncertainty shows degraded performance in mid-horizon range. 
 #thesisfig(
   "rig-calibration",
-  [Accuracy and uncertainty comparison of the data from 4 live experiments running under the same controller to the results of offline evaluation. #todo[Should this fig not be just combined all live vs offline? ]],
+  [Accuracy and uncertainty comparison of the data from 4 live experiments running under the same controller to the results of offline evaluation.],
   "rig-calibration",
 )
 
@@ -954,16 +970,16 @@ The population's resting spread is wider than the light can move any one cell.
 )
 
 == Comparing levels of control
+// ------------------------------------
+
+
 // v24 experiment
-
 Experiment v24 aimed to compare population-level feedback control against a single-cell one and an open-loop control.
-The pattern which the cells were supposed to reach has been planned based on the resting state
-of the previous experiment (v23), which had their baseline and spread unusually high. Because of this demand,
-experiment 24 was set above what the cells were actually able to achieve. 
-
-Because of this, the open-loop arm was pre-calculated for
-the experiment using the wrong starting points for the cells and therefore was deemed inadmissible into the results,
-as it would provide unfair advantage to adaptive closed-loop solutions.
+The pattern which the cells were supposed to reach has been planned based on the resting state and reach
+of the previous experiment (v23), which had these features spread unusually high. Because of this demand,
+experiment 24's goal was set above what the cells were actually able to achieve in 8 out of 9 blocks (@e2-arms).
+Mismatch of baseline in the design meant that the open-loop constant arm that was meant to deliver average pulse light from one of the previous experiment in order
+to reach the same level, failed to do so. It ends up delivering 60ms constant stimulation at every frame, while closed loop controllers deliver on average 112.5 ms / frame.  
 
 #thesisfig(
   "e2-arms",
@@ -971,13 +987,51 @@ as it would provide unfair advantage to adaptive closed-loop solutions.
   "e2-arms",
 )
 
-Ultimately, the choice of a high baseline, as well as pre-computing the entire trajectory without looking at cells during the run, 
-resulted in the objective being unreachable in practice for the light controls available to the system.
-The median distribution of trajectories for a single-cell system - even though it cannot reach the demand in aptitude shape,
-the CNR curve tries to match that of the objective.
+Despite all the problems, one block was reachable (initial hold pattern on demand level L). From it we can try to extract preliminary conclusions, which need further confirmation with a 
+proper experiment. 
 
-Single cell control ends up with slightly smaller residual errors; however, due to a small volume of data and overall poor
-design of the experiment as a whole, this result needs further validation.
+The clearest is block 01 itself. Over that hour the closed-loop arm held a per-cell
+tracking error of 0.161 CNR, against 0.169 for constant illumination and 0.239 for
+darkness, and it did so on less light than the constant arm spent. Neither of the
+failures above applies here: the demand was achievable, and the loop chose to spend
+under 60 ms per frame for most of the block. What the population median does over the
+same hour is worth noting separately. The constant arm's median sits marginally closer
+to the demand than the closed loop's, 0.024 below it against 0.034, while its individual
+cells sit further away. The average is closer and the cells are worse, which is the
+argument for per-cell objectives made in the introduction, appearing inside a single
+block of a single run.
+
+
+#thesisfig(
+  "feedback-ladder-alt2",
+  [],
+  "feedback-ladder",
+)
+
+The second comparison is between the two halves of the closed-loop arm, and it is the
+only place in this work where individuation is isolated. Cells sharing a field were split
+by a fixed rule, half planned individually and half receiving one dose computed for the
+field as a whole, so the comparison is paired inside the dish and every field-level
+difference cancels within the pair. Per-cell dosing gave a median tracking error of 0.295
+against 0.325 for the broadcast dose, on 113 against 123 ms of light per frame: closer,
+and on less light. Three of the four fields favour per-cell dosing and one does not,
+which at four fields is a direction rather than a result, with a sign test giving
+p = 0.375.
+
+The third comparison is the full ladder across all eight fields. It is the strongest
+result statistically and the weakest in interpretation. Field median tracking error
+orders monotonically with how much feedback the arm had: 0.284, 0.288, 0.309 and 0.349
+for the closed-loop fields, 0.375 and 0.399 for constant illumination, 0.470 and 0.486
+for darkness. Eight fields in groups of four, two and two admit 420 distinct
+relabellings, and the observed ordering carries an exact permutation p of 0.0048, with
+Spearman rho of +0.93. The caveat is the one already given: across the whole run the
+closed-loop fields spent 116 to 124 ms per frame against the constant arm's 60. Part of
+this ordering is the light rather than the feedback, and this run cannot separate them.
+
+Taken together, v24 supports two claims. A closed loop holds a reachable level better
+than constant illumination and better than nothing. Dosing cells individually is at least
+no worse than dosing them together, while using less light to do it. It supports no claim
+about following a waveform pattern, and none about performance at a matched dose.
 
 == Are there multiple distinct strategies of stimulation that controller undertakes?
 
@@ -989,10 +1043,26 @@ Visualising the activations in free windows across the different arms shows a co
   "freewindow-heatmap-by-demand",
 )
 
-We observe that controller realises at least two distinct strategies across all of the groups. First strategy involves little if any stimulation until about 
-7 minutes until the demand, after which they show strong stimulation. On @freewindow-heatmap-by-demand these trajectories cluster at the top of each window. 
-Conversely, clustering at the bottom we can see the opposite stimulation strategies - medium stimulation right up until the 7 minute mark, and then complete
-lack of stimulation. 
+The ordering runs between two extremes rather than between two kinds. At one end there is
+little if any stimulation until roughly seven minutes before the demand, followed by
+strong stimulation; these rows sit at the top of each arm in
+@freewindow-heatmap-by-demand. At the other there is medium stimulation up to that same
+seven-minute mark and then nothing at all. Every intermediate between them is occupied,
+and no edge separates one from the other.
+
+The extremes are also rare. Along this axis the density has a single peak near the middle
+in every arm, with several times as many windows near the centre as in either tail. What
+the unscored window changes is the width of that distribution rather than its shape: the
+interquartile spread of the shape score doubles, from 0.079 in the arm scored throughout
+to 0.159 in the arm given twenty free minutes, while remaining single-peaked in all four.
+The two arms whose windows fall inside the loop's dead time, zero and four free minutes,
+are almost indistinguishable at 0.079 and 0.085, and the widening begins only once that
+dead time is cleared. More unscored time buys more variety, not more kinds.
+
+The seven-minute mark is shared by both extremes rather than distinguishing them. It is
+the lead time the actuator needs: driving flat out from the anchor, the cells take about
+seven minutes to reach the demand, so light spent earlier than that has decayed before it
+is scored and light spent later arrives too late.
 
 The arms with a longer unscored windows exhibit more instances of using high light intensity, perhaps due to the fact that are not scored negatively
 for an overshoot before demand, enabling strategy of 'dropping' into the desired state from a strong activation. 
@@ -1001,9 +1071,29 @@ An interesting result to tackle is that even in the control group (free window o
 will in fact trade off short term reward of following the current demand exactly for ability to meet later, harder demand. 
 Nevertheless, with bigger unscored window comes higher diversity of strategies.
 
-All of the demand patterns started off in a high state, meaning above the cells' resting state.
-In such a case, there is a possible failure mode where the stimulation types cluster together with different demand curves.
-Since even though they all start at the high state, it's possible that some distinct stimulation types favour one type of demand curve over the other.
+All of the demand patterns open above the cells' resting state, but they differ in what
+they ask for afterwards. That leaves a possible confound: the stimulation the controller
+chooses in the free window might depend on which demand is coming, so that what looks
+like a spread of strategies is really a spread of objectives.
+
+Testing this means comparing what the controller did before one demand against what it
+did before another. Each window is summarised by its position on the first shape
+component, in effect how early in the window the light was spent. Because the demand
+pattern belongs to the block and not to the cell, the windows within a block are averaged
+first, leaving one number per block and three numbers per demand pattern.
+
+Two spreads can then be computed from those numbers, and the comparison between them is
+the test. The first, *do the demands differ?*, measures how far apart the four pattern
+averages are. The second, *do blocks of the same demand differ?*, measures how far
+apart the three blocks of one pattern are from each other. If the first is no larger than the
+second, then the differences between demands are within the range that repeats of a
+single demand already produce, and nothing can be attributed to the objective.
+
+That is what is found. In v23 the four pattern averages span 0.047 on a scale where a
+single window's standard deviation is 0.077, while the three blocks of one pattern span
+as much as 0.040 between them ($F(3,8) = 1.87$, $p = 0.21$); v21 agrees, with the spread
+between patterns smaller than the spread within them. What the controller does in the
+free window does not depend on the objective ahead.
 
 #thesisfig(
   "freewindow-examples",
