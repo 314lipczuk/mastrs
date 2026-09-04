@@ -160,33 +160,48 @@ can greatly influence the overall success.
 
 = Introduction
 
+This thesis closes a control loop around individual cells. The loop has three parts: a
+learned model that predicts how a single cell's ERK activity will respond to light, a
+controller that plans stimulation against those predictions, and an objective defined for
+each cell rather than the population. A loop of this kind, with a learned predictor in
+it, has been demonstrated for gene expression @Lugagne2024, which unfolds
+over hours. A signalling cascade moves in minutes, and this fact changes what the loop must
+do. It has to predict in real time, carry uncertainty it can plan against, and steer
+through an actuator that only pushes activity up.
+
 == ERK dynamics and cell fate
 
 The MAPK/ERK pathway plays a key role in cellular proliferation signalling, utilising dynamics rather 
 than stable states to control cell fate decisions @Ryu2015.
-Stimulation by a sustained pulse leads to differentiation while a 
-transient pulse to proliferation.
 In PC12 cells, a sustained pulse of pathway activation drives differentiation while a
 transient pulse drives proliferation @Marshall1995; modulating the frequency of
 activation alone can rewire fate decisions @Ryu2015.
 
-Cells partake in a complex spatiotemporal population-level phenomena such as ERK-waves, that affect processes such as wound healing, apoptosis resistance. 
-Cancer cells have been shown to impact these high-level communications, interfering with the surrounding healthy tissue @Aoki2017. 
+Cells partake in complex spatiotemporal population-level phenomena such as ERK-waves @Aoki2017, that affect processes such as wound healing, apoptosis resistance. 
+Cancer cells have been shown to impact these high-level communications, interfering with the surrounding healthy tissue. 
 #todo[citations: wound healing, cancer interference — ask MD which papers to name.]
 
 //  Bridge note: talk about small population influencing dynamics of whole tissue — the bridge lives in the cancer's-book paragraph of the closed-loop section
 
 == Why the population average is not enough
 
-A standard problem in studying a biological system is that while a given
-quantity might be easily modelled at the level of a summary statistic of a
-population, the same does not hold when talking about an individual.
+A standard problem in studying a biological system is that a quantity easily modelled at
+the level of a population statistic need not describe any individual in it. The
+difficulty is not that the average is imprecise; it is that the events of interest
+happen in single cells. A cell differentiates or it does not, commits to a cycle or
+does not, dies or survives. An average over such events describes a state that no cell
+need ever occupy.
 
-// brief: the signalling events, fates, symmetry breaking, etc. are
-// individual-level events.
-
-However, wide distributions of protein abundance @Spencer2009 contribute to a noisy signaling state in real populations --- the same input signal can produce a wide range of responses
+For ERK this matters because the responses really are spread. Genetically identical
+cells differ in protein abundance in ways that precede any stimulus @Spencer2009. That
+shows up directly in this preparation: cells receiving an identical pulse train respond
+over a wide and continuous range, with a substantial minority barely moving at all
 (@fig-heterogeneity).
+
+The consequence for control is direct. A loop that steers a population average can drive
+that average onto a target while leaving the individual cells further from it than
+before, and it has no way to tell the two outcomes apart. Deciding between them requires
+an objective written for each cell, and light delivered to each cell separately.
 
 #thesisfig(
   "heterogeneity",
@@ -212,14 +227,14 @@ Predicting how a given stimulation of the pathway, be it via a growth factor
 or an optogenetic stimulation of an upstream receptor affects the downstream ERK dynamics
 has been dominated by mechanistic approaches that encode a model of the biochemical
 cascade with each participant quantified, and utilise ODE fitting approaches to adjust
-model parameters to a real measurements. 
+model parameters to real measurements. 
 This approach, while principled, can suffer from a number of issues. Data for the 
 fitting of such model often only consists of an insufficient number of state variables of the system in question.
 
 The model itself often suffers from parameter nonidentifiability @Gutenkunst2007: 
 many parameter sets fit the data well, so the fitted values carry little meaning. 
 Its construction requires expert knowledge, and it demands that
-the system be encapsulable within the chosen level of abstraction — morphology or
+the system be encapsulable within the chosen level of abstraction --- morphology or
 mechanical stimulation, for example, have no natural place in a biochemical ODE model
 of a pathway.
 
@@ -227,8 +242,10 @@ Crucially, the fitted mechanistic model is a static description: it cannot nativ
 in how a cell responds over time without being refit. Responses to change --- like the sensitivity drift measured
 in this work --- are such a case. 
 
-The final state is a mechanistically interpretable model that integrates our understanding 
-of the biology while giving us ability to produce predictions. Scope is limited to the data we fitted the model on.
+What this approach delivers is a mechanistically interpretable model: one that encodes
+what is believed about the biology and can be interrogated as well as used to predict.
+That advantage is bought at the cost of the limitations above, and of a reach that does
+not extend past the conditions the model was fitted under.
 
 == Learning to predict from data
 
@@ -237,10 +254,17 @@ of the biology while giving us ability to produce predictions. Scope is limited 
 // is to use data-driven techniques to predict the system's behaviour, and to
 // learn to control it.)
 
-If the goal is not understanding but prediction in itself, we can utilise black-box approaches
-to learning the dynamics of the pathway. Deep neural networks with enough capacity can 
-approximate any continuous function to any desired accuracy. Advances such as LSTM @lstm 
-provide ways of learning sequential data, such as proxy metrics for abundance of kinases in a pathway.
+If the goal is not understanding but prediction in itself, we can turn to models learned
+directly from data. Neural networks are universal approximators @Hornik1989, but the
+useful property here is a weaker and more practical one: given enough examples, a
+sequence model can learn the input--output behaviour of a system without being told its
+mechanism. Recurrent architectures such as the LSTM @lstm are built for exactly this,
+carrying state forward so that a prediction can depend on a cell's whole measured
+history rather than its present value alone.
+
+The readout used throughout this work is such a sequence: the cytoplasm-to-nucleus ratio
+of a translocation reporter, which tracks ERK activity rather than the abundance of any
+kinase.
 
 A work by @Klumpe2023 showed that deep neural networks were able to infer the underlying dynamics of a cell response
 even in the presence of measurement noise and stochasticity in the biochemical reactions.
@@ -256,24 +280,37 @@ Approaches such as optogenetics can be used to control cellular processes.
 Optogenetics is well suited to fine-grained control over dynamics. 
 Light can be delivered with millisecond precision, targeted at subcellular resolution, and acts reversibly.
 
+One property of this actuator shapes everything that follows: light drives ERK activity
+up, and nothing drives it down. A cell descends only by its own decay, so a demand below
+where a cell already rests is not hard to reach but unreachable, and what each cell can
+be asked to do is fixed by where it happens to sit when the run begins.
+
 Learning how cells process these signals internally can aid us in building better models of the tissues and their signalling. 
 An interesting avenue for research is taking a note from the cancer's book and asking: 'Can *we* design a small, controllable populations that will allow us to 
 influence the behavior of the big surrounding tissue?'
 This thesis takes a step in the direction of this ambition, by reliably controlling individual cells in real time.
 
-Control of dynamical systems that utilises a predictive model of the system itself rather than relying on a simple calibrated response (PID) is called 
-Model Predictive Control (MPC) @DDSE. In this approach, several candidate stimulation strategies are produced. The predictive model generates forecasts of future state
-of the system under proposed stimulation, and the state closest to the desired one is chosen.
+Control that plans against a predictive model of the system, rather than reacting to
+error through a fixed calibrated response (PID), is called Model Predictive Control
+(MPC) @DDSE. At each step the controller searches over candidate input sequences,
+forecasts the system's response to each, and scores it against a cost that combines
+distance from the desired trajectory with the price of the input itself. The
+best-scoring sequence is found, but only its first step is applied: the horizon then
+slides forward and the plan is recomputed from the new measurement. Replanning at every
+step is what lets the loop absorb both a model that is imperfect and a system that
+changes underneath it.
 
-In biological setting, model classes such as mechanistic ODE are good candidates for such an endeavour. 
-However, machine learning keeps rapidly advancing and allows for learning complex systems from just observational
-data rather than mechanistic models, we can utilise this approach in the MPC loop.  
+Any MPC loop needs a model that can forecast the system under a proposed input, and a
+mechanistic ODE can serve that role. Control asks for prediction rather than
+identifiability, so parameters that are not uniquely determined are not by themselves
+disqualifying. What does disqualify is the last objection above: a fitted ODE cannot
+follow a cell whose response changes over the run without being refit. A model learned
+from observational data carries no such commitment, and that is the class used here.
 
-Deep MPC has been demonstrated for gene expression @Lugagne2024 steered expression levels in thousands of single cells under blue light, planning with neural predictor.
-However, gene expression is a slow readout --- it unfolds over hours on a transcriptional timescale.
-My thesis asks if the same recipe can extend to a signalling cascade operating on a minute scale: 
-can the prediction pipeline work in real time, track faster dynamics, plan on calibrated uncertainty, and handle constraints 
-of only being able to push the system to a higher state, and having to rely on its own mechanisms to go back down. 
+Deep MPC has been demonstrated for gene expression: @Lugagne2024 steered expression levels
+in thousands of single cells under blue light, planning with a neural predictor.
+Gene expression, however, is a slow readout --- it unfolds over hours on a transcriptional
+timescale.
 
 == Contributions:
 #todo[write those after final analysis]
@@ -290,17 +327,6 @@ high glucose (Sigma-Aldrich \#D5671), supplemented with 10% (v/v) fetal bovine s
 2% L-Glutamine (stable, 200 mM) and 1% penicillin/streptomycin at 37 °C and 5% CO#sub[2].
 Mycoplasma contamination was routinely assessed by PCR.
 
-#figure-placeholder(
-  [The biological system. Blue light drives optoEGFR; ERK activity is read out from the
-   ERK-KTR translocation reporter as the cytoplasm-to-nucleus ratio.],
-  "fig-wetware",
-  height: 5cm,
-)
-
-// Outline: lack of the external part of the natural receptor — what that gives us
-// (a synthetic system / poking device for the rest of the pathway); spatial effects
-// are less relevant here but the method extends to problems with a spatial component
-// (this may belong in the introduction — it is argumentative).
 
 == Live-cell microscopy
 
@@ -445,9 +471,6 @@ non-meaningful features.
 This final composition of all the experiment data resulted in a dataset of 72,441 cells
 and 6.63 M frames.
 
-#todo[summary table of every training experiment and every live run, with scalars and
-each run's fate. Raw material: `materials/serving_runs_summary.parquet`]
-
 == Model architecture
 
 A deep learning model was designed for the CNR prediction task, with the goal of being
@@ -547,10 +570,10 @@ the start of the experiment, a policy containing an objective function was loade
 
 The stimulation that the model is searching for is technically a continuous variable.
 However, due to the constraints of the hardware (both for stimulation and for search over
-possible values), the stimulation is collapsed into five discrete levels and treated as a
+possible values), the stimulation is collapsed into six discrete levels and treated as a
 categorical variable. For the microscope, this simplifies processing the stimulation
-masks, as collapsing to discrete levels means simply switching between five masks. For
-the search process it helps by narrowing the theoretical search space to $5^L$ cases.
+masks, as collapsing to discrete levels means simply switching between six masks. For
+the search process it helps by narrowing the theoretical search space to $6^L$ cases.
 
 The inference process starts with per-cell encoder embeddings that are persisted across
 time. At the beginning of the run they are zero-filled. At each new frame, the newly
@@ -629,10 +652,10 @@ Band kernel could be designed to be more lenient on undershooting cells.
 Early experiments (@fig-encoder) showed that model can encode single cell history into an embedding that is useful for predictions of its future state. #todo[weird sentence. feels discussion'y]
 
 We wanted to investigate if this encoding is ever used as a discriminating factor not just for the quantity of the response given, but also its shape.
-Orignal implementation for a controller receives an objective function, and scores the model's proposed solutions at every step, 
+Original implementation for a controller receives an objective function, and scores the model's proposed solutions at every step, 
 even before any interesting parts objective patterns start (for example, pre-experiment resting state). 
 This limits the diversity of stimulation patterns, as it only asks the question of 'how to best follow the objective curve at every step'. 
-The alternative approach would be to consider an approach where the solution's default frame is not coutered towards the score,
+The alternative approach would be to consider an approach where the solution's default frame is not counted towards the score,
 except when the frame is inside the objective interval.
 
 This way, as the frame approaches the 'scored' section, the controller can use its information about driven cell and pick a 
@@ -799,9 +822,6 @@ yield prediction errors larger than cell's own.
   "fig-history-swap",
 )
 
-#todo[gap: "feature relevance over time" (7c in the outline). No such figure
-exists yet.]
-
 // ------------------------------------------------------------------------------------
 === Calibrating uncertainty 
 // ------------------------------------------------------------------------------------
@@ -839,12 +859,9 @@ Across deciles the predicted standard deviation spans roughly a tenfold range an
   "fig-calibration",
 )
 
-#todo[gap: the comparison of the mixture-density head against ensembles and MC
-dropout is in the outline and has not been run. 
-it is an offline analysis.]
 
 // ------------------------------------------------------------------------------------
-== Controling live experiments
+== Controlling live experiments
 // ------------------------------------------------------------------------------------
 19 experiments were conducted in total. 
 After initial prototyping and troubleshooting the technical issues, 
@@ -864,13 +881,13 @@ This leaves a possibility of a survivorship bias.
 // of this section quotes is drawn from the four runs that clear both gates, and
 // this is where that choice is stated rather than assumed.
 
-Experiment v10 and v11 (@exp_v10_arm2) evaluated based MPC controller against two addioinal mechanisms: 
+Experiment v10 and v11 (@exp_v10_arm2) evaluated the base MPC controller against two additional mechanisms: 
 move penalty, and band kernel scoring across two different frequency
 settings. 
 This establishes a working experimental run and an early sign of success. Notably, the runs 
 did encounter some problems. Cadence slip is a failure mode where as the microscope 
 moves between fields of view, the full rotation through all fields takes longer than planned minute.
-Early experiments encountered such problems early, due to a misconfiguration of the opearting system.
+Early experiments encountered such problems early, due to a misconfiguration of the operating system.
 Experiments v10 and v11 worked at a cadence of 85s and 69s respectively instead of standard 60s. 
 However, as this circumstance affects all conditions equally, the conclusions from this experiment
 are not invalidated.
@@ -882,7 +899,7 @@ are not invalidated.
 )
 
 This experiment shows model's capability to push a population of cells into a desirable behavior. 
-The controller manages to keep desired frequency of the oscillations throught the experiment.
+The controller manages to keep desired frequency of the oscillations throughout the experiment.
 However, across cycles controller's ability to push cells into full amplitude diminishes.
 During the first cycle median CNR reached desired level, while in the last cycle median CNR reached only halfway the objective. 
 This prompted the design of more experiments that could help with quantifying the effect of diminishing responsivity to control. 
@@ -964,7 +981,7 @@ design of the experiment as a whole, this result needs further validation.
 
 == Are there multiple distinct strategies of stimulation that controller undertakes?
 
-Visualising the activations in free windows across different shows a continuum of strategies that the controller picks for single cells. 
+Visualising the activations in free windows across the different arms shows a continuum of strategies that the controller picks for single cells. 
 
 #thesisfig(
   "freewindow-heatmap-by-demand",
@@ -986,7 +1003,7 @@ Nevertheless, with bigger unscored window comes higher diversity of strategies.
 
 All of the demand patterns started off in a high state, meaning above the cells' resting state.
 In such a case, there is a possible failure mode where the stimulation types cluster together with different demand curves.
-Since even though they all start at the high state, it's possible that some distinct simulation types favor one type of demand curve over the other.
+Since even though they all start at the high state, it's possible that some distinct stimulation types favour one type of demand curve over the other.
 
 #thesisfig(
   "freewindow-examples",
@@ -1008,9 +1025,6 @@ Since even though they all start at the high state, it's possible that some dist
 3. Feedback does work (E2 ladder)
 
 
-
-#todo[write]
-
 == Interpreting the sensitivity drift
 
 #todo[the candidate readings: receptor internalisation and downregulation;
@@ -1018,7 +1032,7 @@ photobleaching or phototoxicity of the construct; medium exhaustion over a
 12 h starved run; adaptation in the pathway itself. fig-decline bears on
 which of these can be told apart with the data in hand, and which cannot.]
 
-== Impact of resting CNR states on ridgid objectives
+== Impact of resting CNR states on rigid objectives
 
 Objective during the current experiments was pre-set. During some experiments,
 the baseline starting CNR level varies to the point, where #todo[Difficulty with designing and conducting good experiments because of a varying pre-stimulation baseline CNR.]
@@ -1029,7 +1043,6 @@ the baseline starting CNR level varies to the point, where #todo[Difficulty with
 
 = Future work
 
-#todo[write]
 
 - Make time an explicit axis in the model, either in the conditioning or as a
   feature (`time_since_last_measurement`). This makes it possible to learn
