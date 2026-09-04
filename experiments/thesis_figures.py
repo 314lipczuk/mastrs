@@ -1363,15 +1363,15 @@ def _(
         _a0, fig_examples.add_subplot(_gs8b[1, 0], sharex=_a0), CELL_TYPICAL,
         spread_origins(_t["T"]),
         "a  A typical cell",
-        f"forecasts started at evenly spaced times\n"
+        f"forecasts started at evenly spaced frames\n"
         f"mean |error|  {_t['err']:.3f} CNR",
     )
     _a1 = fig_examples.add_subplot(_gs8b[0, 1])
     forecast_pair_panel(
         _a1, fig_examples.add_subplot(_gs8b[1, 1], sharex=_a1), CELL_FAILURE,
         worst_origins(CELL_FAILURE),
-        "b  A hard cell",
-        f"forecasts started at this cell's highest-error times\n"
+        "b  A failure mode",
+        f"forecasts started at this cell's highest-error frames\n"
         f"mean |error|  {_f['err']:.3f} CNR",
     )
     save_fig(fig_examples, "forecast-examples")
@@ -4069,6 +4069,14 @@ def _(
 
 
 @app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Feedback ladder
+    """)
+    return
+
+
+@app.cell(hide_code=True)
 def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, pl, plt, save_fig):
     # --- E2 / v24: is it the control, or is it the light? ------------------------
     # Every tracking number before this run came from an arm that had feedback, so
@@ -5598,8 +5606,8 @@ def _(MOV_D50, MOV_D90, MOV_DARK_ARM, mo, mov_cells, pl):
 
 
 @app.cell(hide_code=True)
-def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
-    # --- E2 / v24: what the run was, and what the light actually did -------------
+def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, pl, plt, save_fig):
+        # --- E2 / v24: what the run was, and what the light actually did -------------
     # `feedback-ladder` is the RESULT. This is the design and its audit, and it exists
     # because two things about this run cannot be read off the result and change how
     # it must be worded.
@@ -5704,49 +5712,59 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
     _axb.tick_params(axis="both", length=0)
 
 
-    # (c) the grammar of the demand: three levels crossed with three rates
-    # The nine blocks are a complete 3 x 3 factorial -- every level appears once at
-    # every rate -- and each panel below is that block's ACTUAL reference, drawn at
-    # its true CNR. Level is held constant across rates by construction, so a
-    # difference between rates cannot be "that rate asked for a higher level"; the
-    # number on each trace is where the block falls in the running order, which is
-    # counterbalanced so level and elapsed time do not move together.
+    # (c) the ladder, drawn as a ladder. The panel has to carry three things the
+    # reader cannot get from (a) or (b): that all four ran AT THE SAME TIME on one
+    # plate, that they are ORDERED (each can do one thing less than the rung above),
+    # and that the point of the ordering is that each adjacent PAIR isolates exactly
+    # one capability. Arrow = the order, brackets = the pairs, swatches = back to (b).
+    # Line widths are set by the panel: ~45 characters at 6.6 pt, ~30 at 7.4.
     _axc = fig_e2d.add_subplot(_ge2d[1, 1])
-    E2_RATE = ["H", "O30", "O15"]
-    E2_RATENAME = {"H": "hold", "O30": "sine, 30 min", "O15": "sine, 15 min"}
-    E2_LEVEL = {"L": 1.20, "M": 1.36, "H": 1.52}
-    _span = 70.0
+    _axc.set_axis_off()
+    _axc.set_xlim(0, 1)
+    _axc.set_ylim(0, 1)
+    E2_RUNGS_TXT = [
+        ("1a per-cell dose", "1a", "a dose chosen per cell"),
+        ("1b broadcast dose", "1b", "one dose for the field"),
+        ("open loop, 60 ms", "2", "the same dose, every frame"),
+        ("open loop, 0 ms", "3", "no light at all"),
+    ]
+    E2_QUESTIONS = ["does a dose per cell beat one dose?",
+                    "does reacting to the cells help?",
+                    "does the light do anything?"]
+    E2_RY = [0.60, 0.415, 0.23, 0.045]
 
-    _blocks = (_e2d.filter(pl.col("phase_label").str.starts_with("demand_"))
-                   .group_by("phase_label")
-                   .agg(pl.col("timestep").min().alias("t0"))
-                   .sort("t0"))
-    for _b in _blocks.iter_rows(named=True):
-        _lab = _b["phase_label"]
-        _order, _lvl, _rate = int(_lab.split("_")[1]), _lab.split("_")[2], _lab.split("_")[3]
-        _s = (_e2d.filter(pl.col("phase_label") == _lab)
-                  .group_by("timestep").agg(pl.col("r_t").first()).sort("timestep"))
-        _x = np.linspace(0, 60, _s.height) + E2_RATE.index(_rate) * _span
-        _axc.plot(_x, _s["r_t"].to_numpy(), color=INK, lw=1.2)
-        _axc.text(_x[0] - 2, E2_LEVEL[_lvl], str(_order), ha="right", va="center",
-                  fontsize=5.8, color=MUTED)
+    _axc.text(0.0, 1.00,
+              "All four ran at once, on one plate. Each\n"
+              "rung can do one thing less than the one\n"
+              "above, so each pair asks one question.",
+              color=INK, fontsize=6.6, va="top", linespacing=1.55)
 
-    for _lv, _nm in ((1.20, "L"), (1.36, "M"), (1.52, "H")):
-        _axc.axhline(_lv, color=GRID, lw=0.7, zorder=0)
-    _axc.set_yticks(list(E2_LEVEL.values()),
-                    [f"{_n}  {_v:.2f}" for _n, _v in E2_LEVEL.items()], fontsize=7)
-    _axc.set_xticks([_i * _span + 30 for _i in range(3)],
-                    [E2_RATENAME[_r] for _r in E2_RATE], fontsize=6.8)
-    _axc.tick_params(axis="both", length=0)
-    _axc.set_xlim(-10, 2 * _span + 66)
-    _axc.set_ylim(1.08, 1.64)
-    _axc.set_ylabel("demanded CNR", fontsize=8)
-    _axc.set_title("c  Nine blocks: levels × rates", loc="left",
-                   fontweight="bold", fontsize=9)
-    for _s2 in ("top", "right"):
-        _axc.spines[_s2].set_visible(False)
-    _axc.text(0.5, -0.30, "each block is 60 min · small numbers give the running order",
-              transform=_axc.transAxes, ha="center", fontsize=6, color=MUTED)
+    # the order, as an arrow down the left margin
+    _axc.annotate("", xy=(0.03, E2_RY[-1] - 0.03), xytext=(0.03, E2_RY[0] + 0.03),
+                  arrowprops=dict(arrowstyle="-|>", color=MUTED, lw=1.1,
+                                  shrinkA=0, shrinkB=0))
+    _axc.text(0.005, (E2_RY[0] + E2_RY[-1]) / 2, "can do less", rotation=90,
+              ha="center", va="center", fontsize=6.0, color=MUTED)
+
+    for _r, (_key, _arm, _txt) in enumerate(E2_RUNGS_TXT):
+        _y = E2_RY[_r]
+        _axc.add_patch(plt.Rectangle((0.070, _y - 0.026), 0.036, 0.052,
+                                     color=E2_ARMCOL[_key], clip_on=False))
+        _axc.text(0.125, _y, _arm, color=INK, fontsize=7.4, fontweight="bold",
+                  va="center")
+        _axc.text(0.205, _y, _txt, color=INK, fontsize=7.4, va="center")
+        if _r < len(E2_QUESTIONS):
+            _ym = (_y + E2_RY[_r + 1]) / 2
+            # a bracket spanning the two rungs it compares
+            _axc.plot([0.165, 0.145, 0.145, 0.165],
+                      [_y - 0.050, _y - 0.050, E2_RY[_r + 1] + 0.050,
+                       E2_RY[_r + 1] + 0.050],
+                      color=MUTED, lw=0.8, clip_on=False)
+            _axc.text(0.185, _ym, E2_QUESTIONS[_r], color=MUTED, fontsize=6.4,
+                      style="italic", va="center")
+
+    _axc.set_title("c  The comparison ladder", loc="left", fontweight="bold",
+                   fontsize=9)
 
     _e2_key = [plt.Line2D([], [], color=E2_ARMCOL[_k], lw=6, label=_l)
                for _k, _l in (("1a per-cell dose", "arm 1a  a dose per cell"),
@@ -6006,7 +6024,7 @@ def _(materials_path, np, pl):
 
     f"{fw_win.height:,} windows · {fw_win['cell'].n_unique():,} cells · vectors {fw_vec.shape}"
 
-    return FW_FREE, FW_RUNS, FW_W, fw_icc, fw_vec, fw_win
+    return FW_FREE, FW_RUNS, fw_icc, fw_vec, fw_win
 
 
 @app.cell(hide_code=True)
@@ -6354,8 +6372,6 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(
-    FW_W,
-    GRID,
     INK,
     MUTED,
     SERIES,
@@ -6384,9 +6400,7 @@ def _(
     _fwx_meta = fw_win.filter(pl.Series(_fwx_mask)).with_row_index("row")
     _fwx_X = fw_vec[_fwx_mask]
     _fwx_X = _fwx_X / _fwx_X.sum(1, keepdims=True)
-    _fwx_U, _fwx_S, _fwx_Vt = np.linalg.svd(_fwx_X - _fwx_X.mean(0),
-                                            full_matrices=False)
-    _fwx_ev = _fwx_S ** 2 / (_fwx_S ** 2).sum()
+    _fwx_U, _fwx_S, _ = np.linalg.svd(_fwx_X - _fwx_X.mean(0), full_matrices=False)
     _fwx_pc = _fwx_U[:, :2] * _fwx_S[:2]
 
     _p2mid = np.median(_fwx_pc[:, 1])
@@ -6413,12 +6427,11 @@ def _(
 
 
     fig_fwx = plt.figure(figsize=(W_TEXT, 3.6))
-    _gfx = fig_fwx.add_gridspec(2, 2, width_ratios=[0.95, 1.15],
-                                height_ratios=[1.0, 0.85], wspace=0.34,
-                                hspace=0.62, left=0.095, right=0.90,
-                                top=0.91, bottom=0.145)
+    _gfx = fig_fwx.add_gridspec(2, 2, width_ratios=[0.95, 1.15], wspace=0.34,
+                                hspace=0.52, left=0.095, right=0.90,
+                                top=0.90, bottom=0.155)
 
-    _axs = fig_fwx.add_subplot(_gfx[0, 0])
+    _axs = fig_fwx.add_subplot(_gfx[:, 0])
     _axs.hexbin(_fwx_pc[:, 0], _fwx_pc[:, 1], gridsize=32, cmap="Blues", mincnt=1,
                 linewidths=0)
     for _k, _i in enumerate(_pick):
@@ -6431,22 +6444,6 @@ def _(
     _axs.set_title("a  Two windows from opposite ends", loc="left",
                    fontweight="bold", fontsize=8.5)
     _axs.tick_params(labelsize=7)
-
-    # What the two axes of that space actually are, as profiles over the window.
-    _axl = fig_fwx.add_subplot(_gfx[1, 0])
-    _mins = np.arange(-FW_W, 0) + 0.5
-    _axl.axhline(0, color=MUTED, lw=0.8)
-    for _c, _col, _lab in ((0, SERIES[0], "first"), (1, SERIES[2], "second")):
-        _axl.plot(_mins, _fwx_Vt[_c], color=_col, lw=1.7,
-                  label=f"{_lab}  {100 * _fwx_ev[_c]:.0f}%")
-    _axl.set_xlabel("minutes before the demand opens", fontsize=7.5)
-    _axl.set_ylabel("weight", fontsize=7.5)
-    _axl.set_title("b  What the two components are", loc="left",
-                   fontweight="bold", fontsize=8.5)
-    _axl.legend(frameon=False, fontsize=6.4, loc="lower right", handlelength=1.3)
-    _axl.tick_params(labelsize=7)
-    _axl.grid(True, color=GRID, lw=0.6)
-    _axl.set_axisbelow(True)
 
     for _k, _i in enumerate(_pick):
         _m = _fwx_meta.filter(pl.col("row") == _i).to_dicts()[0]
@@ -6465,7 +6462,7 @@ def _(
         _ax.set_ylabel("CNR", fontsize=7.5)
         _ax.tick_params(labelsize=7)
         _ax.set_xlim(0, _de - _rs)
-        _ax.set_title(f"{'cd'[_k]}  window {'AB'[_k]} — {_m['run']}, {_m['free']} free min",
+        _ax.set_title(f"{'bc'[_k]}  window {'AB'[_k]} — {_m['run']}, {_m['free']} free min",
                       loc="left", fontweight="bold", fontsize=8.5)
         _axd = _ax.twinx()
         _axd.bar(_x, _tr["exposure_ms"].fill_null(0).to_numpy(), width=0.9,
@@ -6779,6 +6776,234 @@ def _(
     fig_fwd
 
     return (fwd_F,)
+
+
+@app.cell(hide_code=True)
+def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
+    # --- E2, alternative 1: four rungs from the first panel -----------------------
+    # The published `feedback-ladder` pools 1a and 1b as "closed loop" until panel (c).
+    # That hides the most interesting comparison in the run: in the one block whose
+    # demand was reachable, BROADCAST FEEDBACK SCORES LIKE CONSTANT LIGHT, and only
+    # per-cell dosing separates. Splitting the arm in panel (a) puts that in front.
+    E2A_RUNGS = ["1a per-cell", "1b broadcast", "2 constant 60 ms", "3 dark"]
+    E2A_COL = dict(zip(E2A_RUNGS, [SERIES[0], SERIES[2], MUTED, "#a9a7a2"]))
+    E2A_SHORT = dict(zip(E2A_RUNGS, ["1a  per-cell", "1b  broadcast",
+                                     "2  constant", "3  dark"]))
+    E2A_BLOCK = "demand_01_L_H"
+
+    _e2a_arms = (pl.read_parquet(materials_path("tracks_arms.parquet"))
+                   .filter(pl.col("run") == "v24").select("fov", "arm_label"))
+    e2a = (pl.read_parquet(materials_path("tracks_v24.parquet"))
+             .join(_e2a_arms, on="fov", how="left")
+             .with_columns(
+                 pl.when(pl.col("arm_label") == "population MPC")
+                   .then(pl.when((pl.col("particle") // 4) % 2 == 1)
+                           .then(pl.lit("1b broadcast")).otherwise(pl.lit("1a per-cell")))
+                 .when(pl.col("arm_label") == "open loop, 60 ms")
+                   .then(pl.lit("2 constant 60 ms"))
+                 .otherwise(pl.lit("3 dark")).alias("rung")))
+
+    _b1 = e2a.filter(pl.col("phase_label") == E2A_BLOCK)
+    _e2a_err = {_r: float(np.sqrt(((_s["raw_cnr"] - _s["r_t"]) ** 2).mean()))
+                for _k, _s in _b1.group_by("rung") for _r in [_k[0]]}
+
+    # field-level tracking error over everything the loop was scored on
+    _cell = (e2a.filter(pl.col("timestep") >= 76)
+                .group_by(["rung", "fov", "particle"])
+                .agg(((pl.col("raw_cnr") - pl.col("r_t")) ** 2).mean().sqrt().alias("rmse"),
+                     pl.col("exposure_ms").mean().alias("ms"), pl.len().alias("n"))
+                .filter(pl.col("n") >= 120))
+    e2a_fld = (_cell.group_by(["rung", "fov"])
+                    .agg(pl.col("rmse").median(), pl.col("ms").mean()).sort("rung", "fov"))
+
+    fig_e2a = plt.figure(figsize=(W_TEXT, 5.4))
+    # nested, so the trace and its light strip stay coupled while the ladder below
+    # gets a real gap rather than sharing one uniform hspace with them
+    _ga = fig_e2a.add_gridspec(2, 1, height_ratios=[1.55, 1.0], hspace=0.40,
+                               left=0.115, right=0.975, top=0.94, bottom=0.085)
+    _gtop = _ga[0].subgridspec(2, 1, height_ratios=[1.25, 0.34], hspace=0.12)
+
+    # (a) the one reachable block, with the closed loop split in two
+    _axa = fig_e2a.add_subplot(_gtop[0])
+    _axl = fig_e2a.add_subplot(_gtop[1], sharex=_axa)
+    for _r in E2A_RUNGS:
+        _g = (_b1.filter(pl.col("rung") == _r).group_by("timestep")
+                 .agg(pl.col("raw_cnr").median().alias("m"),
+                      pl.col("exposure_ms").mean().alias("ms")).sort("timestep"))
+        _x = _g["timestep"].to_numpy() - _g["timestep"].min()
+        _axa.plot(_x, _g["m"], color=E2A_COL[_r], lw=1.8,
+                  label=f"{E2A_SHORT[_r]}   {_e2a_err[_r]:.3f}")
+        _axl.plot(_x, _g["ms"], color=E2A_COL[_r], lw=1.2)
+    _axa.axhline(1.20, color=INK, lw=1.4, ls="--", zorder=6)
+    _axa.text(1, 1.203, "demand 1.20", fontsize=6.5, color=INK, va="bottom")
+    _axa.set_ylabel("CNR (median)", fontsize=8)
+    _axa.tick_params(labelsize=7, labelbottom=False)
+    _axa.set_title("a  The one block the demand was reachable", loc="left",
+                   fontweight="bold", fontsize=9)
+    _axa.legend(frameon=False, fontsize=6.6, ncol=2, loc="center left",
+                handlelength=1.4, columnspacing=1.4, labelspacing=0.3,
+                borderaxespad=0.6,
+                title="rung and its error in this block", title_fontsize=6.4)
+    _axa.yaxis.grid(True, color=GRID, lw=0.6)
+    _axa.set_axisbelow(True)
+
+    _axl.set_ylabel("light\n(ms/frame)", fontsize=7, linespacing=1.3)
+    _axl.set_xlabel("minutes into the block", fontsize=8)
+    _axl.set_ylim(0, 90)
+    _axl.tick_params(labelsize=6.5)
+
+    # (b) the four-rung ladder, with 1a and 1b paired inside their shared dishes
+    _axb = fig_e2a.add_subplot(_ga[1])
+    _ypos = {_r: len(E2A_RUNGS) - 1 - _i for _i, _r in enumerate(E2A_RUNGS)}
+    for _r in E2A_RUNGS:
+        _s = e2a_fld.filter(pl.col("rung") == _r)
+        _y = _ypos[_r]
+        _axb.plot(_s["rmse"], [_y] * _s.height, "o", ms=6, color=E2A_COL[_r], zorder=4)
+        _axb.plot([float(_s["rmse"].median())] * 2, [_y - 0.22, _y + 0.22],
+                  color=E2A_COL[_r], lw=2.4, zorder=5)
+    # the pairing: 1a and 1b are two halves of one dish, so join them field by field
+    _pa = e2a_fld.filter(pl.col("rung") == "1a per-cell")
+    _pb = e2a_fld.filter(pl.col("rung") == "1b broadcast")
+    for _f in _pa["fov"]:
+        _xa = float(_pa.filter(pl.col("fov") == _f)["rmse"][0])
+        _xb = float(_pb.filter(pl.col("fov") == _f)["rmse"][0])
+        _axb.plot([_xa, _xb], [_ypos["1a per-cell"], _ypos["1b broadcast"]],
+                  color=MUTED, lw=0.9, alpha=0.7, zorder=2)
+    _axb.set_yticks(list(_ypos.values()),
+                    [f"{E2A_SHORT[_r]}\n"
+                     f"{float(e2a_fld.filter(pl.col('rung') == _r)['ms'].mean()):.0f} ms"
+                     for _r in E2A_RUNGS], fontsize=7)
+    _axb.tick_params(axis="y", length=0)
+    _axb.set_ylim(-0.6, len(E2A_RUNGS) - 0.4)
+    _axb.set_xlabel("tracking error (CNR), field median", fontsize=8)
+    _axb.tick_params(axis="x", labelsize=7)
+    _axb.set_title("b  The ladder, by field, with the two halves of each dish joined",
+                   loc="left", fontweight="bold", fontsize=9)
+    _axb.xaxis.grid(True, color=GRID, lw=0.6)
+    _axb.set_axisbelow(True)
+
+    save_fig(fig_e2a, "feedback-ladder-alt1")
+    fig_e2a
+
+    return E2A_COL, E2A_SHORT, e2a
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **E2, alternative 1: the closed loop split from the first panel.** (a) The one block whose
+    demand the cells could reach, with each rung's median CNR and the light it spent; the
+    number beside each rung in the legend is its pooled error over that block. (b) The same
+    four rungs at the level inference is done, the field, with the two halves of each dish
+    joined: per-cell and broadcast cells sit in the same four dishes, so the comparison is
+    paired and every field-level confound cancels inside the pair. Row labels carry the mean
+    light each rung spent over the whole scored window.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(
+    E2A_COL,
+    E2A_SHORT,
+    GRID,
+    INK,
+    MUTED,
+    W_TEXT,
+    e2a,
+    np,
+    pl,
+    plt,
+    save_fig,
+):
+    # --- E2, alternative 2: the ladder as one axis, dose alongside ----------------
+    # A different way of introducing the split early. Instead of a trace panel and a
+    # separate individuation panel, every cell in the run is placed on one axis of
+    # tracking error, four rungs deep, with the light each rung spent drawn beside it.
+    # The 1a-1b comparison is then the top two rows rather than an afterthought, and
+    # the dose panel makes the confound visible at the same moment as the result.
+    E2B_ORDER = ["1a per-cell", "1b broadcast", "2 constant 60 ms", "3 dark"]
+
+    _e2b_cell = (e2a.filter(pl.col("timestep") >= 76)
+                   .group_by(["rung", "fov", "particle"])
+                   .agg(((pl.col("raw_cnr") - pl.col("r_t")) ** 2).mean().sqrt().alias("rmse"),
+                        pl.col("exposure_ms").mean().alias("ms"), pl.len().alias("n"))
+                   .filter(pl.col("n") >= 120))
+
+    fig_e2b = plt.figure(figsize=(W_TEXT, 3.5))
+    _gb = fig_e2b.add_gridspec(1, 2, width_ratios=[1.0, 0.42], wspace=0.08,
+                               left=0.155, right=0.975, top=0.86, bottom=0.24)
+    _y = {_r: len(E2B_ORDER) - 1 - _i for _i, _r in enumerate(E2B_ORDER)}
+    _rng = np.random.default_rng(0)
+
+    # left: every cell, with the field medians on top of them
+    _axe = fig_e2b.add_subplot(_gb[0, 0])
+    for _r in E2B_ORDER:
+        _s = _e2b_cell.filter(pl.col("rung") == _r)
+        _v = _s["rmse"].to_numpy()
+        _v = _v[_v <= 0.95]
+        _axe.plot(_v, _y[_r] + (_rng.random(len(_v)) - 0.5) * 0.42, "o", ms=1.8,
+                  alpha=0.18, color=E2A_COL[_r], mec="none")
+        _fm = (_s.group_by("fov").agg(pl.col("rmse").median()).sort("fov"))["rmse"].to_numpy()
+        _axe.plot(_fm, [_y[_r]] * len(_fm), "o", ms=6, color=E2A_COL[_r],
+                  mfc="white", mew=1.8, zorder=5)
+        _axe.plot([np.median(_fm)] * 2, [_y[_r] - 0.30, _y[_r] + 0.30], color=INK,
+                  lw=2.2, zorder=6)
+
+    # the two halves of one dish, joined
+    _pa = (_e2b_cell.filter(pl.col("rung") == "1a per-cell").group_by("fov")
+           .agg(pl.col("rmse").median()).sort("fov"))
+    _pb = (_e2b_cell.filter(pl.col("rung") == "1b broadcast").group_by("fov")
+           .agg(pl.col("rmse").median()).sort("fov"))
+    for _xa, _xb in zip(_pa["rmse"], _pb["rmse"]):
+        # dotted and muted: these say "same dish", they are not a measurement
+        _axe.plot([_xa, _xb], [_y["1a per-cell"], _y["1b broadcast"]],
+                  color=MUTED, lw=0.9, ls=":", alpha=0.65, zorder=4)
+
+    _axe.set_yticks(list(_y.values()), [E2A_SHORT[_r] for _r in E2B_ORDER], fontsize=8)
+    _axe.tick_params(axis="y", length=0)
+    _axe.set_ylim(-0.65, len(E2B_ORDER) - 0.35)
+    _axe.set_xlim(0, 0.95)
+    _axe.set_xlabel("tracking error (CNR)", fontsize=8)
+    _axe.tick_params(axis="x", labelsize=7)
+    _axe.set_title("a  Every cell, every rung", loc="left", fontweight="bold", fontsize=9)
+    _axe.xaxis.grid(True, color=GRID, lw=0.6)
+    _axe.set_axisbelow(True)
+    # right: what each rung spent to get there
+    _axm = fig_e2b.add_subplot(_gb[0, 1], sharey=_axe)
+    for _r in E2B_ORDER:
+        _d = float(_e2b_cell.filter(pl.col("rung") == _r)["ms"].mean())
+        _axm.barh([_y[_r]], [_d], height=0.55, color=E2A_COL[_r])
+        _axm.text(_d + 4, _y[_r], f"{_d:.0f}", va="center", fontsize=7, color=INK)
+    _axm.axvline(60, color=INK, lw=1.0, ls="--", zorder=5)
+    _axm.tick_params(labelleft=False, axis="y", length=0)
+    _axm.set_xlim(0, 165)
+    _axm.set_xticks([0, 60, 120])
+    _axm.tick_params(axis="x", labelsize=7)
+    _axm.set_xlabel("light spent\n(ms/frame)", fontsize=8, linespacing=1.3)
+    _axm.set_title("b  On what light", loc="left", fontweight="bold", fontsize=9)
+    _axm.xaxis.grid(True, color=GRID, lw=0.6)
+    _axm.set_axisbelow(True)
+    _axm.text(62, len(E2B_ORDER) - 1 + 0.42, "arm 2's setting", fontsize=6,
+              color=MUTED, va="bottom")
+
+    save_fig(fig_e2b, "feedback-ladder-alt2")
+    fig_e2b
+
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **E2, alternative 2: one axis, four rungs, and the light beside it.** (a) Every scored
+    cell placed on tracking error, jittered within its rung; open rings are field medians and
+    the black bar is the rung's median of those. Thin lines join the two halves of one dish,
+    which is the paired 1a against 1b contrast. (b) What each rung spent to get there, against
+    the 60 ms arm 2 was set to from v23's closed-loop means. The closed-loop rungs spent
+    roughly twice that, so the step from rung 2 to rung 1 is not at a matched dose.
+    """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -7805,6 +8030,7 @@ def _(
     FRP_BLOCK,
     FRP_DEMAND,
     FRP_RUNUP,
+    GRID,
     INK,
     MUTED,
     PROP_CLIMB,
@@ -7818,66 +8044,103 @@ def _(
     prop_reference,
     save_fig,
 ):
-    # One panel, four rows, aligned on the split between the free window and the demand.
-    # Each row pairs one arm with one pattern; the pairing is ILLUSTRATIVE — every field runs
-    # its own arm against all four patterns, which is the 4x4 the run actually is.
-    PROP_ROWSTEP, PROP_GAIN = 1.35, 2.0
-    PROP_PAIRS = list(zip(FRP_ARM_ORDER, PROP_PATTERNS))     # arm 1-4 against the four demands
-    PROP_LEFT = 25
+    # Two panels, because the run is a 4x4 and the previous single panel had to pair
+    # one arm with one pattern and then apologise for the pairing in its caption.
+    #   (a) how much room the controller is given, at one fixed demand
+    #   (b) what it is asked for, once the demand opens
+    # Every field runs its own arm against all four patterns, so the two panels vary
+    # one thing each and nothing has to be paired.
+    PROP_ROWSTEP, PROP_GAIN = 1.25, 2.0
+    PROP_LEFT, PROP_RIGHT = 25, 10
+    PROP_PATCOL = dict(zip(PROP_PATTERNS, [SERIES[0], SERIES[1], SERIES[2], "#8452a1"]))
 
-    fig_prop, _axp = plt.subplots(figsize=(W_TEXT, 4.7))
-    for _i, (_a, _pat) in enumerate(PROP_PAIRS[::-1]):
+    fig_prop = plt.figure(figsize=(W_TEXT, 4.0))
+    _gp = fig_prop.add_gridspec(1, 2, width_ratios=[1.30, 0.85], wspace=0.34,
+                                left=0.125, right=0.975, top=0.88, bottom=0.135)
+
+    # (a) the room: four arms, one demand, the dotted lines are what a window that
+    # long can produce. Arm 2's four minutes sit inside the loop's dead time, so its
+    # window admits only one shape however free it is on paper.
+    _axp = fig_prop.add_subplot(_gp[0, 0])
+    _ntop = 3 * PROP_ROWSTEP + 1.2
+    for _i, _a in enumerate(FRP_ARM_ORDER[::-1]):
         _free = frp_arms[_a]["free"]
         _y = _i * PROP_ROWSTEP
         _cnr = lambda v: _y + (np.asarray(v) - FRP_ANCHOR) * PROP_GAIN
 
-        # the graded part of the run-up: the anchor, and it is scored
-        _axp.plot([-PROP_LEFT, -_free], [_y, _y], color=SERIES[0], lw=2.0)
-        # the free window, and what a window that long can produce
+        _axp.plot([-PROP_LEFT, -_free], [_y, _y], color=MUTED, lw=1.8)
         if _free:
-            _axp.axvspan(-_free, 0, ymin=(_y - 0.30 + 1.0) / 6.7, ymax=(_y + 0.85 + 1.0) / 6.7,
-                         color=MUTED, alpha=0.20, lw=0)
+            _axp.axvspan(-_free, 0, ymin=(_y - 0.32 + 1.0) / (_ntop + 1.0),
+                         ymax=(_y + 0.80 + 1.0) / (_ntop + 1.0),
+                         color=SERIES[2], alpha=0.16, lw=0)
             for _tr in prop_arm_traces[_a]:
-                _axp.plot(np.arange(-_free, 1), _cnr(_tr["cnr"]), color=INK, lw=1.0, ls=":",
-                          alpha=0.8)
-        # and the demand, which opens at the split in every row
-        _axp.plot(np.arange(FRP_BLOCK - FRP_RUNUP), _cnr(prop_reference(_pat)[FRP_RUNUP:]),
+                _axp.plot(np.arange(-_free, 1), _cnr(_tr["cnr"]), color=INK, lw=1.0,
+                          ls=":", alpha=0.85)
+        _axp.plot(np.arange(PROP_RIGHT + 1),
+                  _cnr(prop_reference("hold")[FRP_RUNUP:FRP_RUNUP + PROP_RIGHT + 1]),
                   color=SERIES[0], lw=2.0, drawstyle="steps-post")
         _axp.plot([0], [_cnr(FRP_DEMAND)], "o", ms=5, color=SERIES[0], zorder=6)
-
-        _axp.text(-PROP_LEFT - 1.0, _y + 0.34, f"arm {_a}", ha="right", va="center", fontsize=9,
-                  fontweight="bold")
-        _axp.text(-PROP_LEFT - 1.0, _y + 0.08, f"{_free} free min", ha="right", va="center",
-                  fontsize=6.8, color=MUTED)
-        _axp.text(FRP_BLOCK - FRP_RUNUP + 0.8, _y + 0.22, _pat, ha="left", va="center",
-                  fontsize=9, fontweight="bold")
+        _axp.text(-PROP_LEFT - 1.0, _y + 0.30, f"arm {_a}", ha="right", va="center",
+                  fontsize=8.5, fontweight="bold")
+        _axp.text(-PROP_LEFT - 1.0, _y + 0.05, f"{_free} free min", ha="right",
+                  va="center", fontsize=6.6, color=MUTED)
 
     _axp.axvline(0, color=INK, lw=1.1, ls="--")
-    _axp.set_xlim(-PROP_LEFT, FRP_BLOCK - FRP_RUNUP - 1)
-    _axp.set_ylim(-1.0, 3 * PROP_ROWSTEP + 1.7)
+    _axp.set_xlim(-PROP_LEFT, PROP_RIGHT)
+    _axp.set_ylim(-1.0, _ntop)
     _axp.set_yticks([])
-    _axp.set_xticks([-20, -10, -4, 0, 10, 20])
-    _axp.set_xlabel("minutes from the moment the demand opens")
-    _axp.set_title("Four amounts of room, four demands", loc="left", fontweight="bold")
-    _axp.text(-PROP_LEFT - 1.0, 3 * PROP_ROWSTEP + 1.45, "arm", ha="right", va="center",
-              fontsize=7.5, fontweight="bold", color=MUTED)
-    _axp.text(FRP_BLOCK - FRP_RUNUP + 0.8, 3 * PROP_ROWSTEP + 1.45, "pattern", ha="left",
-              va="center", fontsize=7.5, fontweight="bold", color=MUTED)
-    _axp.text(-0.8, 3 * PROP_ROWSTEP + 1.45, "free window — nothing here is scored", ha="right",
-              va="center", fontsize=7, color=INK)
-    _axp.text(0.8, 3 * PROP_ROWSTEP + 1.45, "the demand, graded identically in every arm",
-              ha="left", va="center", fontsize=7, color=INK)
+    _axp.set_xticks([-20, -10, -4, 0, 10])
+    _axp.tick_params(labelsize=7.5)
+    _axp.set_xlabel("minutes from the moment the demand opens", fontsize=8)
+    _axp.set_title("a  Sizes of unscored windows", loc="left",
+                   fontweight="bold", fontsize=9)
+    _axp.text(-0.8, _ntop - 0.25, "unscored", ha="right", va="center", fontsize=7,
+              color=SERIES[2], fontweight="bold")
+    _axp.text(0.8, _ntop - 0.25, "graded", ha="left", va="center", fontsize=7,
+              color=INK, fontweight="bold")
     for _sp in ("left", "right", "top"):
         _axp.spines[_sp].set_visible(False)
 
-    fig_prop.subplots_adjust(left=0.13, right=0.84, top=0.90, bottom=0.26)
-    fig_prop.text(0.02, 0.015, "Nothing in the window is scored, so the objective cannot tell"
-                  " these apart; which one the controller picks is the measurement.\nThe"
-                  " arm–pattern pairing is illustrative — every field runs its own arm against"
-                  f" all four patterns.  climb goes to {PROP_CLIMB}.",
-                  fontsize=6.4, color=MUTED, va="bottom")
+    # (b) the goal: one small panel per demand, stacked. Overlaid on one axis they
+    # sit on top of each other -- hold and re-arrive share 1.05 for most of the block,
+    # release and re-arrive share the anchor -- so each gets its own row.
+    _gq = _gp[0, 1].subgridspec(len(PROP_PATTERNS), 1, hspace=0.30)
+    _xd = np.arange(FRP_BLOCK - FRP_RUNUP)
+    for _i, (_pat, _col) in enumerate(PROP_PATCOL.items()):
+        _axq = fig_prop.add_subplot(_gq[_i])
+        _axq.axhline(FRP_ANCHOR, color=MUTED, lw=0.8, ls=":", zorder=1)
+        _axq.axhline(FRP_DEMAND, color=GRID, lw=0.8, zorder=1)
+        _axq.plot(_xd, prop_reference(_pat)[FRP_RUNUP:], color=_col, lw=2.0,
+                  drawstyle="steps-post", zorder=4)
+        _axq.plot([0], [FRP_DEMAND], "o", ms=4, color=_col, zorder=5)
+        _axq.set_xlim(0, FRP_BLOCK - FRP_RUNUP - 1)
+        _axq.set_ylim(FRP_ANCHOR - 0.04, PROP_CLIMB + 0.04)
+        _axq.set_yticks([FRP_ANCHOR, FRP_DEMAND, PROP_CLIMB],
+                        [f"{FRP_ANCHOR:.2f}", f"{FRP_DEMAND:.2f}", f"{PROP_CLIMB:.2f}"],
+                        fontsize=6)
+        _axq.tick_params(axis="y", length=2)
+        # top left: every pattern opens at the demand and only climb reaches 1.15,
+        # and it does so after minute 10, so this corner is clear in all four
+        _axq.text(0.02, 0.94, _pat, transform=_axq.transAxes, ha="left", va="top",
+                  fontsize=7.5, fontweight="bold", color=_col)
+        for _sp in ("top", "right"):
+            _axq.spines[_sp].set_visible(False)
+        if _i == 0:
+            _axq.set_title("b  Graded pattern", loc="left", fontweight="bold",
+                           fontsize=9)
+        if _i == len(PROP_PATTERNS) - 1:
+            _axq.set_xlabel("minutes after the demand opens", fontsize=8)
+            _axq.set_xticks([0, 10, 20])
+            _axq.tick_params(axis="x", labelsize=7.5)
+        else:
+            _axq.set_xticks([0, 10, 20])
+            _axq.tick_params(axis="x", labelbottom=False, length=2)
+    fig_prop.text(0.605, 0.60, "demanded CNR", rotation=90, va="center", ha="center",
+                  fontsize=8)
+
     save_fig(fig_prop, "proposed-demands")
     fig_prop
+
     return
 
 

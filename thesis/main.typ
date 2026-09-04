@@ -750,12 +750,12 @@ and observing stimulation patterns within this window.
       [v24],
     )
   ],
-  caption: [#todo[caption. The experimental designs and the live runs that used
+  caption: [The experimental designs and the live runs that used
    them. Objectives and controllers are crossed rather than nested: one run
    carries several objectives across its fields, and one objective appears under
    several controllers. Runs before v10 are omitted, having been recorded
    without a controller policy. Per-run scalars and admissibility are in
-   @fig-ledger.]],
+   @fig-ledger.],
 ) <tab-designs>
 
 == Comparing single-cell control, population-level control and open loop stimulation 
@@ -765,7 +765,7 @@ level MPC against an open loop stimulation matched to experiment beforehand.
 
 #thesisfig(
   "e2-design",
-  [Design of population vs single-cell MPC experiment.  ],
+  [The v24 design. Arm 1's four fields are split inside the dish: (particle / 4) % 2 decides which cells share one broadcast dose, so 1a against 1b is paired within a field rather than compared across dishes. Arm 2 delivers a flat 60 ms, set from v23's closed-loop arm means; arm 3 receives no stimulation light at all. The nine blocks are a complete 3 × 3 of levels against rates, each combination once, in a counterbalanced order.  ],
   "e2-design",
 )
 
@@ -965,7 +965,7 @@ The population's resting spread is wider than the light can move any one cell.
 
 #thesisfig(
   "how-cells-move",
-  [],
+  [ Influence of light on CNR. Rows are cells pooled across all seven runs and binned by the mean light that cell itself received. The null is v24's dark arm — 229 cells held with no stimulation light for twelve hours, median apparent reach 0.14 CNR and p90 0.30. Bars: p10–p90 faint, p25–p75 solid, tick at the median.],
   "how-cells-move",
 )
 
@@ -983,7 +983,7 @@ to reach the same level, failed to do so. It ends up delivering 60ms constant st
 
 #thesisfig(
   "e2-arms",
-  [],
+  [ What the three lit groups achieved. A cell's ceiling in panel (b) is the 95th percentile of its own CNR over the run — what it actually reached, under whatever light it was given. The resting lines are the dark arm, which never received any light. Panel (a) shows the median cell of each rung against the one reference all eight fields were given, with the interquartile band on the per-cell arm.],
   "e2-arms",
 )
 
@@ -1039,7 +1039,7 @@ Visualising the activations in free windows across the different arms shows a co
 
 #thesisfig(
   "freewindow-heatmap-by-demand",
-  [Heatmap of activations in every pre-demand window, binned by the length of unscored time during which the controller could come up with pre-stimulations.],
+  [Heatmap of activations in every pre-demand window, binned by the length of unscored time during which the controller could come up with pre-stimulations. Left sidebar marks the goal pattern that a given cell was tasked with reproducing. Visible clustering of those in one strategy could mean confounding of strategy with goal. ],
   "freewindow-heatmap-by-demand",
 )
 
@@ -1097,7 +1097,7 @@ free window does not depend on the objective ahead.
 
 #thesisfig(
   "freewindow-examples",
-  [],
+  [Two windows from opposite ends of the shape space. Chosen by a stated rule: the window nearest the 5th and nearest the 95th percentile of the first shape component, both at the median of the second. Dashed line: the demand. Bars: light commanded. Green: the unscored window. Both cells are shown over one whole block.],
   "freewindow-examples",
 )
 
@@ -1176,7 +1176,7 @@ belonging in the appendix rather than in the methods]
 
 #thesisfig(
   "run-ledger",
-  [#todo[caption. Every live run scored on the same two gates. (a) achieved
+  [Every live run scored on the same two gates. (a) achieved
    cadence, median to p90, against the 1 min interval the model was trained on;
    seven runs slipped, from 1.16 to 5.72 min per frame. (b) share of closed-loop
    cell-frames sitting on the top rung of their own field's ladder, annotated
@@ -1185,20 +1185,20 @@ belonging in the appendix rather than in the methods]
    to 600 ms, so a run-wide figure understates v16 by more than a factor of ten
    (5% against 73%). Three runs of nineteen clear both gates (v21, v23, v24);
    v16 and v19 hold cadence but saturate 73% and 32% of the time; v22 is
-   excluded for a mis-set objective.]],
+   excluded for a mis-set objective.],
   "fig-ledger",
 )
 
 #thesisfig(
   "arm-tracks",
-  [#todo[Describe the tracks] ],
+  [A raw plot of all the admissable experiments. Solid lines are median CNR of a given arm of experiment. Shaded parts represent IQR ],
   "experiment tracks",
 )
 
 
 #thesisfig(
   "reachability-runs",
-  [#todo[Describe the tracks] ],
+  [#todo[Every cell in every experiment, sorted by initial resting CNR. Colored lines represent p95 of its CNR. Red vertical line shows median of demanded CNR in a given experiment, while the vertical shaded bar stands for demand IQR] ],
   "reachability-runs",
 )
 
