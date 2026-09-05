@@ -1050,6 +1050,8 @@ strong stimulation; these rows sit at the top of each arm in
 seven-minute mark and then nothing at all. Every intermediate between them is occupied,
 and no edge separates one from the other.
 
+#todo[mention free window size -> error drop, not significant ]
+
 The extremes are also rare. Along this axis the density has a single peak near the middle
 in every arm, with several times as many windows near the centre as in either tail. What
 the unscored window changes is the width of that distribution rather than its shape: the
@@ -1108,11 +1110,87 @@ free window does not depend on the objective ahead.
 
 = Discussion
 
-// Outline brief: the sensitivity-drift issue — possible interpretations.
+// Initial intro
+Predicting cell responses is important for the understanding of population-level dynamics. 
+This work shows a successful application of Deep Model Predictive Control for signaling dynamics 
+of single cells in a closed loop experiment.
+The technical pillars of conducting such experiments is a predictive model, controller that plans action, 
+and an objective function.
+Using data from previous experiments, we trained a predictive model of CNR and then used it
+for closed-loop predictions, and steering individual cells with the help of a controller in real time.
 
-1. Prediction needs personal history
-2. Uncertainty is trustworthy
-3. Feedback does work (E2 ladder)
+// choice of an objective, pattern geometry
+During our experiments, choice of an objective was an arbitrary, experiment-wide static decision. 
+This helps with evaluation of multiple cells against a single target,
+but is not the best possible fit to the problem
+Within a population, there is a bigger dispersion of resting CNR values,
+than an average cell is capable of moving (@reachability-runs). Because of this, a static, population-wide pattern will
+always have a proportion of the population over the demanded state, and some that is incapable of reaching it.
+Geometry of the objective matters as well, especially in a system that can only be perturbed one way - into
+activation, and so the objective function should take into account realistic deactivation.
+
+// future work - adaptive objective idea
+This is something addressable in further research. 
+One possible alternative would be to encode objective itself on a per-cell basis - for example based on the 
+initial resting CNR state, position within a cluster or number of neighbours.
+For probing population-level phenomena, this approach could be 
+used to pre-select the cells that exhibit signs of 'good controllability', 
+and then stimulate only those.
+
+
+// Diversity of stim
+//   - history-swap shows that personalised history is crucial for prediction accuracy 
+//   - despite that, The stimulations used inside of
+//     the free window experiment look as though they were taken from a
+//   . single gradient across all windows, with only the difference being the steepness of the gradient.
+//     A possible explanaiton for this is that the optimal stimulation differs in quantity rather than kind,
+//     and the current stimulation ladder is too coarse to express it. 
+// per cell control result
+We found that a controller's choice for stimulation is sampled from a continuum of behaviors.
+On one end, the strategy of stimulating only just before the demand is scored, and on the other end 
+to stimulate early, then stop and let the CNR fall into the desired state. 
+
+Increasing the duration of unscored window before the main objective changes the distribution of behaviors picked - 
+widening the cases at the edges of the continuum (mentioned above) at the expense of the 
+'constant stimulation' case that lives inbetween them. 
+The constant stimulation strategy is more prevalent in
+cases with no free window, perhaps because it does not allow the cells to fall into their own baseline, but 
+instead commands them to hold an 'estimated baseline', leading some cells to need to be stimulated.
+@history-swap shows how taking cells with matching CNR but swapping their histories has a severe negative influence
+on their predictions, highlighting the importance of the historical embedding. Picking different behaviors for 
+stimulation is how this effect transfers to the control task, making the stimulation type a readout of the 
+individuality of the cell. 
+The avenue of finding model's representation of the cell state would benefit from further analysis. 
+Current evidence of continuum of response suggests a single discriminating parameter responsible for 
+the diversity, but a difference in  experimental setup and objective function might paint a more 
+complex picture.   
+Another angle of approach could be an analysis of model's embeddings, and whether they can be used to classify
+the response actually picked by the controller reliably. 
+
+// Sensitivity drift
+Over the course of the experiment we noticed a gradual shift in quality of the tracking (@sensitivity-decline),
+as well as the amount of light energy used. 
+Its cause is unknown, with probable candidates being transcriptional feedback, receptor internalization 
+and pathway desensitization. 
+The conroller learns to deal with the decrease in sensitivity by increasing light budget in a reactive manner,
+while adapting the running encoder by integrating the newly inflated stimulations. 
+An example way to integrate such pathway-level phenomena in future work would be to wire it at the level of the
+model architecture, for example as an explicit time axis between observations. Such operation would not only
+increase awareness of drift, but also could serve as a way to encode external events relevant to the 
+internal state of the cell (time of starvation, etc), and could aid in disentangling time-based phenomena from
+stimulation-driven ones.
+Future work should also consider measuring not only the drift but also recovery, and how it affects 
+contrallability metrics. 
+
+
+
+
+
+// - Sensitivity decline explanation;
+// 	- photobleaching
+// 	- transcriptional feedback
+// 	- receptor internalization
+// Fields of view with no light - do they have different characteristics? 
 
 
 == Interpreting the sensitivity drift
