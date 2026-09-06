@@ -123,7 +123,7 @@
   v(1.2cm)
   text(size: 10.5pt)[Supervised by: Dr. Maciej Dobrzyński, Prof. Olivier Pertz]
   v(1fr)
-  text(size: 10.5pt)[#todo[submission date]]
+  text(size: 10.5pt)[08.09.2026]
 })
 
 #counter(page).update(1)
@@ -175,7 +175,7 @@ The MAPK/ERK pathway plays a key role in cellular proliferation signalling, util
 than stable states to control cell fate decisions @Ryu2015.
 In PC12 cells, a sustained pulse of pathway activation drives differentiation while a
 transient pulse drives proliferation @Marshall1995; modulating the frequency of
-activation alone can rewire fate decisions @Ryu2015.
+activation alone can rewire fate decisions @Ryu2015 @Albeck2013.
 
 Cells partake in complex spatiotemporal population-level phenomena such as ERK-waves @Aoki2017, that affect processes such as wound healing, apoptosis resistance. 
 Cancer cells have been shown to impact these high-level communications, interfering with the surrounding healthy tissue. 
@@ -185,14 +185,14 @@ Cancer cells have been shown to impact these high-level communications, interfer
 
 == Why the population average is not enough
 
-A standard problem in studying  biological systems is that a quantity easily modelled at
+A common problem in studying  biological systems is that a quantity easily modelled at
 the level of a population statistic need not describe any individual in it. The
 difficulty is not that the average is imprecise; it is that the events of interest
 happen in single cells. A cell differentiates or it does not, commits to a cycle or
 does not, dies or survives. An average over such events describes a state that no cell
 need ever occupy.
 
-For ERK this matters because the responses really are spread. Genetically identical
+For ERK this matters because the responses really are diverse. Genetically identical
 cells differ in protein abundance in ways that precede any stimulus @Spencer2009. That
 shows up directly in this preparation: cells receiving an identical pulse train respond
 over a wide and continuous range, with a substantial minority barely moving at all
@@ -205,8 +205,8 @@ an objective written for each cell, and light delivered to each cell separately.
 
 #thesisfig(
   "heterogeneity",
-  [*The population average is not a cell.* 7,141 cells receiving the same pulse
-   train, sorted by response. The response is continuously distributed over more
+  [*The population average is not a cell.* 7,141 cells receiving the same pulse,
+    sorted by response. The response is continuously distributed over more
    than a two-fold range rather than falling into classes, and 16% stay within
    10% of their own baseline. Data: experiment #raw("bo_v8"), 78 fields, pulses
    every five minutes. Because that experiment swept per-pulse exposure between
@@ -266,7 +266,7 @@ The readout used throughout this work is such a sequence: the cytoplasm-to-nucle
 of a translocation reporter, which tracks ERK activity rather than the abundance of any
 kinase.
 
-A work by @Klumpe2023 showed that deep neural networks were able to infer the underlying dynamics of a cell response
+A work by Klumpe et. al. @Klumpe2023 showed that deep neural networks were able to infer the underlying dynamics of a cell response
 even in the presence of measurement noise and stochasticity in the biochemical reactions.
 
 // brief: not explaining mechanisms, but uncovering more complex behaviour and
@@ -303,17 +303,30 @@ changes underneath it.
 Any MPC loop needs a model that can forecast the system under a proposed input, and a
 mechanistic ODE can serve that role. Control asks for prediction rather than
 identifiability, so parameters that are not uniquely determined are not by themselves
-disqualifying. What does disqualify is the last objection above: a fitted ODE cannot
+disqualifying. A more severe objection is that a fitted ODE cannot
 follow a cell whose response changes over the run without being refit. A model learned
 from observational data carries no such commitment, and that is the class used here.
 
-Deep MPC has been demonstrated for gene expression: @Lugagne2024 steered expression levels
+Deep MPC has been demonstrated for controlling gene expression in a synthetic system: Lugagne et. al. @Lugagne2024 steered expression levels
 in thousands of single cells under blue light, planning with a neural predictor.
 Gene expression, however, is a slow readout: it unfolds over hours on a transcriptional
 timescale.
 
-== Contributions:
-#todo[write those after final analysis]
+The difference in timescale is important. Transcription integrates over hours, so a
+controller for gene expression has room to measure, plan and wait. ERK activity moves in
+minutes @Albeck2013: the reporter used here responds to a pulse within a few frames and relaxes on a
+comparable scale, so the loop must close inside the one-minute acquisition interval and
+its horizon spans half an hour rather than a day. The lag between commanding light
+and seeing the cell move is a sizeable fraction of that horizon, which is what makes the
+control predictive rather than reactive: there is no error to respond to until it is too
+late to correct cheaply.
+
+This thesis builds a loop for that regime and runs it on live cells. A model is learned
+from observational data to forecast one cell's ERK response to a proposed light sequence; a
+model-predictive controller plans against it, for every cell in the field, at every frame;
+and the closed loop is tested in live experiments against the two comparisons that decide
+whether the complexity earns its place, namely the same light delivered without feedback,
+and one dose shared across cells instead of chosen per cell.
 
 = Materials and methods
 
@@ -389,53 +402,30 @@ allowed displacement of 50 pixels between consecutive frames.
 
 == Feature engineering
 
-Many feature engineering and augmentation methods were contemplated, which can be
-clustered into distinct groups by their motivation: 1) enrichment of stimulation
-features, 2) spatial/population features, 3) self-learned image features.
+The model receives five channels per cell per frame, and nothing else: CNR, which is both
+the quantity being predicted and the model's own most informative input; fluence, the
+light delivered to that cell on that frame; nuclear area; the number of other cells within
+a 200 px radius; and optoRTK expression, a static per-cell value measured once before the
+run.
 
-Stimulation features are first collapsed from their distributed representation between
-multiple columns (`stim_exposure`, `stim_power`, and a hidden, experiment-level variable
-of which stimulation hardware and light filters were used) into a single variable of
-energy received by the cell per unit area (radiant exposure), calculated based on
-#todo[method] and calibration curves of each of the microscope setups used in generating
-the training data.
+Stimulation reaches the raw data distributed across three quantities: the commanded
+exposure, the LED power setting, and an experiment-level variable of which stimulation
+hardware and filters were in use. None of them is comparable across setups on its own.
+They are therefore collapsed into a single physical quantity, the radiant exposure
+received by the cell per unit area, referred to throughout as fluence and computed from
+each microscope's own power calibration curve (@light-dose-calculation). This is what allows
+experiments from two setups to enter one training corpus.
 
-This feature, referred to henceforth as `fluence`, allowed us to compare data from
-multiple acquisition setups. We then used it as a base to calculate auxiliary summary
-statistics, that were fed to the model in an attempt to improve learning efficiency.
-Among such summary statistics were:
-
-- time since last pulse
-- exponential moving average of stimulation across a short time window
-- exponential moving average of stimulation across a long time window
-- number of pulses in the last $N$ frames
-- integral of fluence for this cell since the start of the experiment
-- OLS slope of fluences over the last $N$ frames
-
-Features regarding crowding at the level of the single cell and the field of view were
-used. FOV-level features count the number of cells found by segmentation, and the
-single-cell neighbourhood feature counts for each cell the number of other cells nearby.
-
-After extensive testing and with a bigger dataset, we noticed that the significance of
-hand-engineered features diminishes. In the end, a minimalistic set of features was used,
-encoder inputs consisting of:
-
-- CNR
-- nuclear area
-- stimulation (encoded as fluence)
-- count of other cells within a radius of 200 px
-- optoRTK expression
-
-Out of those mentioned above, the optoRTK expression is worth mentioning in more detail.
-The biosensor used for this readout has an overlapping activation spectrum with our
-Cry2 — this means that whenever we want to do a readout of optoRTK expression, we also
-activate the MAPK/ERK pathway. The reasonable assumption here is that expression of the
-optoRTK receptor is something that changes on a much larger timescale than the MAPK
-dynamics, and therefore the strategy we chose was to obtain the optoRTK expression value
-for each cell before the experiment starts, wait for the MAPK system to reset, and then
-start the experiment. Additionally, we image the mCitrine one last time at the end of the
-experiment. This serves no purpose in terms of control, but is a useful metric when
-attempting to explain behaviour of the cells during the control task.
+The optoRTK expression channel is worth more detail.
+The biosensor for this readout has an activation spectrum overlapping that of the Cry2
+domain of the optogenetic construct, so any readout of expression also activates the MAPK
+pathway. The assumption we rely on is that receptor expression changes on a far longer
+timescale than MAPK dynamics, which licenses measuring it once before the experiment
+begins and then waiting for the pathway to return to rest before starting. The mCitrine
+channel is imaged once more at the end of the run; this plays no part in control, but is
+useful when accounting for how individual cells behaved during it. Expression is not
+comparable in absolute units between sessions, so what enters the model is a within-session
+rank rather than a rescaled intensity.
 
 #thesisfig(
   "expression-normalisation",
@@ -443,6 +433,24 @@ attempting to explain behaviour of the cells during the control task.
    differ in the shape of the distribution and not only in its scale.],
   "fig-expression-norm",
 )
+
+Nuclear area and the local cell count describe the cell's size and its immediate
+surroundings. The encoder ablation in @sec-temporal-context finds the two behave quite
+differently: nuclear area earns a small but real place in the model's predictions, while
+the crowding channels are essentially unused. The crowding channel is retained in the
+input set on the grounds that its absence would then have to be argued rather than shown.
+
+A considerably larger set of derived stimulation statistics was built and tested before
+this one: time since the last pulse, fast and slow exponential moving averages of
+delivered light, a count of pulses within a trailing window, the integral of fluence since
+the start of the experiment, and the OLS slope of fluence over recent frames. Features
+learned directly from the images were also considered and never built. None of the derived
+statistics survived, and the reason is structural rather than empirical. Once the encoder
+was given the cell's entire history rather than a fixed window, every one of them became a
+function of inputs the encoder already holds, and a recurrent network can compute a moving
+average or a time-since-event counter for itself where that is useful. The ablation found
+them carrying no weight and they were removed. What the model is given is deliberately
+minimal, and the work of remembering the past is left to the encoder.
 
 == Dataset
 
@@ -476,41 +484,46 @@ and 6.63 M frames.
 A deep learning model was designed for the CNR prediction task, with the goal of being
 quick enough to be run in real time for many cells in parallel.
 
-#figure-placeholder(
-  [The predictive model: a full-history LSTM encoder, an MLP trunk, and a mixture-density
-   prediction head.],
+#thesisfig(
+  "model-schematic",
+  [The predictive model. (a) One step of the computation: the encoder reads every past
+   frame of one cell on five channels, the decoder is a separate recurrent network stepped
+   on just two numbers, the CNR fed back from the previous step and the light commanded for
+   this one, and the head returns a mixture of three Gaussians rather than a point. The
+   commanded dose enters three times, as a decoder input, as the FiLM conditioning that
+   scales and shifts the decoder output, and again concatenated at the trunk input. (b) The
+   same decoder unrolled over the 30-frame horizon. The light row is the candidate plan
+   being scored, known ahead of time because it is what the controller is choosing, and the
+   predicted spread widens because each step is conditioned on the previous step's
+   prediction rather than on a measurement. Dropout and the learned per-step variance
+   offset are part of the model and are omitted from the drawing.],
   "fig-model-schematic",
-  height: 5cm,
 )
 
-This motivated the decision to split the model into three parts: encoder, trunk and
-prediction head. The encoder is an LSTM network that encodes all the features from
-previous timepoints of a given cell, and returns a hidden state vector. When running in
-real time, the encoder hidden state from time $t-1$ is persisted in memory. This way,
-when the microscope provides us with the next frame, we can run a single encoder step on
-our hidden state and immediately obtain the next state, without re-encoding the entire
-past again. After the encoder, the state vector is passed through an MLP trunk, and then
-given to a prediction head.
+This motivated the decision to split the model into four parts: an encoder, a decoder, an
+MLP trunk and a prediction head. The encoder is an LSTM network that reads all the
+features from previous timepoints of a given cell and returns a hidden state. When running
+in real time that state is persisted in memory, so when the microscope provides the next
+frame we run a single encoder step on the state we already hold and immediately obtain the
+next one, without re-encoding the entire past. The decoder is a second LSTM, initialised
+from the encoder's state, and it is stepped once for each frame of the planning horizon.
+Its input at each step is only the CNR fed back from the previous step and the light
+commanded for this one, which are the two quantities that are known while a candidate plan
+is being scored. Its output is modulated by a FiLM layer conditioned on that commanded
+dose, then concatenated with the dose again and passed through the MLP trunk to the
+prediction head. The dose therefore reaches the prediction by three routes rather than
+having to survive in the recurrent state alone.
 
-Being able to take into account model uncertainty during the control task was deemed
-important, and so the predictive architecture was evaluated for the best way of
-quantifying uncertainty. We evaluated multiple options for achieving this goal. A model
-ensemble can provide a notion of uncertainty by inspecting the variance of ensemble
-predictions. Similar effects can be achieved by a technique called Monte Carlo dropout —
-here we use a single model, trained with dropout, but while in ordinary use of this
-technique the dropout layer is turned off in evaluation mode, here we use it to sample
-from a distribution of plausible predictions from different sub-configurations of the
-model. Finally, a mixture density network approach was tested, where the network outputs
-a mixture of Gaussians. Each Gaussian consists of three features: mean, variance and
-weight, which we constrain into meaningful values. The number of Gaussians used is a
-hyperparameter, and can help us encode predictions for a non-homogeneous population. This
-prediction head is trained using negative log likelihood loss on the running minibatch.
+Being able to take model uncertainty into account during the control task was deemed
+important, so the prediction head returns a distribution rather than a point. It is a
+mixture density network: the network outputs a mixture of Gaussians, each described by a
+mean, a variance and a weight, which we constrain into meaningful values. The number of
+components is a hyperparameter, and lets the head express a prediction for a
+non-homogeneous population. It is trained by minimising the negative log likelihood of the
+observed CNR under that mixture, on the running minibatch.
 
-The prediction head outputs a single future CNR value at $t+1$.
-
-#todo[FiLM conditioning; autoregressive unrolling and the predictive horizon in the
-training task — and decide whether the autoregressive paragraph lives here or in
-training methodology, where a version of it already exists]
+The head emits one such mixture at every step of the planning horizon, rather than a
+single value one frame ahead.
 
 == Training methodology
 
@@ -529,7 +542,7 @@ must be large enough to capture dynamical features of the controlled system, whi
 small enough to be evaluated quickly in a live experiment. It is also possible to run
 training with a varying time horizon. The reasoning for such a design choice is that we
 convey the fact that we are interested in phenomena at all temporal scales of the system.
-The problem with this approach is that it makes training noisy and unstable — there is no
+The problem with this approach is that it makes training noisy and unstable: there is no
 meaningful way to assign datapoints to horizon lengths, so they must be assigned at
 random, which means that sometimes datapoints with little long-range dynamics will be
 used to learn long-range dynamics, and the frequency of such assignments will vary
@@ -560,20 +573,51 @@ being asked to predict the same parts multiple times.
 The model predictive control approach was based on the extending-horizon model. Before
 the start of the experiment, a policy containing an objective function was loaded.
 
-#figure-placeholder(
-  [The inference path: the encoder state persisted per cell across frames, cross-entropy
-   sampling over the discrete dose ladder, and the parallel decoder passes that score
-   candidate plans.],
+#thesisfig(
+  "schematic",
+  [The closed loop, once per frame. FARO drives the microscope, segments and tracks the
+   cells and extracts their features; the inference server takes one encoder step per cell
+   on the state it has been carrying, runs the controller, and returns a dose per cell,
+   which FARO turns into a DMD stimulation mask. The whole circuit completes inside the
+   one-minute acquisition interval, and repeats for the length of the run.],
+  "fig-pipeline",
+)
+
+#thesisfig(
+  "mpc-schematic",
+  [The cross-entropy search, run on one real cell. Rows are the three passes; columns
+   follow a single pass from left to right. The controller holds a categorical
+   distribution over the six ladder rungs at each of the thirty horizon steps, uniform to
+   begin with; it draws 512 plans from it and adds the six constant-dose plans, which are
+   always evaluated so the search can never come out worse than the best constant dose;
+   all 518 are rolled through the decoder in one batch and scored against the demand. The
+   cheapest 64 are the elites, the distribution is refit to them with a tenth of uniform
+   mixed back in, and the pass repeats. Each column shares its scale down the three rows,
+   so the distribution visibly peaks, the plans and their predicted trajectories collapse
+   together, and the cost histogram slides left. Only the winning plan's first step is
+   applied. The cost axis is truncated on the right, so the all-dark plan sits off it.],
   "fig-mpc-schematic",
-  height: 5cm,
 )
 
 The stimulation that the model is searching for is technically a continuous variable.
-However, due to the constraints of the hardware (both for stimulation and for search over
-possible values), the stimulation is collapsed into six discrete levels and treated as a
-categorical variable. For the microscope, this simplifies processing the stimulation
-masks, as collapsing to discrete levels means simply switching between six masks. For
-the search process it helps by narrowing the theoretical search space to $6^L$ cases.
+However, due to the constraints of the hardware, both for stimulation and for the search
+over possible values, it is collapsed into a small set of discrete levels and treated as a
+categorical variable. For the microscope this simplifies processing the stimulation masks,
+since discrete levels mean switching between a fixed set of masks. For the search it
+narrows the space of candidate plans over a horizon of $L$ frames from a continuum to
+$k^L$ cases, where $k$ is the number of levels.
+
+The ladder is fixed for the whole of a run and shared by every arm within it, so arms are
+always comparable inside a run, but it was not the same in every run. Runs v10, v11, v16
+and v19 used five levels: 0, 20, 45, 85 and 150 ms. From v21 onward a sixth level of 300 ms
+was added, and v21, v23 and v24 all use it. Two arms sit outside their own run's ladder by
+design. The open-loop dose probe in v16 steps through 0, 85, 150, 300 and 600 ms, exceeding
+what that run's closed-loop fields could choose from, because its purpose is to
+characterise the actuator rather than to control anything. The constant arm in v24 delivers
+a flat 60 ms, set from the mean dose of v23's closed-loop arms and deliberately placed
+between rungs so that it is not a choice the closed-loop arms could have made. Comparisons
+of delivered light between runs therefore have to account for which ladder they were drawn
+from.
 
 The inference process starts with per-cell encoder embeddings that are persisted across
 time. At the beginning of the run they are zero-filled. At each new frame, the newly
@@ -602,7 +646,7 @@ each other by objective, and comparing them across different cells. The basic co
 strategy requires us to specify a continuous objective function that is used to score
 candidate solutions that the model comes up with. The effect is, however, that the model
 is always evaluated on the entire path to the desired state. The creativity of the
-solution is therefore constrained by the question we are asking the model — from state
+solution is therefore constrained by the question we are asking the model: from state
 $s_t$, what sort of stimulation $u$ do I need to find myself in state $S$ at time $t+1$?
 
 An alternative test for whether the model can come up with diverse strategies for
@@ -623,11 +667,10 @@ objective patterns.
 //  Experiments
 // ═════════════════════════════════════════════════════════════════════════════
 
-== Live experiments 
+== Live experiments
 
-Experiments on the live cells were designed to probe the biological system as well as test the MPC pipeline.
-Standard length of the experiment lasted 12 hours,
-and consisted of 8-12 fields of view on the microscope.
+Experiments on live cells were designed both to probe the biological system and to test
+the MPC pipeline. A standard experiment ran for 12 hours over 8 to 12 fields of view.
 
 Three levels of structure recur throughout, and the distinction between them matters for
 how the experiments are analysed. A *field of view* is one imaging position on the plate;
@@ -644,41 +687,6 @@ two of them. A treatment applied to blocks, such as which demand pattern is bein
 for, is replicated by blocks, three of them per pattern. The individual cell is a
 replicate of neither: a cell lives in one field and survives many blocks, so its
 measurements are repeated observations rather than independent ones.
-
-=== Search for useful controller mechanisms
-
-Predictive model can be evaluated offline, by observing its errors on already existing data. Due to its counterfactual nature,
-controller is impossible to evaluate offline. Because of this, the first experiment (v10) aimed to evaluate usefulness of the base MPC controller and two
-variations on its theme. I designed 4 experimental arms :
-Arm 1 was a control, not utilising full MPC: it evaluated 5 possible futures at 30 frames - one for each choice of 
-next stimulation, pretending that this exact stimulation will be applied on the next 30 frames. 
-Arm 2 was a base MPC configuration - using L2 norm to score predictions and starting the sampling from a 
-uniform distribution across choices of stimulation.
-Arm 3 was a base MPC configuration with additional penalty for big 'jumps' between stimulation choices at 
-subsequent frames - effectively promoting a smooth stimulation patterns over time.
-Arm 4 had the same configuration as Arm 3, except the scoring method was changed into a band kernel.
-We considered band kernel as a mechanism that could help specifically with asymetricity of control of our system - since 
-we can only control to activate the optogenetic receptor but can only decrease CNR by waiting, overshooting the target has 
-more serious implications than undershooting (since we can re-stimulate to correct for the undershoot in the next frame). 
-L2 method is symmetric, scoring overshot and undershot predictions the same way. 
-Band kernel could be designed to be more lenient on undershooting cells. 
-
-=== Diversity of stimulation types found by the model
-
-Early experiments (@fig-encoder) showed that model can encode single cell history into an embedding that is useful for predictions of its future state. #todo[weird sentence. feels discussion'y]
-
-We wanted to investigate if this encoding is ever used as a discriminating factor not just for the quantity of the response given, but also its shape.
-Original implementation for a controller receives an objective function, and scores the model's proposed solutions at every step, 
-even before any interesting parts objective patterns start (for example, pre-experiment resting state). 
-This limits the diversity of stimulation patterns, as it only asks the question of 'how to best follow the objective curve at every step'. 
-The alternative approach would be to consider an approach where the solution's default frame is not counted towards the score,
-except when the frame is inside the objective interval.
-
-This way, as the frame approaches the 'scored' section, the controller can use its information about driven cell and pick a 
-pre-stimulation strategy that it considers best for crossing the 'scored' section.
-
-Practical strategy for exploring this idea was to introduce a 'free window' of varying size before an objective pattern,
-and observing stimulation patterns within this window.   
 
 #figure(
   text(size: 8.5pt)[
@@ -758,6 +766,63 @@ and observing stimulation patterns within this window.
    @fig-ledger.],
 ) <tab-designs>
 
+=== Search for useful controller mechanisms
+
+The predictive model can be evaluated offline, by measuring its error on data already
+collected. The controller cannot: what it is judged on is the trajectory that follows from
+its own choices, and the trajectory a different controller would have produced is not
+available. The first live experiment, v10, was therefore designed to ask whether the base
+MPC controller is useful at all, and whether two variations on it help. Four arms were run,
+identical in model, objective and dose ladder, and differing only in how candidate plans
+were generated and scored.
+
+Arm 1 was a control that does not use the full search. It evaluated one future per rung of
+the ladder, five in that run, holding that single exposure fixed across all 30 frames of
+the horizon, and applied the first step of whichever came out best. It therefore has the
+model and the objective but no search over sequences.
+
+Arm 2 was the base configuration: candidate sequences sampled from an initially uniform
+distribution over the rungs and scored by squared error against the reference.
+
+Arm 3 added a penalty on large changes in exposure between consecutive frames, which
+favours smooth stimulation patterns over ones that alternate between distant rungs.
+
+Arm 4 kept that penalty and replaced the scoring kernel with a band kernel, which prices
+the probability of leaving a band around the reference rather than the squared distance
+from it.
+
+The band kernel was included because control of this system is asymmetric. Light can only
+drive CNR up, and it comes down only by waiting, so an overshoot is more costly than an
+undershoot of the same size: an undershoot can be corrected on the next frame, while an
+overshoot cannot be corrected at all except by losing time. Squared error is symmetric and
+prices the two identically. A band kernel can be made more lenient below the reference than
+above it.
+
+=== Diversity of stimulation types found by the model
+
+The encoder compresses a cell's history into a state that demonstrably improves prediction
+(@fig-encoder). That state could be used by the controller in two quite different ways: to
+decide how much light a given cell needs, or to decide what shape of stimulation suits it.
+The first would show up as different doses for different cells, the second as different
+patterns. This subsection describes the design used to look for the second.
+
+The obstacle is the objective itself. A controller that is scored at every frame is being
+asked one question repeatedly, namely how best to sit on the reference right now, and that
+question has close to one answer. Frames before the interesting part of the objective
+begins, such as a resting period preceding a demand, are scored on the same terms as the
+demand itself, so the approach to the demand is as constrained as the demand.
+
+The alternative is to leave some frames out of the cost entirely. A frame outside the
+scored interval contributes nothing to a plan's score, so any behaviour during it is free,
+and the controller may use that room to prepare a cell for the section it will be scored
+on. Whether it uses the room at all, and whether different cells use it differently, is
+then an empirical question.
+
+The design that follows is a free window: a stretch of unscored frames, of varying length,
+placed immediately before each scored objective, with the stimulation the controller
+chooses inside that window as the observable.
+
+
 == Comparing single-cell control, population-level control and open loop stimulation 
 
 Experiment 24 was designed to compare single cell level MPC with population
@@ -805,12 +870,12 @@ Beyond this horizon, we observe the flattening of model's error.
 
 #thesisfig(
   "forecast-examples",
-  [A typical cell and a troublesome one, forecast from evenly spaced and from the
+  [A typical cell and one in a model's failure mode, forecast from evenly spaced and from the
    cell's own highest-error starting points respectively.],
   "fig-forecast-examples",
 )
 
-=== Dependence on temporal context
+=== Dependence on temporal context <sec-temporal-context>
 
 Model showed heavy reliance on the encoded history of the cell. Using full history shows over 2-fold 
 improvemnt in MAE error over a fresh context. 
@@ -835,7 +900,7 @@ yield prediction errors larger than cell's own.
   [The past the encoder uses is cell-specific: replacing a cell's history with a
    level-matched donor's roughly doubles forecast error, and the penalty does not
    decay across the run.],
-  "fig-history-swap",
+  "history-swap",
 )
 
 // ------------------------------------------------------------------------------------
@@ -921,7 +986,6 @@ During the first cycle median CNR reached desired level, while in the last cycle
 This prompted the design of more experiments that could help with quantifying the effect of diminishing responsivity to control. 
 The best controller arm is the base MPC one, scoring lowest RMSE values in both experiments (0.1916 in v10, 0.1554 in v11), and
 thus was used in all later experiments.
-#todo[Mann-Whitney U test w/ Holm corr for multiple testing to have p-value of the above claim?]
 
 Having obtained a stable controller configuration, we moved into a more diverse set of objectives for experiments.
 Generalization of accuracy and uncertainty from the offline evaluation into live experiment regime was done.
@@ -965,7 +1029,7 @@ The population's resting spread is wider than the light can move any one cell.
 
 #thesisfig(
   "how-cells-move",
-  [ Influence of light on CNR. Rows are cells pooled across all seven runs and binned by the mean light that cell itself received. The null is v24's dark arm — 229 cells held with no stimulation light for twelve hours, median apparent reach 0.14 CNR and p90 0.30. Bars: p10–p90 faint, p25–p75 solid, tick at the median.],
+  [ Influence of light on CNR. Rows are cells pooled across all seven runs and binned by the mean light that cell itself received. The null is v24's dark arm: 229 cells held with no stimulation light for twelve hours, median apparent reach 0.14 CNR and p90 0.30. Bars: p10–p90 faint, p25–p75 solid, tick at the median.],
   "how-cells-move",
 )
 
@@ -983,7 +1047,7 @@ to reach the same level, failed to do so. It ends up delivering 60ms constant st
 
 #thesisfig(
   "e2-arms",
-  [ What the three lit groups achieved. A cell's ceiling in panel (b) is the 95th percentile of its own CNR over the run — what it actually reached, under whatever light it was given. The resting lines are the dark arm, which never received any light. Panel (a) shows the median cell of each rung against the one reference all eight fields were given, with the interquartile band on the per-cell arm.],
+  [ What the three lit groups achieved. A cell's ceiling in panel (b) is the 95th percentile of its own CNR over the run, which is what it actually reached under whatever light it was given. The resting lines are the dark arm, which never received any light. Panel (a) shows the median cell of each rung against the one reference all eight fields were given, with the interquartile band on the per-cell arm.],
   "e2-arms",
 )
 
@@ -1004,7 +1068,7 @@ block of a single run.
 
 #thesisfig(
   "feedback-ladder-alt2",
-  [],
+  [(a) Every scored cell placed on tracking error, jittered within its rung; open rings are field medians and the black bar is the rung's median of those. Thin lines join the two halves of one dish, which is the paired 1a against 1b contrast. (b) What each rung spent to get there, against the 60 ms arm 2 was set to from v23's closed-loop means. The closed-loop rungs spent roughly twice that, so the step from rung 2 to rung 1 is not at a matched dose.],
   "feedback-ladder",
 )
 
@@ -1049,8 +1113,6 @@ strong stimulation; these rows sit at the top of each arm in
 @freewindow-heatmap-by-demand. At the other there is medium stimulation up to that same
 seven-minute mark and then nothing at all. Every intermediate between them is occupied,
 and no edge separates one from the other.
-
-#todo[mention free window size -> error drop, not significant ]
 
 The extremes are also rare. Along this axis the density has a single peak near the middle
 in every arm, with several times as many windows near the centre as in either tail. What
@@ -1119,10 +1181,14 @@ and an objective function.
 Using data from previous experiments, we trained a predictive model of CNR and then used it
 for closed-loop predictions, and steering individual cells with the help of a controller in real time.
 
+Offline the model is scored against experiments done before it existed;
+in a live run it is scored against the consequences of its own earlier decisions.
+No held-out set stands in for that, which is why the evaluation had to be made again on the live experiment.
+
 // choice of an objective, pattern geometry
 During our experiments, choice of an objective was an arbitrary, experiment-wide static decision. 
 This helps with evaluation of multiple cells against a single target,
-but is not the best possible fit to the problem
+but is not the best possible fit to the problem.
 Within a population, there is a bigger dispersion of resting CNR values,
 than an average cell is capable of moving (@reachability-runs). Because of this, a static, population-wide pattern will
 always have a proportion of the population over the demanded state, and some that is incapable of reaching it.
@@ -1152,80 +1218,100 @@ to stimulate early, then stop and let the CNR fall into the desired state.
 
 Increasing the duration of unscored window before the main objective changes the distribution of behaviors picked - 
 widening the cases at the edges of the continuum (mentioned above) at the expense of the 
-'constant stimulation' case that lives inbetween them. 
+'constant stimulation' case that lives in between them. 
 The constant stimulation strategy is more prevalent in
 cases with no free window, perhaps because it does not allow the cells to fall into their own baseline, but 
 instead commands them to hold an 'estimated baseline', leading some cells to need to be stimulated.
 @history-swap shows how taking cells with matching CNR but swapping their histories has a severe negative influence
 on their predictions, highlighting the importance of the historical embedding. Picking different behaviors for 
-stimulation is how this effect transfers to the control task, making the stimulation type a readout of the 
+stimulation is how this effect transfers to the control task, making the stimulation type a marker of the 
 individuality of the cell. 
+The diversity we observe is ordered along a single axis, but this describes what the controller was
+asked to express rather than how many parameters underlie its choice. A second axis would go unseen
+here if no objective we posed called on it, or if the stimulation ladder were too coarse to resolve it.
 The avenue of finding model's representation of the cell state would benefit from further analysis. 
-Current evidence of continuum of response suggests a single discriminating parameter responsible for 
-the diversity, but a difference in  experimental setup and objective function might paint a more 
-complex picture.   
 Another angle of approach could be an analysis of model's embeddings, and whether they can be used to classify
 the response actually picked by the controller reliably. 
+
+// Population, dose
+Dosing cells individually was tested against dosing them together, paired inside each field so
+that whatever the field shares (medium, focus, crowding, drift) falls out of the comparison.
+Per-cell planning tracked the demand more closely, and spent less light doing so.
+Winning on less light is what gives the comparison its force. The broader ordering across arms,
+in which tracking improves monotonically with how much feedback an arm was given,
+cannot be read the same way: those arms also received more light, and the run has no means of saying
+which of the two produced the ordering. This one does.
+The advantage was not unanimous across fields, and since the pairing is at the level of the field rather than the cell,
+it is more fields and not more cells that would settle the matter; we report a direction rather than a result.
+It is nonetheless the point at which the individuality the model reads out of a cell's past is allowed
+to change what that cell receives, and the cells finish closer to what was asked of them.
+
+A single block of that run admits a sharper reading, being the only one whose demand the cells could 
+actually reach.
+Across that hour the population median of the constant arm sat closer to the demand than the median under closed-loop control,
+while its individual cells sat further away. This is the situation the introduction gives as the reason
+for working at single-cell resolution, and it is the one place here where it was observed rather than assumed:
+a summary statistic can be driven onto a target by a controller that is moving cells away from it,
+and the summary cannot report the difference.
 
 // Sensitivity drift
 Over the course of the experiment we noticed a gradual shift in quality of the tracking (@sensitivity-decline),
 as well as the amount of light energy used. 
 Its cause is unknown, with probable candidates being transcriptional feedback, receptor internalization 
 and pathway desensitization. 
-The conroller learns to deal with the decrease in sensitivity by increasing light budget in a reactive manner,
+Two features of the decline sit awkwardly together: it follows elapsed time rather than the number of
+stimulation cycles delivered, yet its size follows delivered power rather than the shape of the pattern.
+Both are consistent with a single process accumulating with total exposure, since at fixed cadence dose
+and elapsed time run together and our protocols cannot separate them. They are equally consistent with
+two processes superimposed - one stimulation-independent and tied to the duration of the run, one
+dose-dependent - and we cannot distinguish these possibilities with the current runs. The arm that
+received no stimulation light bears on this directly, though as run it reports only resting state.
+The controller learns to deal with the decrease in sensitivity by increasing light budget in a reactive manner,
 while adapting the running encoder by integrating the newly inflated stimulations. 
+The objection we raised against mechanistic fits - that they cannot follow a cell whose response changes
+over the course of a run without being refitted - applies to the model used here as well. It applies for
+a different reason. Nothing commits a learned model to fixed parameters, but nothing in the inputs we
+gave ours represents elapsed time, so it has no variable in which a drifting response could be expressed.
+The failure is in the feature set rather than in the model class, and unlike a refit it is repairable
+from within.
 An example way to integrate such pathway-level phenomena in future work would be to wire it at the level of the
 model architecture, for example as an explicit time axis between observations. Such operation would not only
 increase awareness of drift, but also could serve as a way to encode external events relevant to the 
 internal state of the cell (time of starvation, etc), and could aid in disentangling time-based phenomena from
 stimulation-driven ones.
+The same omission appears one level up, in the controller. Its cost prices the light it spends but not
+what spending it does to the cell's willingness to respond later, so sensitivity is absent from the state
+the planner reasons over just as time is absent from the model's inputs. Should recovery prove to exist
+on a measurable timescale, this becomes actionable rather than merely diagnosable: responsiveness could
+be carried as a depleting and regenerating resource, and the loop could hold cells dark for a period in
+order to restore the authority it needs for a later demand. The behaviour in the unscored window shows
+the planner already trading present error against future reachability when it is given the room; drift
+would give it the same trade over hours instead of minutes.
 Future work should also consider measuring not only the drift but also recovery, and how it affects 
-contrallability metrics. 
-
-
-
-
-
-// - Sensitivity decline explanation;
-// 	- photobleaching
-// 	- transcriptional feedback
-// 	- receptor internalization
-// Fields of view with no light - do they have different characteristics? 
-
-
-== Interpreting the sensitivity drift
-
-#todo[the candidate readings: receptor internalisation and downregulation;
-photobleaching or phototoxicity of the construct; medium exhaustion over a
-12 h starved run; adaptation in the pathway itself. fig-decline bears on
-which of these can be told apart with the data in hand, and which cannot.]
-
-== Impact of resting CNR states on rigid objectives
-
-Objective during the current experiments was pre-set. During some experiments,
-the baseline starting CNR level varies to the point, where #todo[Difficulty with designing and conducting good experiments because of a varying pre-stimulation baseline CNR.]
+controllability metrics. 
+A dark arm carried through a future run should end with a probe pulse. As run, such an arm reports only
+whether the resting state holds; one stimulation at the end would make it report whether sensitivity
+does, and that single frame is what separates a decline driven by the run's duration from one driven by
+the light we spend. 
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  FUTURE WORK
+//  FUTURE WORK; (Now folded into the discussion.) 
 // ═════════════════════════════════════════════════════════════════════════════
 
-= Future work
-
-
-- Make time an explicit axis in the model, either in the conditioning or as a
-  feature (`time_since_last_measurement`). This makes it possible to learn
-  multiple timescales, and may do better on long-range effects such as receptor
-  internalisation or transcriptional feedback.
-- Extend into the spatial dimension, possibly with a hierarchical model.
-- Use the model to help fit a hybrid approach — a neural ODE, a
-  physics-informed network, or similar.
-- Use it to quantify the controllability of systems of this kind, and to ask
-  whether the control drift itself can be influenced.
-
-```
-In order to lower the data requirements and to improve the prediction accuracy and thus the
-control performance, incoming sensor data are used to update the RNN online. 
-```
+// - Make time an explicit axis in the model, either in the conditioning or as a
+//   feature (`time_since_last_measurement`). This makes it possible to learn
+//   multiple timescales, and may do better on long-range effects such as receptor
+//   internalisation or transcriptional feedback.
+// - Extend into the spatial dimension, possibly with a hierarchical model.
+// - Use the model to help fit a hybrid approach — a neural ODE, a
+//   physics-informed network, or similar.
+// - Use it to quantify the controllability of systems of this kind, and to ask
+//   whether the control drift itself can be influenced.
+// 
+// ```
+// In order to lower the data requirements and to improve the prediction accuracy and thus the
+// control performance, incoming sensor data are used to update the RNN online. 
+// ```
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  APPENDIX
@@ -1244,10 +1330,32 @@ control performance, incoming sensor data are used to update the RNN online.
   "fig-loss-curves",
 )
 
-== Light dose calculation
+== Light dose calculation <light-dose-calculation>
 
-#todo[the energy emitted by a light pulse — the outline flags this as possibly
-belonging in the appendix rather than in the methods]
+Two microscopes contributed to the training corpus, and they do not deliver the same light
+at the same nominal setting, so commanded exposures had to be converted into a physical
+dose before the two could be pooled. Each setup carries a bench calibration: a table of LED
+power settings, from 0 to 100%, against the optical power at the sample and the
+corresponding irradiance. A commanded power is converted by piecewise-linear interpolation
+into that table, and the irradiance is multiplied by the exposure duration to give the
+radiant exposure delivered by a single pulse,
+
+$ "fluence" ["mJ/cm"^2] = "irradiance" ["mW/cm"^2] times "exposure" ["ms"] times 10^(-3) $
+
+which is the quantity the model consumes and commands, and is referred to throughout as
+fluence. Both curves convert optical power to irradiance through the same illuminated
+area, 0.006362 cm#super[2], taken as a 900 µm diameter field, and it is that shared
+constant that puts the two setups on a single dose axis.
+
+Two power figures are quoted for each setting and they are not interchangeable. The values
+given in the microscopy section are the output of the light engine before the neutral
+density filter in the illumination path; the calibration table from which fluence is
+computed is the attenuated measurement, which is what reached the cells. On the training
+setup at 10% these differ by roughly sevenfold, about 340 µW against the 49.9 µW the table
+records. Every fluence value in the corpus is computed from the attenuated column. The
+curves carry no time dimension: they are assumed stable per instrument, and no correction
+for lamp ageing is applied.
+
 
 == Additional figures
 

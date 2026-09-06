@@ -724,7 +724,9 @@ def _(
         ax.text(0.97, 0.94,
                 f"p10  {np.quantile(s, 0.10):.2f}\nmedian  {np.median(s):.2f}\n"
                 f"p90  {np.quantile(s, 0.90):.2f}",
-                transform=ax.transAxes, ha="right", va="top", fontsize=7.5, color=INK)
+                transform=ax.transAxes, ha="right", va="top", fontsize=7.5, color=INK,
+                zorder=6, bbox=dict(boxstyle="round,pad=0.28", fc="white", ec="none",
+                                    alpha=0.88))
         # Anchored to the shaded band but written out over the empty right-hand tail,
         # where nothing is drawn.
         ax.annotate(f"{het_nonresp_frac:.0%} within\n10% of baseline",
@@ -738,16 +740,19 @@ def _(
         ax.set_title("b  Spread of response", loc="left", fontweight="bold")
         ax.yaxis.grid(True, color=GRID, lw=0.6)
         ax.set_axisbelow(True)
+        # The p90 line is vertical and full height, so no placement avoids it; the
+        # two grey blocks sit on a white plate instead and the line passes behind.
+        _plate = dict(boxstyle="round,pad=0.28", fc="white", ec="none", alpha=0.88)
         ax.text(0.98, 0.80, f"{(s > hi_x).mean():.1%} above {hi_x:g}, not shown",
                 transform=ax.transAxes, ha="right", va="top",
-                fontsize=6.5, color=MUTED)
+                fontsize=6.5, color=MUTED, zorder=6, bbox=_plate)
         # Pooling across fields folds in the dose sweep. The dose-controlled
         # spread is what the cell-to-cell claim actually rests on.
         ax.text(0.98, 0.68,
                 f"p90−p10 = {het_pooled_spread:.2f} pooled,\n"
                 f"{het_within_spread:.2f} within one field",
                 transform=ax.transAxes, ha="right", va="top",
-                fontsize=6.5, color=MUTED, linespacing=1.6)
+                fontsize=6.5, color=MUTED, linespacing=1.6, zorder=6, bbox=_plate)
 
 
     fig_heterogeneity = plt.figure(figsize=(W_TEXT, 4.4))
@@ -757,6 +762,625 @@ def _(
     _panel_het_distribution(fig_heterogeneity.add_subplot(_gs7[0, 1]))
     save_fig(fig_heterogeneity, "heterogeneity")
     fig_heterogeneity
+    return
+
+
+@app.cell(hide_code=True)
+def _(INK, MUTED, SERIES, W_TEXT, np, plt, save_fig):
+
+    # --- The predictive model, as built -------------------------------------------
+    # Drawn from the checkpoint the live runs actually loaded
+    # (enc_e_area_lean_2026-08-07_02.05.26), not from the model docstring, which is
+    # stale on both the channel list and the cnr mode.
+    #   5 input channels  [cnr, u_t, n_cells_200px, optortk_expr, nuc_area]
+    #   encoder   LSTM 2 x 64, packed over the whole variable-length past
+    #   decoder   a SEPARATE LSTM 2 x 64, initialised from (h, c), stepped 30 times
+    #   FiLM      film="output", film_cond="fluence": gamma*h + beta on the decoder out
+    #   trunk     3 x (Linear 64, GELU), and the dose is concatenated again at its input
+    #   head      MDN, K = 3  ->  (pi, mu, sigma)
+    #   115,559 parameters, horizon 30 frames = 30 min
+    #
+    # Dropout (0.1) and the learned per-step log-sigma bias ARE in the model and are
+    # deliberately not drawn: both are training-time detail and neither changes the
+    # shape of the computation.
+    #
+    # Both panels use inch coordinates with equal aspect, so a rounded corner is
+    # round and a gap of 0.3 is 0.3 in on the page.
+    from matplotlib.patches import FancyBboxPatch
+
+    _MOD = SERIES[0]      # learned module
+    _LIT = SERIES[1]      # commanded light
+    _OUT = SERIES[2]      # prediction
+    # Fills are near-neutral: the stroke and the label carry the colour, so the page
+    # stays quiet and the figure survives being printed in greyscale.
+    _MODF = "#eaedf3"     # learned module, a cool paper
+    _LITF = "#f4ece5"     # light, a warm paper
+    _PAPR = "#f1f0ec"     # data blocks (the past, the forecast)
+
+
+    def _bx(ax, x0, x1, y0, y1, ec, fc, r=0.06, lw=1.15, z=3):
+        ax.add_patch(FancyBboxPatch(
+            (x0, y0), x1 - x0, y1 - y0,
+            boxstyle=f"round,pad=0,rounding_size={r}",
+            linewidth=lw, edgecolor=ec, facecolor=fc, zorder=z))
+
+
+    def _ar(ax, p0, p1, color=INK, ls="-", rad=0.0, lw=1.05, z=5, style="-|>"):
+        ax.annotate("", xy=p1, xytext=p0, zorder=z, arrowprops=dict(
+            arrowstyle=style, color=color, lw=lw, linestyle=ls,
+            shrinkA=0, shrinkB=0, mutation_scale=9,
+            connectionstyle=f"arc3,rad={rad}"))
+
+
+    fig_arch = plt.figure(figsize=(W_TEXT, 5.00))
+    _gsa = fig_arch.add_gridspec(2, 1, height_ratios=[2.52, 2.31],
+                                 left=0.005, right=0.995, top=0.99, bottom=0.01,
+                                 hspace=0.01)
+
+    # =============================================================== panel a ======
+    _axa = fig_arch.add_subplot(_gsa[0])
+    _axa.set_xlim(0, 6.20); _axa.set_ylim(0, 2.50)
+    _axa.set_aspect("equal"); _axa.axis("off")
+
+    _CY0, _CY1 = 1.30, 1.90
+    _CYM = (_CY0 + _CY1) / 2
+
+    # -- input channels
+    _CH = ["cnr", "$u_t$  light", "n_cells_200px", "optortk_expr", "nuc_area"]
+    _sx0, _sx1 = 0.02, 0.94
+    for _i, _nm in enumerate(_CH):
+        _y = _CY1 - 0.12 * (_i + 1)
+        _bx(_axa, _sx0, _sx1, _y, _y + 0.105, MUTED,
+            _LITF if _i == 1 else _PAPR, r=0.018, lw=0.7)
+        _axa.text((_sx0 + _sx1) / 2, _y + 0.052, _nm, ha="center", va="center",
+                  fontsize=5.4, color=_LIT if _i == 1 else INK, zorder=6)
+    _axa.text((_sx0 + _sx1) / 2, _CY0 - 0.09, "every past frame,\nfive channels",
+              ha="center", va="top", fontsize=6.0, color=MUTED, linespacing=1.35)
+
+    # -- encoder / decoder / trunk / head
+    _BOXES = [("encoder", 1.22, 2.10, "LSTM\n2 x 64"),
+              ("decoder", 2.52, 3.40, "LSTM\n2 x 64"),
+              ("trunk",   4.32, 5.06, "MLP\n3 x 64, GELU"),
+              ("head",    5.32, 6.18, "mixture of\n3 Gaussians")]
+    for _nm, _x0, _x1, _sub in _BOXES:
+        _bx(_axa, _x0, _x1, _CY0, _CY1, _MOD, _MODF)
+        _axa.text((_x0 + _x1) / 2, _CYM + 0.155, _nm, ha="center", va="center",
+                  fontsize=7.6, fontweight="bold", color=_MOD, zorder=6)
+        _axa.text((_x0 + _x1) / 2, _CYM - 0.115, _sub, ha="center", va="center",
+                  fontsize=6.0, color=INK, linespacing=1.3, zorder=6)
+
+    # -- FiLM, small, sitting on the decoder -> trunk arrow
+    _fx0, _fx1 = 3.60, 4.04
+    _bx(_axa, _fx0, _fx1, _CYM - 0.17, _CYM + 0.17, _LIT, _LITF, r=0.05, lw=1.0)
+    _axa.text((_fx0 + _fx1) / 2, _CYM, "FiLM\n$\\gamma h + \\beta$", ha="center",
+              va="center", fontsize=5.9, color=_LIT, linespacing=1.3, zorder=6)
+
+    # -- chain arrows
+    _ar(_axa, (_sx1, _CYM), (1.22, _CYM))
+    _ar(_axa, (2.10, _CYM), (2.52, _CYM))
+    _axa.text(2.31, _CYM + 0.07, "$(h, c)$", ha="center", va="bottom",
+              fontsize=6.2, color=INK)
+    _ar(_axa, (3.40, _CYM), (_fx0, _CYM))
+    _ar(_axa, (_fx1, _CYM), (4.16, _CYM))
+    _ar(_axa, (4.26, _CYM), (4.32, _CYM))
+    _ar(_axa, (5.06, _CYM), (5.32, _CYM))
+    _axa.plot([4.19], [_CYM], "o", ms=5.6, mfc="white", mec=_LIT, mew=1.1, zorder=6)
+    #_axa.text(4.21, _CYM, "+", ha="center", va="center", fontsize=6.2,
+    _axa.text(4.19, _CYM, "+", ha="center", va="center", fontsize=6.2,
+              color=_LIT, zorder=7)
+
+    # -- the commanded light, and the three places it enters
+    _lx0, _lx1, _ly0, _ly1 = 2.62, 4.44, 0.50, 0.87
+    _bx(_axa, _lx0, _lx1, _ly0, _ly1, _LIT, _LITF, r=0.05, lw=1.1)
+    _axa.text((_lx0 + _lx1) / 2, (_ly0 + _ly1) / 2, "commanded light $u_{t+k}$",
+              ha="center", va="center", fontsize=6.4, color=_LIT, zorder=6)
+    _axa.text((_lx0 + _lx1) / 2, _ly0 - 0.09,
+              "known ahead of time: it is the plan being scored",
+              ha="center", va="top", fontsize=5.9, color=MUTED, style="italic")
+    _ar(_axa, (2.96, _ly1), (2.96, _CY0), color=_LIT)
+    _ar(_axa, (3.82, _ly1), (3.82, _CYM - 0.17), color=_LIT)
+    _ar(_axa, (4.19, _ly1), (4.19, _CYM - 0.10), color=_LIT)
+
+    # -- fed-back prediction, routed above the chain
+    _ar(_axa, (5.75, _CY1), (2.96, _CY1), color=_OUT, ls=(0, (3, 2)), rad=0.28, lw=1.0)
+    _axa.text(4.36, 2.47,
+              "the point prediction $\\sum \\pi \\mu$ becomes the next step's CNR input",
+              ha="center", va="top", fontsize=6.0, color=_OUT)
+
+    # -- the head's output, as a density
+    _dx0, _dx1, _dy0, _dy1 = 5.36, 6.10, 0.50, 0.99
+    _g = np.linspace(-3.1, 3.1, 200)
+    _comp = [(0.50, -0.75, 0.62), (0.32, 0.55, 0.48), (0.18, 1.75, 0.75)]
+    _mix = np.zeros_like(_g)
+    for _w, _m, _s in _comp:
+        _c = _w * np.exp(-0.5 * ((_g - _m) / _s) ** 2) / _s
+        _mix += _c
+        _axa.plot(_dx0 + (_g + 3.1) / 6.2 * (_dx1 - _dx0),
+                  _dy0 + _c / 1.05 * (_dy1 - _dy0), lw=0.7, color=MUTED, zorder=5)
+    _axa.plot(_dx0 + (_g + 3.1) / 6.2 * (_dx1 - _dx0),
+              _dy0 + _mix / 1.05 * (_dy1 - _dy0), lw=1.4, color=_OUT, zorder=6)
+    _axa.plot([_dx0, _dx1], [_dy0, _dy0], lw=0.7, color=MUTED, zorder=4)
+    _ar(_axa, (5.75, _CY0), (5.75, _dy1 + 0.05), color=_OUT)
+    _axa.text((_dx0 + _dx1) / 2, _dy0 - 0.09,
+              "$(\\pi, \\mu, \\sigma)$ for each\nof three components",
+              ha="center", va="top", fontsize=5.9, color=INK, linespacing=1.35)
+
+    _axa.text(0.0, 2.48, "a  One step of the model", ha="left", va="top",
+              fontsize=9, fontweight="bold", color=INK)
+
+    # =============================================================== panel b ======
+    _axb = fig_arch.add_subplot(_gsa[1])
+    _axb.set_xlim(0, 6.20); _axb.set_ylim(0, 2.31)
+    _axb.set_aspect("equal"); _axb.axis("off")
+
+    # -- the past
+    _px0, _px1, _py0, _py1 = 0.02, 1.12, 0.95, 1.62
+    _bx(_axb, _px0, _px1, _py0, _py1, MUTED, _PAPR, r=0.05, lw=0.9)
+    _tt = np.linspace(0, 1, 120)
+    _wig = 0.5 + 0.30 * np.sin(2 * np.pi * 1.6 * _tt) * np.exp(-0.6 * (1 - _tt)) \
+           + 0.10 * np.sin(2 * np.pi * 4.3 * _tt)
+    _wig = (_wig - _wig.min()) / np.ptp(_wig)          # keep it inside the box
+    _axb.plot(_px0 + 0.07 + _tt * (_px1 - _px0 - 0.14),
+              _py0 + 0.32 + _wig * 0.26, lw=0.9, color=INK, zorder=5)
+    for _s in np.linspace(0.08, 0.92, 11):
+        _h = 0.15 * (0.35 + 0.65 * abs(np.sin(9 * _s)))
+        _axb.plot([_px0 + 0.07 + _s * (_px1 - _px0 - 0.14)] * 2,
+                  [_py0 + 0.06, _py0 + 0.06 + _h], lw=1.2, color=_LIT, zorder=5)
+    _axb.text((_px0 + _px1) / 2, _py1 + 0.06, "encoder", ha="center", va="bottom",
+              fontsize=7.0, fontweight="bold", color=_MOD)
+    _axb.text((_px0 + _px1) / 2, _py0 - 0.07, "every past frame, one pass",
+              ha="center", va="top", fontsize=5.9, color=MUTED)
+
+    _ar(_axb, (_px1, 1.25), (1.30, 1.25))
+
+    # -- the unrolled decoder
+    _SX = [1.30, 1.98, 2.66, 3.62]
+    _SLAB = ["$t{+}1$", "$t{+}2$", "$t{+}3$", "$t{+}30$"]
+    _SW, _SY0, _SY1 = 0.56, 1.02, 1.48
+    _SIG = [0.13, 0.17, 0.20, 0.31]
+    _BASE = 0.62
+    for _i, _x in enumerate(_SX):
+        _cx = _x + _SW / 2
+        _bx(_axb, _x, _x + _SW, _SY0, _SY1, _MOD, _MODF, r=0.05, lw=1.1)
+        _axb.text(_cx, (_SY0 + _SY1) / 2 + 0.08, "decoder", ha="center",
+                  va="center", fontsize=5.8, fontweight="bold", color=_MOD, zorder=6)
+        _axb.text(_cx, (_SY0 + _SY1) / 2 - 0.085, _SLAB[_i], ha="center",
+                  va="center", fontsize=6.2, color=INK, zorder=6)
+        _bh = 0.09 + 0.19 * [0.9, 0.45, 0.7, 0.2][_i]
+        _axb.add_patch(plt.Rectangle((_cx - 0.07, 1.68), 0.14, _bh,
+                                     fc=_LIT, ec="none", zorder=5))
+        _ar(_axb, (_cx, 1.66), (_cx, _SY1), color=_LIT)
+        _axb.plot([_cx] * 2, [_BASE - _SIG[_i], _BASE + _SIG[_i]], lw=1.5,
+                  color=_OUT, zorder=5, solid_capstyle="round")
+        _axb.plot([_cx], [_BASE], "o", ms=3.4, color=_OUT, zorder=6)
+        _ar(_axb, (_cx, _SY0), (_cx, _BASE + _SIG[_i] + 0.04), color=_OUT, lw=0.9)
+        if _i < len(_SX) - 1:
+            _ar(_axb, (_cx + 0.06, _BASE + 0.04), (_SX[_i + 1] - 0.02, _SY0 + 0.12),
+                color=_OUT, ls=(0, (2.6, 1.8)), rad=-0.36, lw=0.9)
+        if _i < len(_SX) - 2:
+            _ar(_axb, (_x + _SW, (_SY0 + _SY1) / 2), (_SX[_i + 1], (_SY0 + _SY1) / 2))
+    _axb.text((_SX[2] + _SW + _SX[3]) / 2, (_SY0 + _SY1) / 2, ". . .", ha="center",
+              va="center", fontsize=9, color=MUTED, zorder=7)
+
+    # -- row labels, tucked to the left of the first step
+    _axb.text(1.24, 1.86, "commanded\nlight", ha="right", va="center",
+              fontsize=6.0, color=_LIT, linespacing=1.35)
+    _axb.text(1.24, _BASE, "predicted CNR\nand its spread", ha="right", va="center",
+              fontsize=6.0, color=_OUT, linespacing=1.35)
+
+    # -- horizon bracket
+    _axb.annotate("", xy=(_SX[0], 0.12), xytext=(_SX[-1] + _SW, 0.12),
+                  arrowprops=dict(arrowstyle="|-|", color=MUTED, lw=0.8,
+                                  mutation_scale=3, shrinkA=0, shrinkB=0))
+    _axb.text((_SX[0] + _SX[-1] + _SW) / 2, 0.16, "30 steps, one minute apart",
+              ha="center", va="bottom", fontsize=6.0, color=MUTED)
+
+    # -- what the 30 steps add up to
+    _ar(_axb, (_SX[-1] + _SW, 1.25), (4.55, 1.25))
+    _qx0, _qx1, _qy0, _qy1 = 4.55, 6.18, 0.62, 1.62
+    _bx(_axb, _qx0, _qx1, _qy0, _qy1, MUTED, _PAPR, r=0.05, lw=0.9)
+    _ft = np.linspace(0, 1, 121)
+    _fmu = 0.20 + 0.62 * (1 - np.exp(-3.1 * _ft)) + 0.035 * np.sin(2 * np.pi * 2.1 * _ft)
+    _fsd = 0.045 + 0.175 * _ft
+    _fx = _qx0 + 0.09 + _ft * (_qx1 - _qx0 - 0.18)
+    _fy0i, _fh = _qy0 + 0.30, 0.60
+    _axb.fill_between(_fx, _fy0i + (_fmu - _fsd) * _fh, _fy0i + (_fmu + _fsd) * _fh,
+                      color=_OUT, alpha=0.20, lw=0, zorder=4)
+    _axb.plot(_fx, _fy0i + _fmu * _fh, lw=1.3, color=_OUT, zorder=5)
+    for _j, _s in enumerate(np.linspace(0.02, 0.98, 15)):
+        _h = 0.15 * [0.9, 0.6, 0.8, 0.3, 0.7, 0.5, 0.9, 0.2, 0.6, 0.4,
+                     0.7, 0.3, 0.5, 0.2, 0.4][_j]
+        _axb.plot([_qx0 + 0.09 + _s * (_qx1 - _qx0 - 0.18)] * 2,
+                  [_qy0 + 0.06, _qy0 + 0.06 + _h], lw=1.2, color=_LIT, zorder=5)
+    _axb.text((_qx0 + _qx1) / 2, _qy1 + 0.06, "forecast", ha="center", va="bottom",
+              fontsize=7.0, fontweight="bold", color=_OUT)
+    _axb.text((_qx0 + _qx1) / 2, _qy0 - 0.07,
+              "the 30 steps assembled:\nwhat this plan is predicted to do",
+              ha="center", va="top", fontsize=5.9, color=MUTED, linespacing=1.35)
+
+    _axb.text(0.0, 2.29, "b  Rolled out over the horizon", ha="left", va="top",
+              fontsize=9, fontweight="bold", color=INK)
+
+    save_fig(fig_arch, "model-schematic")
+    fig_arch
+
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    **The predictive model.** Panel (a) is one step of the computation. The encoder reads
+    every past frame of one cell on five channels and hands the decoder its hidden and cell
+    state; the decoder is a separate LSTM whose per-step input is just two numbers, the CNR
+    fed back from the previous step and the light commanded for this one. The commanded light
+    enters three times: as a decoder input, as the FiLM conditioning that scales and shifts
+    the decoder output, and again concatenated at the trunk input, so the dose can act on the
+    prediction without having to survive in the recurrent state. The head returns a mixture of
+    three Gaussians rather than a point, which is what makes the plan cost able to price
+    uncertainty. Panel (b) unrolls the same decoder over the 30-frame horizon. The light row
+    is the candidate plan being scored, known ahead of time because it is what the controller
+    is choosing; the prediction row widens because each step is conditioned on the previous
+    step's predicted CNR rather than on a measurement. The block on the right is those
+    thirty steps assembled, which is the object the plan cost is evaluated on.
+
+    Sizes are those of the checkpoint every live run in this thesis loaded
+    (`enc_e_area_lean_2026-08-07_02.05.26`): 115,559 parameters, hidden width 64, two layers
+    in each LSTM, three trunk layers, three mixture components, horizon 30 frames at one
+    frame per minute. Dropout and the learned per-step variance offset are part of the model
+    and are left out of the drawing: both are training-time detail and neither changes the
+    shape of the computation. The panels are schematic; the traces inside the encoder and
+    forecast blocks are not data.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(Path, materials_path, np, pl):
+
+    # --- Inside the controller: the cross-entropy search ---------------------------
+    # NOT a sketch. This runs the real checkpoint the live experiments loaded
+    # (enc_e_area_lean_2026-08-07_02.05.26) and the real CEM from
+    # optoerk.serving.control.CEMController, on one real cell of v21, and plots what
+    # the search actually did. Everything below matches the E2/v21 policy:
+    #   ladder [0, 20, 45, 85, 150, 300] ms   horizon 30   n_samples 512
+    #   the 6 constant-dose plans are ALWAYS evaluated too, so 518 plans per pass
+    #   elite_frac 0.125 -> the cheapest 64   smoothing 0.1   lambda_dose 0.089
+    #   cost = mean_h (pred - r)^2 + lambda_dose * mean_h (dose / 300)
+    # u_t is fluence, and the ladder maps onto it at 0.55 mJ/cm2 per ms, read off the
+    # run's own u_t_in column (20 ms -> 11.00, 300 ms -> 165.00).
+    import torch as _T
+    from optoerk.core.utils import results_write_path as _rwp
+    from optoerk.models.seq2scal_history import (
+        HistoryConfig as _HCfg, Seq2ScalarHistory as _S2S)
+
+    _CKPT = Path(_rwp()) / "enc_e_area_lean_2026-08-07_02.05.26" / "bundle.pt"
+    _bun = _T.load(_CKPT, map_location="cpu", weights_only=False)
+    _cfg = _HCfg.model_validate(_bun["model_config"])
+    CEM_NELITEt = _S2S(_cfg)
+    CEM_NELITEt.load_state_dict(_bun["model_state_dict"])
+    CEM_NELITEt.eval()
+    _MU = np.asarray(_cfg.norm_mean, np.float32)
+    _SD = np.asarray(_cfg.norm_std, np.float32)
+
+    _FPMS, _H, _LN = 0.55, 30, 6
+    CEM_LEV = np.array([0.0, 20.0, 45.0, 85.0, 150.0, 300.0])
+    _NS, _NIT, _EF, _SM, _LAM = 512, 3, 0.125, 0.1, 0.089
+
+    # ---- WHICH CELL. Bump CEM_PICK and re-run to walk the shortlist. -------------
+    CEM_PICK = 0
+    # ------------------------------------------------------------------------------
+    # Built by sweeping v21 and v23, every field, at minutes 90 through 390, over the
+    # cells with at least 60 frames of history, running this exact search on each and
+    # keeping only those where
+    #   * the winning plan is NOT one of the six always-evaluated constant-dose plans,
+    #     otherwise the figure shows a search that discovered nothing;
+    #   * the best plan's cost actually improves from the first pass to the third;
+    #   * the winning plan's predicted trajectory sits on the demand rather than above
+    #     or below it (mean signed error under 0.05 CNR).
+    # What survived is ranked by how far the MEDIAN plan cost falls across the three
+    # passes, which is what the histogram column shows. Cells that need a lot of light
+    # rank badly, and rightly: when the answer is "drive hard" the first pass already
+    # has it and there is nothing for the sampler to find.
+    #
+    #      run  fov  minute  cell        median   best   peak   first step
+    CEM_CANDIDATES = [
+        ("v21", 6, 140, 42),    # drop 62%  best 40%  peak 0.56   20 ms, 4 rungs
+        ("v21", 2, 290, 3),     # drop 60%  best 33%  peak 0.47   20 ms, 5 rungs
+        ("v21", 5, 240, 18),    # drop 54%  best 45%  peak 0.56   20 ms, 5 rungs
+        ("v21", 3, 290, 45),    # drop 54%  best 40%  peak 0.61   20 ms, 4 rungs
+        ("v21", 4, 140, 30),    # drop 55%  best 30%  peak 0.52   20 ms, 4 rungs
+        ("v21", 7, 140, 27),    # drop 55%  best 15%  peak 0.68   20 ms, 5 rungs
+        ("v21", 2, 140, 9),     # drop 56%  best 17%  peak 0.54   45 ms, 4 rungs
+        ("v21", 1, 140, 15),    # drop 54%  best  8%  peak 0.56   45 ms, 6 rungs
+        ("v21", 2, 290, 9),     # drop 54%  best 22%  peak 0.51   20 ms, 4 rungs
+        ("v21", 7, 340, 39),    # drop 61%  best 17%  peak 0.56    0 ms, 5 rungs
+        ("v21", 2, 240, 9),     # drop 57%  best 18%  peak 0.51    0 ms, 5 rungs
+        ("v23", 0, 190, 6),     # drop 56%  best 14%  peak 0.49    0 ms, 5 rungs
+        ("v21", 7, 190, 134),   # drop 55%  best 15%  peak 0.64    0 ms, 5 rungs
+        ("v21", 7, 240, 39),    # drop 53%  best 21%  peak 0.58    0 ms, 5 rungs
+        ("v21", 4, 390, 39),    # drop 53%  best 13%  peak 0.58    0 ms, 4 rungs
+        ("v21", 1, 240, 36),    # drop 53%  best 26%  peak 0.51    0 ms, 5 rungs
+    ]
+    CEM_RUN, CEM_FOV, CEM_T0, CEM_CELL = CEM_CANDIDATES[CEM_PICK]
+
+    _trk = (pl.read_parquet(materials_path(f"tracks_{CEM_RUN}.parquet"))
+              .filter(pl.col("fov") == CEM_FOV).sort(["particle", "timestep"]))
+    _one = _trk.filter(pl.col("particle") == CEM_CELL)
+    _past = _one.filter(pl.col("timestep") <= CEM_T0)
+    _futr = _one.filter((pl.col("timestep") > CEM_T0) & (pl.col("timestep") <= CEM_T0 + _H))
+
+    _cx = np.zeros((_past.height, 5), np.float32)
+    _cx[:, 0] = _past["raw_cnr"].fill_null(float(_MU[0])).to_numpy()
+    _cx[:, 1] = _past["u_t_in"].fill_null(0.0).to_numpy()
+    _cx[:, 2], _cx[:, 3], _cx[:, 4] = _MU[2], _MU[3], _MU[4]   # not in the parquet
+    _cxs = _T.tensor((_cx - _MU) / _SD).unsqueeze(0)
+    with _T.no_grad():
+        _h0, _c0 = CEM_NELITEt.encoder(_cxs, _T.tensor([_past.height]))
+    _fb0 = _cxs[:, -1, 0:1]
+    CEM_REF = _T.tensor(_futr["r_t"].to_numpy(), dtype=_T.float32)
+
+
+    @_T.no_grad()
+    def _roll(h, c, fb, futs):
+        """Decoder-only rollout from a given (h, c); mirrors the serving path."""
+        _dh, _dc, _out = h, c, []
+        for _i in range(futs.shape[1]):
+            _fi = futs[:, _i, :]
+            _o, (_dh, _dc) = CEM_NELITEt.decoder(_T.cat([fb, _fi], -1).unsqueeze(1), (_dh, _dc))
+            _hs = _o[:, -1, :]
+            _g, _b = CEM_NELITEt.film_layer(_fi)                       # film="output"
+            _hs = _g * _hs + _b
+            _pi, _mu, _sg = CEM_NELITEt.head(CEM_NELITEt.trunk(_T.cat([_hs, _fi], -1)),
+                                      sigma_bias=CEM_NELITEt.sigma_step_bias_param[_i])
+            fb = (_pi * _mu).sum(-1, keepdim=True)
+            _out.append(fb)
+        return _T.cat(_out, 1)
+
+
+    _slev = _T.tensor((CEM_LEV * _FPMS - _MU[1]) / _SD[1], dtype=_T.float32)
+    _gen = _T.Generator().manual_seed(7)
+    _probs = _T.full((_H, _LN), 1.0 / _LN)
+    CEM_NELITE = max(2, int(round(_NS * _EF)))
+    CEM = []
+    for _it in range(_NIT):
+        _p_in = _probs.clone().numpy()
+        _idx = _T.multinomial(_probs, _NS, replacement=True, generator=_gen).T
+        _idx = _T.cat([_T.arange(_LN).view(_LN, 1).expand(_LN, _H), _idx], 0)
+        CEM_NPLANS = _idx.shape[0]
+        _pred = _roll(_h0.repeat(1, CEM_NPLANS, 1), _c0.repeat(1, CEM_NPLANS, 1),
+                      _fb0.repeat(CEM_NPLANS, 1), _slev[_idx].unsqueeze(-1)) * _SD[0] + _MU[0]
+        _dose = CEM_LEV[_idx.numpy()]
+        _cost = (((_pred - CEM_REF.unsqueeze(0)) ** 2).mean(-1)
+                 + _LAM * _T.tensor((_dose / 300.0).mean(-1), dtype=_T.float32))
+        _el = _cost.topk(CEM_NELITE, largest=False).indices
+        CEM.append(dict(probs=_p_in, idx=_idx.numpy(), dose=_dose,
+                        pred=_pred.numpy(), cost=_cost.numpy(),
+                        elite=_el.numpy(), best=int(_cost.argmin())))
+        _cnt = _T.zeros(_H, _LN)
+        _cnt.scatter_add_(1, _idx[_el].T, _T.ones(_H, CEM_NELITE))
+        _probs = _cnt / _cnt.sum(1, keepdim=True).clamp(min=1.0)
+        _probs = (1 - _SM) * _probs + _SM / _LN
+
+    (f"pick {CEM_PICK}/{len(CEM_CANDIDATES) - 1} · {CEM_RUN} fov {CEM_FOV} "
+    f"cell {CEM_CELL} at minute {CEM_T0} · {CEM_NPLANS} plans/pass\n\n"
+    + "\n".join(
+        f"pass {_i+1}: peak {_s['probs'].max():.2f} · median cost "
+        f"{np.median(_s['cost']):.4f} · best {_s['cost'].min():.4f} · "
+        f"first step {CEM_LEV[_s['idx'][_s['best'], 0]]:.0f} ms"
+        for _i, _s in enumerate(CEM)))
+
+    return (
+        CEM,
+        CEM_CELL,
+        CEM_FOV,
+        CEM_LEV,
+        CEM_NELITE,
+        CEM_NPLANS,
+        CEM_REF,
+        CEM_T0,
+    )
+
+
+@app.cell(hide_code=True)
+def _(
+    CEM,
+    CEM_LEV,
+    CEM_NELITE,
+    CEM_NPLANS,
+    CEM_REF,
+    INK,
+    MUTED,
+    SERIES,
+    W_TEXT,
+    np,
+    plt,
+    save_fig,
+):
+
+    # --- Drawing the search --------------------------------------------------------
+    # Three rows, one per CEM pass, four columns following one pass left to right.
+    # Every column shares its scale down the three rows, which is what makes the
+    # convergence visible: the distribution darkens, the plans and the predictions
+    # collapse toward one another, the cost histogram slides left.
+    _MODc, _LITc, _OUTc = SERIES[0], SERIES[1], SERIES[2]
+
+    fig_cem = plt.figure(figsize=(W_TEXT, 4.05))
+    _axk = fig_cem.add_subplot(111)
+    _axk.set_position([0.005, 0.010, 0.990, 0.980])
+    _axk.set_xlim(0, 6.20); _axk.set_ylim(0, 3.95)
+    _axk.set_aspect("equal"); _axk.axis("off")
+
+    _COL = [(0.52, 1.74), (2.04, 3.26), (3.56, 4.78), (5.08, 6.18)]
+    _ROW = [(2.90, 3.58), (1.88, 2.56), (0.86, 1.54)]
+    _HEAD = [("the distribution over\nstimulation doses", "6 exposure times x 30 steps"),
+             ("realized stimulation plans", "512 sampled + 6 constant"),
+             ("what the model predicts", "518 rollouts, one batch"),
+             ("how close they are\nto the goal", "squared error + a price on light")]
+
+    # shared scales
+    _vmax = max(float(_s["probs"].max()) for _s in CEM)
+    _pmin = min(float(_s["pred"].min()) for _s in CEM)
+    _pmax = max(float(_s["pred"].max()) for _s in CEM)
+    _chi = float(np.percentile(CEM[0]["cost"], 96))
+    _clo = min(float(_s["cost"].min()) for _s in CEM)
+    _rng2 = np.random.default_rng(11)
+    _SUB = 90
+
+    for _j, ((_x0, _x1), (_ht, _hs)) in enumerate(zip(_COL, _HEAD)):
+        _axk.text((_x0 + _x1) / 2, 3.80, _ht, ha="center", va="bottom",
+                  fontsize=6.4, fontweight="bold", color=INK)
+        _axk.text((_x0 + _x1) / 2, 3.64, _hs, ha="center", va="bottom",
+                  fontsize=5.5, color=MUTED)
+
+    for _i, (_y0, _y1) in enumerate(_ROW):
+        _s = CEM[_i]
+        _hgt = _y1 - _y0
+        _axk.text(0.44, (_y0 + _y1) / 2 + 0.06, f"pass {_i + 1}", ha="right",
+                  va="center", fontsize=6.6, fontweight="bold", color=INK)
+        _axk.text(0.44, (_y0 + _y1) / 2 - 0.08,
+                  ["uniform", "sharpening", "peaked"][_i], ha="right", va="center",
+                  fontsize=5.5, color=MUTED, style="italic")
+
+        # -- 1  the sampling distribution, 6 rungs x 30 steps
+        _a0, _a1 = _COL[0]
+        for _r in range(6):
+            for _t in range(30):
+                _axk.add_patch(plt.Rectangle(
+                    (_a0 + _t * (_a1 - _a0) / 30, _y0 + _r * _hgt / 6),
+                    (_a1 - _a0) / 30, _hgt / 6, fc=_LITc,
+                    alpha=0.04 + 0.86 * _s["probs"][_t, _r] / _vmax,
+                    ec="white", lw=0.2, zorder=4))
+        _axk.text(_a1 - 0.03, _y1 - 0.04, f"max {_s['probs'].max():.2f}",
+                  ha="right", va="top", fontsize=5.0, color=INK, zorder=6,
+                  bbox=dict(boxstyle="round,pad=0.13", fc="white", ec="none", alpha=0.8))
+
+        # -- 2  the plans themselves, as dose staircases on the ladder
+        _b0, _b1 = _COL[1]
+        _pick = _rng2.choice(_s["dose"].shape[0], _SUB, replace=False)
+        _tt = np.arange(31)
+
+        def _dstep(d, lw, alpha, z, _y0=_y0, _hgt=_hgt, _b0=_b0, _b1=_b1, _tt=_tt):
+            _axk.step(_b0 + _tt / 30 * (_b1 - _b0),
+                      _y0 + 0.03 + np.r_[d, d[-1]] / 300 * (_hgt - 0.06),
+                      where="post", lw=lw, color=_LITc, alpha=alpha, zorder=z)
+
+        for _k in _rng2.choice(_s["dose"].shape[0], 4, replace=False):
+            _dstep(_s["dose"][_k], 0.5, 0.40, 4)
+        _dstep(_s["dose"][_s["best"]], 1.3, 1.0, 6)
+
+        # -- 3  what the model says each plan does
+        _c0, _c1 = _COL[2]
+        _tc = _c0 + np.arange(30) / 29 * (_c1 - _c0)
+
+        def _ymap(v, _y0=_y0, _hgt=_hgt):
+            return _y0 + 0.03 + (v - _pmin) / (_pmax - _pmin) * (_hgt - 0.06)
+
+        for _k in _pick:
+            _axk.plot(_tc, _ymap(_s["pred"][_k]), lw=0.35, color=_OUTc,
+                      alpha=0.05, zorder=4)
+        _axk.plot(_tc, _ymap(CEM_REF.numpy()), lw=1.1, color=INK,
+                  ls=(0, (2.4, 1.6)), zorder=6)
+        _axk.plot(_tc, _ymap(_s["pred"][_s["best"]]), lw=0.9, color=_OUTc, zorder=7)
+
+        # -- 4  the cost of every plan, and which eighth survives
+        _d0, _d1 = _COL[3]
+        _thr = float(np.sort(_s["cost"])[CEM_NELITE - 1])
+        _edges = np.linspace(_clo, _chi, 34)
+        _cnt, _ = np.histogram(_s["cost"], bins=_edges)
+        _cmx = _cnt.max()
+        for _k in range(len(_cnt)):
+            if _cnt[_k] == 0:
+                continue
+            _el = _edges[_k + 1] <= _thr
+            _axk.add_patch(plt.Rectangle(
+                (_d0 + (_edges[_k] - _clo) / (_chi - _clo) * (_d1 - _d0), _y0 + 0.03),
+                (_edges[1] - _edges[0]) / (_chi - _clo) * (_d1 - _d0) * 0.92,
+                _cnt[_k] / _cmx * (_hgt - 0.10),
+                fc=_OUTc if _el else MUTED, alpha=0.85 if _el else 0.38,
+                ec="none", zorder=4))
+        _axk.text(_d1 - 0.03, _y1 - 0.04, f"median {np.median(_s['cost']):.3f}",
+                  ha="right", va="top", fontsize=5.0, color=INK, zorder=6)
+
+    # -- axis hints, on the bottom row only
+    _axk.text(_COL[0][0] - 0.03, _ROW[2][1], "300", ha="right", va="center",
+              fontsize=4.8, color=MUTED)
+    _axk.text(_COL[0][0] - 0.03, _ROW[2][0], "0 ms", ha="right", va="center",
+              fontsize=4.8, color=MUTED)
+    for _j, _lab in enumerate(["30 horizon steps", "30 horizon steps",
+                               "30 horizon steps", "cost of a plan"]):
+        _axk.text((_COL[_j][0] + _COL[_j][1]) / 2, _ROW[2][0] - 0.06, _lab,
+                  ha="center", va="top", fontsize=5.0, color=MUTED)
+    _axk.text(_COL[2][0] + 0.04, _ROW[0][1] - 0.04, "dashed: the demand",
+              ha="left", va="top", fontsize=5.0, color=INK, zorder=8,
+              bbox=dict(boxstyle="round,pad=0.13", fc="white", ec="none", alpha=0.8))
+
+    # -- the loop, drawn where it happens: cost back to distribution
+    for _yb in (2.73, 1.71):
+        _axk.annotate("", xy=(0.56, _yb), xytext=(6.14, _yb), zorder=6,
+                      arrowprops=dict(arrowstyle="-|>", color=_MODc, lw=1.0,
+                                      shrinkA=0, shrinkB=0, mutation_scale=9))
+    _axk.text(3.35, 2.77, "pick 64 best, refit the distribution to them, then mix a tenth of uniform back in",
+              ha="center", va="bottom", fontsize=5.8, color=_MODc)
+    _axk.text(3.35, 1.75, "and again", ha="center", va="bottom", fontsize=5.8,
+              color=_MODc)
+
+    # -- what comes out
+    _axk.annotate("", xy=(5.95, 0.50), xytext=(5.95, 0.80), zorder=6,
+                  arrowprops=dict(arrowstyle="-|>", color=_OUTc, lw=1.1,
+                                  shrinkA=0, shrinkB=0, mutation_scale=9))
+    _axk.text(5.98, 0.46,
+              f"the winning plan's first step,\n"
+              f"{CEM_LEV[CEM[-1]['idx'][CEM[-1]['best'], 0]]:.0f} ms, is this cell's dose",
+              ha="right", va="top", fontsize=5.8, color=_OUTc, linespacing=1.4)
+    _axk.text(0.02, 0.46,
+              f"{CEM_NPLANS} plans scored per pass, {3 * CEM_NPLANS:,} rollouts for this cell on this\n"
+              f"frame. Green bars are the cheapest 64, the ones the next distribution is fit to.\n"
+              f"Every cell is searched separately.",
+              ha="left", va="top", fontsize=5.8, color=MUTED, linespacing=1.4)
+
+    save_fig(fig_cem, "mpc-schematic")
+    fig_cem
+
+    return
+
+
+@app.cell(hide_code=True)
+def _(CEM, CEM_CELL, CEM_FOV, CEM_NELITE, CEM_NPLANS, CEM_T0, mo, np):
+    mo.md(rf"""
+    **Inside the controller.** Not a sketch: this is the checkpoint the live experiments
+    loaded, running the serving code's own cross-entropy search on one real cell of v21
+    (field {CEM_FOV}, cell {CEM_CELL}, at minute {CEM_T0}), and the panels are what the search
+    actually did. Rows are the three passes; columns follow one pass from left to right. Every
+    column shares its scale down the three rows, which is what makes the convergence readable.
+
+    The search holds a categorical distribution over the six ladder rungs at each of the
+    thirty horizon steps. It starts uniform, at 1/6 on every rung, so the first heat map is
+    flat. It draws {CEM_NPLANS - 6} plans from it and adds the six constant-dose plans, which
+    are always evaluated so the search can never come out worse than the best constant dose.
+    All {CEM_NPLANS} are rolled through the decoder in one batch and scored against the
+    demand: mean squared error over the thirty steps plus 0.089 times the mean normalised
+    dose. The cheapest {CEM_NELITE}, an eighth of the sample, are the elites; the distribution
+    is refit to their counts with a tenth of uniform mixed back in so no step can collapse
+    onto a single rung. Three passes, {3 * CEM_NPLANS:,} rollouts for this one cell on this
+    one frame, and then only the winning plan's first step is applied.
+
+    The peak of the distribution goes {CEM[0]['probs'].max():.2f} to
+    {CEM[1]['probs'].max():.2f} to {CEM[2]['probs'].max():.2f} and the median plan cost falls
+    {np.median(CEM[0]['cost']):.3f} to {np.median(CEM[2]['cost']):.3f}. The bold plan is worth
+    following across the rows: for the first {sum(_s['best'] < 6 for _s in CEM)} passes nothing
+    the sampler draws beats a constant-dose plan, which is why it sits flat, and only on the
+    last does the search find a varied plan cheaper still, by
+    {100 * (CEM[0]['cost'].min() - CEM[2]['cost'].min()) / CEM[0]['cost'].min():.0f}%. That is
+    the case the six always-evaluated constants exist to guard.
+
+    Two things to read honestly. The cost axis is truncated on the right, so the most
+    expensive plans sit off it. And the three static channels the track parquet does not carry
+    (`n_cells_200px`, `optortk_expr`, `nuc_area`) were fed at their population means, which is
+    what the server does for any channel a payload omits. The cell was chosen from a sweep
+    over fields, frames and cells: among cells below the demand whose winning plan is not one
+    of the constants, this is where the median cost falls furthest.
+    """)
     return
 
 
@@ -6956,9 +7580,8 @@ def _(
     _pb = (_e2b_cell.filter(pl.col("rung") == "1b broadcast").group_by("fov")
            .agg(pl.col("rmse").median()).sort("fov"))
     for _xa, _xb in zip(_pa["rmse"], _pb["rmse"]):
-        # dotted and muted: these say "same dish", they are not a measurement
-        _axe.plot([_xa, _xb], [_y["1a per-cell"], _y["1b broadcast"]],
-                  color=MUTED, lw=0.9, ls=":", alpha=0.65, zorder=4)
+        _axe.plot([_xa, _xb], [_y["1a per-cell"], _y["1b broadcast"]], color=INK,
+                  lw=0.9, alpha=0.55, zorder=4)
 
     _axe.set_yticks(list(_y.values()), [E2A_SHORT[_r] for _r in E2B_ORDER], fontsize=8)
     _axe.tick_params(axis="y", length=0)
@@ -6969,6 +7592,12 @@ def _(
     _axe.set_title("a  Every cell, every rung", loc="left", fontweight="bold", fontsize=9)
     _axe.xaxis.grid(True, color=GRID, lw=0.6)
     _axe.set_axisbelow(True)
+    _axe.text(0.985, 0.06,
+              "small dots: cells · rings: field medians · bar: the rung\n"
+              "thin lines join the two halves of one dish",
+              transform=_axe.transAxes, ha="right", va="bottom", fontsize=6.2,
+              color=MUTED, linespacing=1.5)
+
     # right: what each rung spent to get there
     _axm = fig_e2b.add_subplot(_gb[0, 1], sharey=_axe)
     for _r in E2B_ORDER:
@@ -6984,8 +7613,8 @@ def _(
     _axm.set_title("b  On what light", loc="left", fontweight="bold", fontsize=9)
     _axm.xaxis.grid(True, color=GRID, lw=0.6)
     _axm.set_axisbelow(True)
-    _axm.text(62, len(E2B_ORDER) - 1 + 0.42, "arm 2's setting", fontsize=6,
-              color=MUTED, va="bottom")
+    _axm.text(64, -0.5, "what arm 2\nwas set to", fontsize=6, color=MUTED,
+              va="center", linespacing=1.4)
 
     save_fig(fig_e2b, "feedback-ladder-alt2")
     fig_e2b
