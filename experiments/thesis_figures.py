@@ -2902,7 +2902,6 @@ def _(
     GRID,
     INK,
     MC_REFERENCE,
-    MUTED,
     SERIES,
     W_TEXT,
     mcitrine_by_exp,
@@ -2911,7 +2910,12 @@ def _(
     plt,
     save_fig,
 ):
+    from matplotlib.ticker import FuncFormatter as _FuncFmt, NullFormatter as _NullFmt
+
     MC_Q = np.linspace(0.01, 0.99, 99)
+    # A CDF and a QQ plot both run bottom-left to top-right, so there is no block
+    # of empty space wide enough for a sentence. The mark key and the explanation
+    # therefore live in the caption; only the number stays on the axes.
 
 
     def _panel_median_scaled(ax):
@@ -2932,11 +2936,9 @@ def _(
         ax.set_title("a  Rescaling does not align them", loc="left", fontweight="bold")
         _lo = mcitrine_summary["p90_over_p10"].min()
         _hi = mcitrine_summary["p90_over_p10"].max()
-        ax.text(0.03, 0.99,
-                f"each session \u00f7 its own median\np90/p10 still ranges {_lo:.2f} to {_hi:.2f}",
-                transform=ax.transAxes, va="top", fontsize=7, color=INK)
-        ax.text(0.97, 0.06, f"bold = {MC_REFERENCE} (largest session)",
-                transform=ax.transAxes, ha="right", fontsize=6.5, color=MUTED)
+        ax.text(0.98, 0.42, f"p90/p10\n{_lo:.2f} to {_hi:.2f}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=7,
+                color=INK, zorder=6, linespacing=1.4)
         ax.xaxis.grid(True, color=GRID, lw=0.6)
         ax.set_axisbelow(True)
 
@@ -2962,12 +2964,14 @@ def _(
         ax.set_yscale("log")
         ax.set_xlabel(f"quantiles of {MC_REFERENCE} (mCitrine)")
         ax.set_ylabel("quantiles of each other session,\nmedian-matched")
-        ax.set_title("b  Shape mismatch, session by session", loc="left", fontweight="bold")
-        ax.text(0.03, 0.95,
-                "dashed = perfect agreement after rescaling.\n"
-                "Curves bending away from it cannot be fixed\n"
-                "by any scale factor, in raw units or in log.",
-                transform=ax.transAxes, va="top", fontsize=7, color=INK)
+        ax.set_title("b  Shape mismatch, not scale", loc="left", fontweight="bold")
+        # Default log minor labels collide at 2x/3x/4x; name the decade ticks
+        # explicitly and silence the minors.
+        for _axis in (ax.xaxis, ax.yaxis):
+            _axis.set_major_formatter(_FuncFmt(lambda v, _p: f"{v:,.0f}"))
+            _axis.set_minor_formatter(_NullFmt())
+        ax.set_xticks([1000, 2000, 4000])
+        ax.set_yticks([1000, 2000, 4000])
         ax.grid(True, color=GRID, lw=0.6)
         ax.set_axisbelow(True)
 
@@ -6580,7 +6584,16 @@ def _(materials_path, np, pl):
     # between identical frames that differ only in whether they were scored. v21 has
     # no phase labels, so its blocks are recovered from the 50-min period; v23 labels
     # its run-ups directly.
-    FW_FREE = {0: 0, 7: 0, 2: 4, 5: 4, 1: 10, 6: 10, 3: 20, 4: 20}
+    # THE TWO RUNS DO NOT USE THE SAME WINDOW LENGTHS. The field-to-arm mapping is
+    # identical (arm 1 = fov 0,7; arm 2 = fov 2,5; arm 3 = fov 1,6; arm 4 = fov 3,4),
+    # but v21 (policy_8fov_free_runup_v2) gives 0/4/10/20 free minutes while v23
+    # (policy_8fov_free_window_oscillations_v2, whose segment labels match v23's own
+    # phase_label column) gives 0/8/14/20. Treating both as 0/4/10/20 mislabels v23's
+    # two middle arms, and in particular calls an 8-minute window "4 minutes", which is
+    # the difference between sitting inside the loop's 3-5 min dead time and clearing it.
+    FW_ARM = {0: 1, 7: 1, 2: 2, 5: 2, 1: 3, 6: 3, 3: 4, 4: 4}
+    FW_FREE = {"v21": {1: 0, 2: 4, 3: 10, 4: 20},
+               "v23": {1: 0, 2: 8, 3: 14, 4: 20}}
     FW_W = 20
     FW_RUNS = ["v21", "v23"]
 
@@ -6606,7 +6619,7 @@ def _(materials_path, np, pl):
                     continue
                 _tot = float(_d.sum())
                 _rows.append(dict(
-                    run=run, fov=_fov, particle=_p, block=_bi, free=FW_FREE[_fov],
+                    run=run, fov=_fov, particle=_p, block=_bi, arm=FW_ARM[_fov], free=FW_FREE[run][FW_ARM[_fov]],
                     total=_tot,
                     centroid=float((np.arange(FW_W) * _d).sum() / _tot / (FW_W - 1))
                              if _tot > 0 else float("nan"),
@@ -6648,11 +6661,12 @@ def _(materials_path, np, pl):
 
     f"{fw_win.height:,} windows · {fw_win['cell'].n_unique():,} cells · vectors {fw_vec.shape}"
 
-    return FW_FREE, FW_RUNS, fw_icc, fw_vec, fw_win
+    return FW_ARM, FW_FREE, FW_RUNS, fw_icc, fw_vec, fw_win
 
 
 @app.cell(hide_code=True)
 def _(
+    FW_FREE,
     FW_RUNS,
     GRID,
     MUTED,
@@ -6677,15 +6691,18 @@ def _(
     # and its own windows. Anything above that band is per-cell structure.
     FWA_METRIC = [("total", "how much light"), ("centroid", "when in the window"),
                   ("npulse", "how many pulses")]
-    FWA_FREE = [0, 4, 10, 20]
-    FWA_COL = dict(zip(FWA_FREE, [MUTED, "#a9a7a2", SERIES[2], SERIES[0]]))
+    # Iterate ARMS, not minutes: the arm-to-field mapping is shared between the two
+    # runs but the window lengths are not (v21 0/4/10/20, v23 0/8/14/20), so a fixed
+    # list of minutes silently drops v23's two middle arms.
+    FWA_ARMS = [1, 2, 3, 4]
+    FWA_TICKS = sorted({_f for _d in FW_FREE.values() for _f in _d.values()})
     FWA_BOOT = 80
 
     _fwa_rng = np.random.default_rng(0)
     _fwa = []
     for _run in FW_RUNS:
-        for _f in FWA_FREE:
-            _sub = fw_win.filter((pl.col("run") == _run) & (pl.col("free") == _f))
+        for _a in FWA_ARMS:
+            _sub = fw_win.filter((pl.col("run") == _run) & (pl.col("arm") == _a))
             _cells = _sub["cell"].to_numpy()
             _strata = np.char.add(_sub["fov"].cast(str).to_numpy().astype(str),
                                   _sub["block"].cast(str).to_numpy().astype(str))
@@ -6700,7 +6717,7 @@ def _(
                     _x = fw_icc(_v, _perm)
                     if np.isfinite(_x):
                         _null.append(_x)
-                _fwa.append(dict(run=_run, free=_f, metric=_m,
+                _fwa.append(dict(run=_run, arm=_a, free=FW_FREE[_run][_a], metric=_m,
                                  icc=fw_icc(_v, _cells),
                                  null=float(np.percentile(_null, 95)) if _null else np.nan,
                                  n=_sub.height))
@@ -6713,13 +6730,12 @@ def _(
         _ax = fig_fwa.add_subplot(_gfa[0, _j])
         for _ri, _run in enumerate(FW_RUNS):
             _s = fwa.filter((pl.col("metric") == _m) & (pl.col("run") == _run)).sort("free")
-            _x = np.arange(len(FWA_FREE)) + (_ri - 0.5) * 0.26
-            _ax.plot(_x, _s["icc"], "o-", ms=5, lw=1.2, color=SERIES[_ri],
+            _ax.plot(_s["free"], _s["icc"], "o-", ms=5, lw=1.2, color=SERIES[_ri],
                      label=_run, mfc="white", mew=1.5)
         _nl = fwa.filter(pl.col("metric") == _m)["null"].max()
         _ax.axhspan(0, _nl, color=MUTED, alpha=0.18, lw=0)
-        _ax.set_xticks(range(len(FWA_FREE)), [str(_f) for _f in FWA_FREE], fontsize=7)
-        _ax.set_xlim(-0.5, len(FWA_FREE) - 0.5)
+        _ax.set_xticks(FWA_TICKS, [str(_f) for _f in FWA_TICKS], fontsize=7)
+        _ax.set_xlim(-1.5, 21.5)
         _ax.set_ylim(0, 0.78)
         _ax.set_xlabel("free minutes", fontsize=7.5)
         _ax.set_title(f"{'abc'[_j]}  {_title}", loc="left", fontweight="bold", fontsize=8.5)
@@ -6730,7 +6746,7 @@ def _(
             _ax.set_ylabel("share of the spread that\nbelongs to the cell", fontsize=7.5)
             _ax.legend(frameon=False, fontsize=6.5, loc="upper right",
                        handlelength=1.4, borderaxespad=0.3)
-            _ax.text(len(FWA_FREE) - 0.6, _nl + 0.025,
+            _ax.text(21.0, _nl + 0.025,
                      "what re-dealing the windows already gives",
                      fontsize=6, color=MUTED, va="bottom", ha="right")
         else:
@@ -6873,6 +6889,7 @@ def _(FWB_P_OBS, FWB_P_SHUF, mo):
 
 @app.cell(hide_code=True)
 def _(
+    FW_ARM,
     FW_FREE,
     FW_RUNS,
     GRID,
@@ -6927,7 +6944,7 @@ def _(
             _seg = _t.filter((pl.col("timestep") >= _rs) & (pl.col("timestep") <= _de))
             for (_fov, _p), _s in _seg.group_by(["fov", "particle"], maintain_order=True):
                 _s = _s.sort("timestep")
-                _f = FW_FREE[_fov]
+                _f = FW_FREE[_run][FW_ARM[_fov]]
                 _ru_s = _s.filter((pl.col("timestep") >= _rs) & (pl.col("timestep") <= _re))
                 _dm_s = _s.filter((pl.col("timestep") >= _ds) & (pl.col("timestep") <= _de))
                 if _ru_s.height < 15 or _dm_s.height < 15:
@@ -6954,16 +6971,19 @@ def _(
                          .agg(pl.col(_col).median().alias("m")).sort("free"))
             _byarm = (fwc.filter(pl.col("run") == _run).group_by("free")
                          .agg(pl.col(_col).median().alias("m")).sort("free"))
-            _xi = {_f: _i for _i, _f in enumerate(FWC_FREE)}
-            _ax.plot([_xi[_f] for _f in _byfov["free"]], _byfov["m"], "o", ms=3,
+            # True minutes on a linear axis. The two runs do not share their middle
+            # arm lengths, so a shared category axis would put v23's 8 and 14 minute
+            # arms on v21's 4 and 10 minute ticks.
+            _ax.plot(_byfov["free"], _byfov["m"], "o", ms=3,
                      color=SERIES[_ri], alpha=0.45, mew=0)
-            _ax.plot([_xi[_f] for _f in _byarm["free"]], _byarm["m"], "-", lw=1.6,
+            _ax.plot(_byarm["free"], _byarm["m"], "-", lw=1.6,
                      color=SERIES[_ri], label=_run, zorder=4)
-            _ax.plot([_xi[_f] for _f in _byarm["free"]], _byarm["m"], "o", ms=5,
+            _ax.plot(_byarm["free"], _byarm["m"], "o", ms=5,
                      color=SERIES[_ri], mfc="white", mew=1.5, zorder=5)
-        _ax.axvspan(-0.5, 1.5, color=MUTED, alpha=0.10, lw=0)
-        _ax.set_xticks(range(len(FWC_FREE)), [str(_f) for _f in FWC_FREE], fontsize=7)
-        _ax.set_xlim(-0.5, len(FWC_FREE) - 0.5)
+        _ax.axvspan(-1.5, 5, color=MUTED, alpha=0.10, lw=0)
+        _ax.set_xticks([0, 4, 8, 10, 14, 20],
+                       ["0", "4", "8", "10", "14", "20"], fontsize=7)
+        _ax.set_xlim(-1.5, 21.5)
         _ax.set_xlabel("free minutes", fontsize=7.5)
         _ax.set_ylabel(_lab, fontsize=7)
         _ax.set_title(f"{'abc'[_j]}  {['It uses the room', 'It arrives sooner', 'It tracks no better'][_j]}",
@@ -6973,8 +6993,8 @@ def _(
         _ax.tick_params(labelsize=7)
         if _j == 0:
             _ax.legend(frameon=False, fontsize=6.5, loc="upper left", handlelength=1.4)
-            _ax.text(0.5, 0.04, "shorter than\nthe dead time", transform=_ax.transAxes,
-                     ha="center", va="bottom", fontsize=5.8, color=MUTED,
+            _ax.text(0.02, 0.04, "inside the\ndead time", transform=_ax.transAxes,
+                     ha="left", va="bottom", fontsize=5.8, color=MUTED,
                      linespacing=1.4)
 
     save_fig(fig_fwc, "freewindow-what-it-buys")
@@ -7123,7 +7143,21 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(GRID, INK, MUTED, SERIES, W_TEXT, fw_vec, fw_win, np, pl, plt, save_fig):
+def _(
+    FW_FREE,
+    FW_RUNS,
+    GRID,
+    INK,
+    MUTED,
+    SERIES,
+    W_TEXT,
+    fw_vec,
+    fw_win,
+    np,
+    pl,
+    plt,
+    save_fig,
+):
     # --- Every free window, as a picture -----------------------------------------
     # One row per window, one column per minute of the 20-minute tail, colour is the
     # rung the controller commanded. Rows are ordered by the first shape component --
@@ -7149,7 +7183,13 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, fw_vec, fw_win, np, pl, plt, save_fig):
     #
     # The shape axis is computed once over ALL windows, so the four blocks are ordered
     # on a common scale and can be read against each other.
-    FWH_FREE = [0, 4, 10, 20]
+    # Band by ARM, not by minutes. The arm-to-field mapping is shared between the
+    # two runs but the window lengths are not (v21 0/4/10/20, v23 0/8/14/20), so
+    # banding on minutes would cut six groups into four labelled bands.
+    FWH_ARMS = [1, 2, 3, 4]
+    FWH_LAB = [f"arm {_a}\n" + " or ".join(
+        str(_m) for _m in sorted({FW_FREE[_r][_a] for _r in FW_RUNS})) + " free min"
+        for _a in FWH_ARMS]
     FWH_COL = [MUTED, "#a9a7a2", SERIES[2], SERIES[0]]
 
     _fwh_mask = (fw_win["total"] > 0).to_numpy()
@@ -7162,7 +7202,7 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, fw_vec, fw_win, np, pl, plt, save_fig):
     # inside each. That is the comparison the panel is for -- does more free time
     # change the KIND of thing the controller does, or only give it more room?
     _pc1 = _fwh_U[:, 0] * _fwh_S[0]
-    _free_all = _fwh_meta["free"].to_numpy()
+    _free_all = _fwh_meta["arm"].to_numpy()
     _order = np.lexsort((_pc1, _free_all))          # last key is the primary one
     _D = _fwh_D[_order]
     _free = _free_all[_order]
@@ -7175,8 +7215,8 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, fw_vec, fw_win, np, pl, plt, save_fig):
     _totb = _tot[:_nb * FWH_BIN].reshape(_nb, FWH_BIN).mean(1)
     # Block edges and centres, so each arm can be named on the axis instead of being
     # colour-coded with a legend to decode.
-    _edges = [0] + [int(np.argmax(_freeb >= _f)) for _f in FWH_FREE[1:]] + [_nb]
-    _centres = [(_edges[_i] + _edges[_i + 1]) / 2 for _i in range(len(FWH_FREE))]
+    _edges = [0] + [int(np.argmax(_freeb >= _f)) for _f in FWH_ARMS[1:]] + [_nb]
+    _centres = [(_edges[_i] + _edges[_i + 1]) / 2 for _i in range(len(FWH_ARMS))]
     _splits = _edges[1:-1]
 
     fig_fwh = plt.figure(figsize=(W_TEXT, 4.0))
@@ -7188,7 +7228,7 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, fw_vec, fw_win, np, pl, plt, save_fig):
                       extent=[-20, 0, _nb, 0], vmin=0, vmax=np.percentile(_Db, 99.5))
     for _s in _splits:
         _axh.axhline(_s, color="white", lw=1.2)
-    _axh.set_yticks(_centres, [f"{_f} free min" for _f in FWH_FREE], fontsize=7)
+    _axh.set_yticks(_centres, FWH_LAB, fontsize=6.2)
     _axh.tick_params(axis="y", length=0)
     _axh.set_xticks([-20, -15, -10, -5, 0])
     _axh.tick_params(axis="x", labelsize=7)
@@ -7236,6 +7276,7 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(
     BoundaryNorm,
+    FW_FREE,
     FW_RUNS,
     GRID,
     INK,
@@ -7277,7 +7318,13 @@ def _(
     FWD_V23 = ["hold", "release", "climb", "re-arrive"]
     FWD_COL = [plt.cm.tab10(_i) for _i in (0, 1, 2, 3)] + \
               [plt.cm.tab10(_i) for _i in (4, 5, 6, 8)]
-    FWD_FREE = [0, 4, 10, 20]
+    # Band by ARM, not by minutes. The arm-to-field mapping is shared between the
+    # two runs but the window lengths are not (v21 0/4/10/20, v23 0/8/14/20), so
+    # banding on minutes would cut six groups into four labelled bands.
+    FWD_ARMS = [1, 2, 3, 4]
+    FWD_LAB = [f"arm {_a}\n" + " or ".join(
+        str(_m) for _m in sorted({FW_FREE[_r][_a] for _r in FW_RUNS})) + " free"
+        for _a in FWD_ARMS]
     FWD_BIN = 40
 
 
@@ -7308,7 +7355,7 @@ def _(
     _fwd_X = _fwd_D0 / _fwd_D0.sum(1, keepdims=True)
     _fwd_U, _fwd_S, _ = np.linalg.svd(_fwd_X - _fwd_X.mean(0), full_matrices=False)
     _fwd_pc1 = _fwd_U[:, 0] * _fwd_S[0]
-    _fwd_freeall = _fwd_meta["free"].to_numpy()
+    _fwd_freeall = _fwd_meta["arm"].to_numpy()
     _fwd_order = np.lexsort((_fwd_pc1, _fwd_freeall))
     _fwd_D = _fwd_D0[_fwd_order]
     _fwd_free = _fwd_freeall[_fwd_order]
@@ -7317,8 +7364,8 @@ def _(
     _Db = _fwd_D[:_fwd_nb * FWD_BIN].reshape(_fwd_nb, FWD_BIN, _fwd_D.shape[1]).mean(1)
     _freeb = np.median(_fwd_free[:_fwd_nb * FWD_BIN].reshape(_fwd_nb, FWD_BIN), axis=1)
     _totb = _fwd_tot[:_fwd_nb * FWD_BIN].reshape(_fwd_nb, FWD_BIN).mean(1)
-    _edges = [0] + [int(np.argmax(_freeb >= _f)) for _f in FWD_FREE[1:]] + [_fwd_nb]
-    _centres = [(_edges[_i] + _edges[_i + 1]) / 2 for _i in range(len(FWD_FREE))]
+    _edges = [0] + [int(np.argmax(_freeb >= _f)) for _f in FWD_ARMS[1:]] + [_fwd_nb]
+    _centres = [(_edges[_i] + _edges[_i + 1]) / 2 for _i in range(len(FWD_ARMS))]
     _splits = _edges[1:-1]
 
     _dem = np.array([(_map21 if _r == "v21" else _map23)[_b] for _r, _b
@@ -7353,7 +7400,7 @@ def _(
     _axdm.imshow(_demb[:, None], aspect="auto", cmap=ListedColormap(FWD_COL),
                  norm=BoundaryNorm(np.arange(-0.5, 8.5), 8), interpolation="nearest")
     _axdm.set_xticks([])
-    _axdm.set_yticks(_centres, [f"{_f} free" for _f in FWD_FREE], fontsize=6.8)
+    _axdm.set_yticks(_centres, FWD_LAB, fontsize=5.8)
     _axdm.tick_params(axis="y", length=0)
     _axdm.set_title("demand\nahead", fontsize=6, color=MUTED, linespacing=1.3, pad=3)
 
@@ -7411,7 +7458,7 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
     # per-cell dosing separates. Splitting the arm in panel (a) puts that in front.
     E2A_RUNGS = ["1a per-cell", "1b broadcast", "2 constant 60 ms", "3 dark"]
     E2A_COL = dict(zip(E2A_RUNGS, [SERIES[0], SERIES[2], MUTED, "#a9a7a2"]))
-    E2A_SHORT = dict(zip(E2A_RUNGS, ["1a  per-cell", "1b  broadcast",
+    E2A_SHORT = dict(zip(E2A_RUNGS, ["1a  per-cell", "1b  population",
                                      "2  constant", "3  dark"]))
     E2A_BLOCK = "demand_01_L_H"
 
@@ -7592,11 +7639,6 @@ def _(
     _axe.set_title("a  Every cell, every rung", loc="left", fontweight="bold", fontsize=9)
     _axe.xaxis.grid(True, color=GRID, lw=0.6)
     _axe.set_axisbelow(True)
-    _axe.text(0.985, 0.06,
-              "small dots: cells · rings: field medians · bar: the rung\n"
-              "thin lines join the two halves of one dish",
-              transform=_axe.transAxes, ha="right", va="bottom", fontsize=6.2,
-              color=MUTED, linespacing=1.5)
 
     # right: what each rung spent to get there
     _axm = fig_e2b.add_subplot(_gb[0, 1], sharey=_axe)
@@ -7613,8 +7655,8 @@ def _(
     _axm.set_title("b  On what light", loc="left", fontweight="bold", fontsize=9)
     _axm.xaxis.grid(True, color=GRID, lw=0.6)
     _axm.set_axisbelow(True)
-    _axm.text(64, -0.5, "what arm 2\nwas set to", fontsize=6, color=MUTED,
-              va="center", linespacing=1.4)
+    _axm.text(63, 3.42, "arm 2's dose", fontsize=6, color=MUTED,
+              ha="left", va="center")
 
     save_fig(fig_e2b, "feedback-ladder-alt2")
     fig_e2b
