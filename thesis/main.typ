@@ -116,22 +116,40 @@
 
 // ── Title page ───────────────────────────────────────────────────────────────
 
+// Layout fixed by the Faculty of Science submission rules: the black lines
+// ("Master thesis", "Faculty of Science, University of Bern", "handed in by",
+// "Supervisor") are prescribed boilerplate and must stay verbatim; only the
+// title, name, year and supervisors are filled in.
 #page(numbering: none, {
   set align(center)
-  v(5cm)
-  text(font: SANS-FONT, size: 20pt, weight: "bold")[
+  set text(font: SANS-FONT, fill: black)
+  set par(justify: false, first-line-indent: 0pt)
+
+  v(4.6cm)
+  text(size: 17pt, weight: "bold")[
     Deep model-predictive control of ERK signalling in single cells
   ]
-  v(1.2cm)
-  text(size: 13pt)[Przemysław Pilipczuk]
-  v(0.4cm)
-  text(size: 11pt, style: "italic")[Master's thesis]
-  v(0.3cm)
-  text(size: 11pt)[Institute of Cell Biology, University of Bern]
-  v(1.2cm)
-  text(size: 10.5pt)[Supervised by: Dr. Maciej Dobrzyński, Prof. Olivier Pertz]
+
+  v(3.4cm)
+  text(size: 12pt)[Master thesis]
+  linebreak()
+  text(size: 12pt)[Faculty of Science, University of Bern]
+
+  v(1.9cm)
+  text(size: 12pt)[handed in by]
+  v(0.45cm)
+  text(size: 13pt, weight: "bold")[Przemysław Pilipczuk]
+
+  v(2.7cm)
+  text(size: 13pt, weight: "bold")[2026]
+
   v(1fr)
-  text(size: 10.5pt)[08.09.2026]
+  text(size: 12pt)[Supervisor]
+  v(0.45cm)
+  text(size: 13pt, weight: "bold")[Dr. M. Dobrzyński]
+  linebreak()
+  text(size: 13pt, weight: "bold")[Prof. O. Pertz]
+  v(2.2cm)
 })
 
 #counter(page).update(1)
@@ -202,12 +220,13 @@ In PC12 cells, a sustained pulse of pathway activation drives differentiation wh
 transient pulse drives proliferation @Marshall1995; modulating the frequency of
 activation alone can rewire fate decisions @Ryu2015 @Albeck2013. The principle is not
 confined to this pathway: in p53, converting a naturally pulsed response into a sustained
-one switches the downstream programme and the fate that follows, with no change in the
-amount of signal @Purvis2012.
+one switches which downstream genes are expressed and whether cells recover or senesce
+@Purvis2012.
 
 Cells partake in complex spatiotemporal population-level phenomena such as ERK waves
-@Aoki2017, which propagate through epidermis in vivo and speed wound healing
-@Hiratsuka2015, and which an apoptotic cell sends into its neighbours to protect them from
+@Aoki2017, which propagate through the epidermis in vivo, where their frequency tracks the
+rate of cell division and they organise into trigger waves at a wound edge @Hiratsuka2015,
+and which an apoptotic cell sends into its neighbours to protect them from
 dying with it @Gagliardi2021. Cancer cells act through the same channel: oncogene-expressing
 cells release ligands that drive ERK waves in surrounding wild-type tissue, changing the
 behaviour of cells that carry no mutation themselves @Aikin2020.
@@ -264,11 +283,15 @@ or an optogenetic stimulation of an upstream receptor affects the downstream ERK
 has been dominated by mechanistic approaches that encode a model of the biochemical
 cascade with each participant quantified, and utilise ODE fitting approaches to adjust
 model parameters to real measurements. 
-This approach, while principled, can suffer from a number of issues. Data for the 
-fitting of such model often only consists of an insufficient number of state variables of the system in question.
+This approach, while principled, can suffer from a number of issues. The data available to
+fit such a model usually covers only a few of its state variables: the cascade is written
+with every participant quantified, while the measurement reports one node of it. Many
+parameter sets then reproduce the observed trace equally well, so the fitted values carry
+little meaning individually. Nor is this only a shortage of data. Models of this class are
+sloppy: their parameters stay poorly constrained even when fitted to large amounts of ideal
+time-series data @Gutenkunst2007, so non-identifiability follows from the model class as
+much as from the experiment.
 
-The model itself often suffers from parameter nonidentifiability @Gutenkunst2007: 
-many parameter sets fit the data well, so the fitted values carry little meaning. 
 Its construction requires expert knowledge, and it demands that
 the system be encapsulable within the chosen level of abstraction: morphology or
 mechanical stimulation, for example, have no natural place in a biochemical ODE model
@@ -302,11 +325,15 @@ The readout used throughout this work is such a sequence: the cytoplasm-to-nucle
 of a translocation reporter, which tracks ERK activity rather than the abundance of any
 kinase.
 
-A work by Klumpe et al. @Klumpe2023 showed that deep neural networks were able to infer the underlying dynamics of a cell response
-even in the presence of measurement noise and stochasticity in the biochemical reactions.
-
-// brief: not explaining mechanisms, but uncovering more complex behaviour and
-// learning through interactions.
+Klumpe et al. @Klumpe2023 examined this directly in simulation. Training networks on
+simulated single-cell traces, they found that a network could recover the underlying
+dynamics of a response despite measurement noise and stochasticity in the biochemical
+reactions, and that how much of a cell's past the network needed depended on the circuit
+producing it: cascades that introduce delays required more history. They also found that
+predicting a single future trajectory fails where the dynamics are multimodal, and replaced
+it with a network predicting the whole distribution of future states. Both findings inform
+the model used here, which reads a cell's entire past rather than a fixed window and returns
+a distribution rather than a point.
 
 == Closed-loop control as an instrument <sec-closed-loop>
 
@@ -534,9 +561,16 @@ itself rather than to train anything.
   "fig-dataset",
 )
 
-All this data was filtered using a standard procedure involving removing cells that were
-segmented but not alive, incorrectly segmented cells, and visual anomalies resulting in
-non-meaningful features.
+Every experiment in the training corpus passes through the same filter chain before it is
+used, and the chain described here applies to that corpus rather than to the live runs,
+whose own admissibility conditions are given in @sec-live-experiments. A cell is kept only
+if it was tracked for at least 90% of the longest track in its own experiment, so that
+partial tracks, which end when a cell divides, migrates out of the field, or is lost by the
+segmenter, do not enter as short fragments. Each cell's baseline is the median CNR over its
+first ten frames; a cell without one is dropped, and so is any cell whose baseline exceeds
+0.8 CNR, which removes cells already responding before stimulation begins. Where an
+experiment carries a manual exclusion list from visual inspection, marking mis-segmented
+nuclei and other anomalies, those cells are removed as well. 
 
 This final composition of all the experiment data resulted in a dataset of 72,441 cells
 and 6.63 M frames.
@@ -605,9 +639,8 @@ a learning rate of $10^(-3)$, weight decay $10^(-4)$ and a cosine schedule decay
 $10^(-5)$, in batches of 256, with gradients clipped to unit norm and early stopping on
 validation loss at a patience of 40 epochs. The best validation loss fell at epoch 291,
 although 95% of the improvement was reached by epoch 94. Teacher forcing was annealed
-linearly from 1 to 0 across the first 30% of training @scheduledsampling. Each batch drew its horizon length
-uniformly between 3 and 30 frames, and cells were drawn by a response-magnitude stratified
-sampler over four strata. Training used 57,954 samples against 7,250 for validation and took
+linearly from 1 to 0 across the first 30% of training @scheduledsampling. Cells were drawn by a response-magnitude
+stratified sampler over four strata. Training used 57,954 samples against 7,250 for validation and took
 2.1 hours on a single RTX 2080 Ti.
 
 A single forward pass through the model produces an uncertainty-aware prediction of CNR at
@@ -622,17 +655,20 @@ steps done per single prediction is referred to as the predictive horizon hencef
 Choice of a predictive horizon is made based on the characteristics of the biological
 phenomenon we are controlling and the throughput needs of our control task. The horizon
 must be large enough to capture dynamical features of the controlled system, while being
-small enough to be evaluated quickly in a live experiment. It is also possible to run
-training with a varying time horizon. The reasoning for such a design choice is that we
-convey the fact that we are interested in phenomena at all temporal scales of the system.
-The problem with this approach is that it makes training noisy and unstable: there is no
-meaningful way to assign datapoints to horizon lengths, so they must be assigned at
-random, which means that sometimes datapoints with little long-range dynamics will be
-used to learn long-range dynamics, and the frequency of such assignments will vary
-between runs.
+small enough to be evaluated quickly in a live experiment. For our system we chose thirty
+frames, each one minute apart, as the longest horizon the model is asked for, and it is the
+horizon the live controller plans over.
 
-For our system, we chose a predictive horizon of 30 frames, each one minute apart. An
-important factor in slicing the original single-cell tracks into datapoints for the model
+Training did not fix the horizon there. Each batch drew one length uniformly between three
+and thirty frames and scored every item in it at that length, so a datapoint is seen at many
+horizons over the course of training rather than being assigned to one. The objection to
+varying the horizon is that it makes training noisier, since a stretch of track with little
+long-range structure can be asked to teach long-range structure, and the mix of lengths
+differs between runs. Two things limit that here: the length is drawn per batch rather than
+per datapoint, so it never varies within a gradient step, and validation is scored at the
+full thirty frames throughout, so model selection reads one horizon and not a moving one.
+
+An important factor in slicing the original single-cell tracks into datapoints for the model
 to train on is how to deal with reusing data from a track. From the statistical point of
 view, we would like to have datapoints that are completely decorrelated from each other
 and can be viewed as i.i.d. From the practical point of view, it is quite costly to
@@ -737,14 +773,13 @@ elsewhere.
 
 Two scoring kernels are implemented. The squared-error kernel above reads only the
 predictive mean; a band kernel instead prices the probability that a plan leaves a band
-around the reference, and is the one that consumes the head's full mixture. The band kernel
-was tested as one arm of v10 and v11 and was not used in the runs that followed, so every
-result reported here is produced by scoring on the mean.
-
-A second reason, independent of what those two runs showed, was that with only a handful of
-live experiments there was no evidence that the model's offline calibration carried into a
-feedback regime, where it is scored against the consequences of its own earlier choices.
-Scoring on the mean was the conservative option until enough live data existed to check. The
+around the reference, and is the one that consumes the head's full mixture. Every result
+reported here is produced by scoring on the mean, for two reasons. The first is what the
+runs did: the band kernel was tested as one arm of v10 and v11 and was not carried into the
+runs that followed. The second is independent of those two runs. With only a handful of live
+experiments there was no evidence that the model's offline calibration carried into a
+feedback regime, where it is scored against the consequences of its own earlier choices, and
+scoring on the mean was the conservative option until enough live data existed to check. The
 capability remains in place: the head is a mixture throughout, and the kernel is one line of
 the policy.
 
@@ -990,8 +1025,8 @@ variability.
 
 == Comparing single-cell control, population-level control and open loop stimulation 
 
-Experiment v24 was designed to compare single-cell MPC with population
-level MPC against an open loop stimulation matched to experiment beforehand.
+Experiment v24 compares single-cell MPC against population-level MPC and against an
+open-loop arm whose dose was matched in advance.
 
 #thesisfig(
   "e2-design",
@@ -999,9 +1034,30 @@ level MPC against an open loop stimulation matched to experiment beforehand.
   "e2-design",
 )
 
-A split into blocks instead of splitting by field of view was used. Within FOVs 0,3,4,7, half of the cells were stimulated with the standard single-cell pipeline, 
-and other half were pooled into a shared population, their features averaged and their control signal computed from the population average. By sharing the FOVs across
-blocks, we avoid per-FOV effects confounding our result. 
+The population controller is the per-cell controller with exactly one freedom removed. It
+uses the same model, the same objective, the same dose ladder, the same horizon and the same
+search, and it replans every frame from the current measurement; what it cannot do is send
+two cells in its group different doses. That is the reason to have it. An open-loop arm
+removes feedback and the ability to treat cells differently at the same time, so when it
+loses, the run cannot say which of the two mattered.
+
+The comparison is made inside the field rather than between fields. In fields 0, 3, 4 and 7,
+cells are assigned by tracking index in alternating blocks of four: four consecutive indices
+share a dose, the next four are planned individually. Anything the field shares, such as
+focus, medium, illumination or local drift, therefore cancels within the pair instead of
+entering the contrast. Blocking by four rather than alternating single cells keeps the split
+independent of the four phase groups the serving code assigns by tracking index, which would
+otherwise be confounded with it.
+
+The shared dose is not computed from an average. Each frame, the cell sitting at the median
+CNR of the group is taken as its representative, and the plan is computed from that cell's
+own encoder state and then issued to every cell in the group. Averaging encoder states
+instead would construct a state no cell was ever in and that the model has never been asked
+about; taking the median cell keeps the plan on a trajectory of the kind the model was
+fitted to. The representative is re-chosen every frame, which is consistent with the
+receding horizon, since the plan is recomputed from scratch in any case. Cells are grouped
+by what they are being asked for at that frame, which in v24 is one group, since the
+reference is common to the whole field.
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  RESULTS
@@ -1065,9 +1121,17 @@ $R^2$ of 0.02 after three minutes and 0.91 after thirty. Against that rising bas
 optoRTK expression rank is worth a great deal early and almost nothing late: it adds 0.233
 at three minutes, more than the delivered light itself at 0.120, and 0.001 by thirty. The
 spatial channels contribute at no point on that axis. Local crowding adds 0.000 at three
-minutes and 0.0004 at thirty; field density adds 0.004 and 0.000. A covariate measured once
-before the run is worth having only while there is nothing else to go on, and a description
-of the neighbourhood is not worth having at all.
+minutes and 0.0004 at thirty; field density adds 0.004 and 0.000.
+
+The two cases are not the same, and the difference matters for what to conclude. Expression
+is a static per-cell number, so whatever it predicts about a cell's response is also written
+into that response, and watching for long enough recovers it: its incremental value falls
+because the observation has become redundant with it, not because it is uninformative. That
+is a statement about the data rather than about the trained network, which still leans on
+the channel; permuting it costs 0.059 in validation likelihood, more than any input except
+the delivered light. The spatial channels have no such early value to be absorbed. They add
+nothing at three minutes, when there is least to go on, and permuting them costs 0.005 to
+0.007, so a description of the neighbourhood is not worth having at any point.
 
 #thesisfig(
   "encoder-needs",
@@ -1200,6 +1264,16 @@ the nominal 95% covers 93%. The direction of the error also reverses. Offline th
 were slightly too wide, covering 70% where 68% was claimed; live they are too narrow,
 covering 61%.
 
+The loop also met its timing requirement; budget that matters is
+per field rather than per frame. Fields of view are served sequentially, since the microscope
+visits one at a time, so eight fields on a one-minute cadence leave each of them a slot of
+7.5 s; the measured spacing between consecutive fields on v24 was 7.07 s at the median. A
+field under closed-loop control, planning for a median of 64 cells, spent 0.40 s of that slot
+at the median and 0.59 s at the 95th percentile, which is the cost of the full search; fields
+on a fixed sequence, which evaluate no plans, spent 0.025 s. Summed over the eight fields,
+inference accounted for a median of 2.05 s of the minute and never more than 2.57 s.
+Acquisition and stage movement across the fields account for the rest.
+
 In runs with a repeating block objective the response to stimulation flattened over the
 course of the run (@sensitivity-decline).
 
@@ -1291,9 +1365,9 @@ run.
 
 The second comparison is between the two halves of the closed-loop arm, and it is the
 only place in this work where individuation is isolated. Cells sharing a field were split
-by a fixed rule, half planned individually and half receiving one dose computed for the
-field as a whole, so the comparison is paired inside the FOV and every field-level
-difference cancels within the pair. Per-cell dosing gave a median tracking error of 0.291
+by a fixed rule, half planned individually and half receiving one dose shared across their
+group, so the comparison is paired inside the field and every field-level difference
+cancels within the pair. Per-cell dosing gave a median tracking error of 0.291
 against 0.320 for the broadcast dose, on 109 against 118 ms of light per frame: closer,
 and on less light. Three of the four fields favour per-cell dosing and one does not,
 which at four fields is a direction rather than a result: an exact sign test gives
@@ -1522,8 +1596,8 @@ points one way without settling it.
 It is nonetheless the point at which the individuality the model reads out of a cell's past is allowed
 to change what that cell receives, and the cells finish closer to what was asked of them.
 
-A single block of that run admits a sharper reading, being the only one whose demand the cells could 
-actually reach.
+One block of that run supports a stronger claim, because it is the only one whose demand
+the cells could actually reach.
 Across that hour the population median of the constant arm sat closer to the demand than the median under closed-loop control,
 while its individual cells sat further away. This is the situation the introduction gives as the reason
 for working at single-cell resolution, and it is the one place here where it was observed rather than assumed:
@@ -1669,6 +1743,16 @@ gain lies.
 
 = Appendix
 
+== AI acknowledgement
+
+I used Claude (Anthropic, models Opus 4.8, Opus 5) accessed via claude.ai
+between March and September 2026) for two purposes.
+First, for language editing of the manuscript: spelling and grammar correction, and revision of wording.
+No text was generated from prompts describing content;
+all scientific claims, structure, and argumentation are my own.
+Second, as a coding assistant during implementation of the software. 
+I reviewed, tested, and take full responsibility for all code and text in this thesis.
+
 == Training loss curves
 
 #thesisfig(
@@ -1737,7 +1821,10 @@ for lamp ageing is applied.
 
 #thesisfig(
   "arm-tracks",
-  [A raw plot of all the admissible experiments. Solid lines are median CNR of a given arm of experiment. Shaded parts represent IQR ],
+  [Every run used in this work except v19, one panel each: v10, v11, v16, v21, v23 and v24.
+   Solid lines are the median CNR of each arm, shaded bands the interquartile range across
+   its cells. Only v21, v23 and v24 clear every condition in @sec-live-experiments; v10, v11
+   and v16 are read within the bounds set there.],
   "experiment tracks",  float: false,
 )
 
