@@ -956,7 +956,8 @@ def _(INK, MUTED, SERIES, W_TEXT, np, plt, save_fig):
         _ar(_axb, (_cx, _SY0), (_cx, _BASE + _SIG[_i] + 0.04), color=_OUT, lw=0.9)
         if _i < len(_SX) - 1:
             _ar(_axb, (_cx + 0.06, _BASE + 0.04), (_SX[_i + 1] - 0.02, _SY0 + 0.12),
-                color=_OUT, ls=(0, (2.6, 1.8)), rad=-0.36, lw=0.9)
+                #color=_OUT, ls=(0, (2.6, 1.8)), rad=-0.36, lw=0.9)
+                color=_OUT, ls=(0, (2.6, 1.8)), rad=0.0, lw=0.9)
         if _i < len(_SX) - 2:
             _ar(_axb, (_x + _SW, (_SY0 + _SY1) / 2), (_SX[_i + 1], (_SY0 + _SY1) / 2))
     _axb.text((_SX[2] + _SW + _SX[3]) / 2, (_SY0 + _SY1) / 2, ". . .", ha="center",
@@ -1183,6 +1184,67 @@ def _(Path, materials_path, np, pl):
 
 
 @app.cell(hide_code=True)
+def _(GRID, INK, MUTED, Path, SERIES, W_TEXT, np, plt, save_fig):
+
+    # --- Training curves for the reported checkpoint -------------------------------
+    # Rebuilt from the bundle's own history rather than placed as the 400 px PNG the
+    # training notebook emitted, which renders at about 63 dpi across the text block.
+    #
+    # The teacher-forcing ratio is drawn because it explains the shape: it anneals
+    # linearly from 1 to 0 over the first 30% of training, and the validation loss
+    # falls steeply while it does. Up to that point the decoder is being fed the true
+    # CNR at most steps, so the task it is scored on is easier than the one it will
+    # face live; the curve after epoch 90 is the only part measuring free-running
+    # rollout, which is what the controller actually uses.
+    # `_bun` is cell-local to the CEM cell, so the bundle is reopened here.
+    import torch as _Tl
+    from optoerk.core.utils import results_write_path as _rwpl
+    _lh = _Tl.load(Path(_rwpl()) / "enc_e_area_lean_2026-08-07_02.05.26" / "bundle.pt",
+                   map_location="cpu", weights_only=False)["training_results"]["history"]
+    loss_tr = np.asarray(_lh["train_loss"], float)
+    loss_va = np.asarray(_lh["val_loss"], float)
+    loss_tf = np.asarray(_lh["tf_ratio"], float)
+    LOSS_BEST = int(np.argmin(loss_va))
+    LOSS_TF_END = int(np.argmax(loss_tf <= 0)) if (loss_tf <= 0).any() else len(loss_tf)
+
+    fig_loss = plt.figure(figsize=(W_TEXT, 2.7))
+    _gl = fig_loss.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.30,
+                                left=0.085, right=0.985, top=0.88, bottom=0.19)
+
+    for _j, (_lo, _hi, _ttl) in enumerate(
+            [(None, None, "a  The whole run"),
+             (-0.25, 0.12, "b  After teacher forcing ends")]):
+        _ax = fig_loss.add_subplot(_gl[0, _j])
+        _e = np.arange(1, len(loss_tr) + 1)
+        _ax.axvspan(0, LOSS_TF_END, color=MUTED, alpha=0.10, lw=0)
+        _ax.plot(_e, loss_tr, lw=1.1, color=SERIES[0], label="train")
+        _ax.plot(_e, loss_va, lw=1.1, color=SERIES[1], label="validation")
+        _ax.axvline(LOSS_BEST + 1, color=INK, lw=0.9, ls=(0, (2.5, 1.8)), zorder=4)
+        if _lo is not None:
+            _ax.set_ylim(_lo, _hi)
+            _ax.set_xlim(LOSS_TF_END, len(loss_tr))
+        else:
+            _ax.set_xlim(0, len(loss_tr))
+            _ax.text(LOSS_TF_END + 6, _ax.get_ylim()[1] * 0.92,
+                     "teacher forcing\nannealed to zero", fontsize=6.0, color=MUTED,
+                     va="top", linespacing=1.4)
+            _ax.legend(frameon=False, fontsize=7, loc="upper right")
+        _ax.text(LOSS_BEST + 1 - 6, _ax.get_ylim()[1], f"best {LOSS_BEST + 1} ",
+                 fontsize=6.0, color=INK, va="top", ha="right")
+        _ax.set_xlabel("epoch", fontsize=8)
+        _ax.set_ylabel("negative log likelihood", fontsize=8)
+        _ax.set_title(_ttl, loc="left", fontweight="bold", fontsize=9)
+        _ax.tick_params(labelsize=7)
+        _ax.grid(True, color=GRID, lw=0.6)
+        _ax.set_axisbelow(True)
+
+    save_fig(fig_loss, "loss-curves")
+    fig_loss
+
+    return
+
+
+@app.cell(hide_code=True)
 def _(
     CEM,
     CEM_LEV,
@@ -1381,6 +1443,188 @@ def _(CEM, CEM_CELL, CEM_FOV, CEM_NELITE, CEM_NPLANS, CEM_T0, mo, np):
     over fields, frames and cells: among cells below the demand whose winning plan is not one
     of the constants, this is where the median cost falls furthest.
     """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(
+    CEM,
+    CEM_LEV,
+    CEM_NELITE,
+    CEM_NPLANS,
+    CEM_REF,
+    INK,
+    MUTED,
+    SERIES,
+    W_TEXT,
+    np,
+    plt,
+    save_fig,
+):
+
+    # --- Drawing the search: ALTERNATIVE with forward step arrows --------------------------------------------------------
+    # Three rows, one per CEM pass, four columns following one pass left to right.
+    # Every column shares its scale down the three rows, which is what makes the
+    # convergence visible: the distribution darkens, the plans and the predictions
+    # collapse toward one another, the cost histogram slides left.
+    _MODc, _LITc, _OUTc = SERIES[0], SERIES[1], SERIES[2]
+
+    fig_cem2 = plt.figure(figsize=(W_TEXT, 4.05))
+    _axk = fig_cem2.add_subplot(111)
+    _axk.set_position([0.005, 0.010, 0.990, 0.980])
+    _axk.set_xlim(0, 6.20); _axk.set_ylim(0, 3.95)
+    _axk.set_aspect("equal"); _axk.axis("off")
+
+    _COL = [(0.52, 1.74), (2.04, 3.26), (3.56, 4.78), (5.08, 6.18)]
+    _ROW = [(2.90, 3.58), (1.88, 2.56), (0.86, 1.54)]
+    _HEAD = [("the distribution over\nstimulation doses", "6 exposure times x 30 steps"),
+             ("realized stimulation plans", "512 sampled + 6 constant"),
+             ("what the model predicts", "518 rollouts, one batch"),
+             ("how close they are\nto the goal", "squared error + a price on light")]
+
+    # shared scales
+    _vmax = max(float(_s["probs"].max()) for _s in CEM)
+    _pmin = min(float(_s["pred"].min()) for _s in CEM)
+    _pmax = max(float(_s["pred"].max()) for _s in CEM)
+    _chi = float(np.percentile(CEM[0]["cost"], 96))
+    _clo = min(float(_s["cost"].min()) for _s in CEM)
+    _rng2 = np.random.default_rng(11)
+    _SUB = 90
+
+    for _j, ((_x0, _x1), (_ht, _hs)) in enumerate(zip(_COL, _HEAD)):
+        _axk.text((_x0 + _x1) / 2, 3.80, _ht, ha="center", va="bottom",
+                  fontsize=6.4, fontweight="bold", color=INK)
+        _axk.text((_x0 + _x1) / 2, 3.64, _hs, ha="center", va="bottom",
+                  fontsize=5.5, color=MUTED)
+
+    for _i, (_y0, _y1) in enumerate(_ROW):
+        _s = CEM[_i]
+        _hgt = _y1 - _y0
+        _axk.text(0.44, (_y0 + _y1) / 2 + 0.06, f"pass {_i + 1}", ha="right",
+                  va="center", fontsize=6.6, fontweight="bold", color=INK)
+        _axk.text(0.44, (_y0 + _y1) / 2 - 0.08,
+                  ["uniform", "sharpening", "peaked"][_i], ha="right", va="center",
+                  fontsize=5.5, color=MUTED, style="italic")
+
+        # -- 1  the sampling distribution, 6 rungs x 30 steps
+        _a0, _a1 = _COL[0]
+        for _r in range(6):
+            for _t in range(30):
+                _axk.add_patch(plt.Rectangle(
+                    (_a0 + _t * (_a1 - _a0) / 30, _y0 + _r * _hgt / 6),
+                    (_a1 - _a0) / 30, _hgt / 6, fc=_LITc,
+                    alpha=0.04 + 0.86 * _s["probs"][_t, _r] / _vmax,
+                    ec="white", lw=0.2, zorder=4))
+        _axk.text(_a1 - 0.03, _y1 - 0.04, f"max {_s['probs'].max():.2f}",
+                  ha="right", va="top", fontsize=5.0, color=INK, zorder=6,
+                  bbox=dict(boxstyle="round,pad=0.13", fc="white", ec="none", alpha=0.8))
+
+        # -- 2  the plans themselves, as dose staircases on the ladder
+        _b0, _b1 = _COL[1]
+        _pick = _rng2.choice(_s["dose"].shape[0], _SUB, replace=False)
+        _tt = np.arange(31)
+
+        def _dstep(d, lw, alpha, z, _y0=_y0, _hgt=_hgt, _b0=_b0, _b1=_b1, _tt=_tt):
+            _axk.step(_b0 + _tt / 30 * (_b1 - _b0),
+                      _y0 + 0.03 + np.r_[d, d[-1]] / 300 * (_hgt - 0.06),
+                      where="post", lw=lw, color=_LITc, alpha=alpha, zorder=z)
+
+        for _k in _rng2.choice(_s["dose"].shape[0], 4, replace=False):
+            _dstep(_s["dose"][_k], 0.5, 0.40, 4)
+        _dstep(_s["dose"][_s["best"]], 1.3, 1.0, 6)
+
+        # -- 3  what the model says each plan does
+        _c0, _c1 = _COL[2]
+        _tc = _c0 + np.arange(30) / 29 * (_c1 - _c0)
+
+        def _ymap(v, _y0=_y0, _hgt=_hgt):
+            return _y0 + 0.03 + (v - _pmin) / (_pmax - _pmin) * (_hgt - 0.06)
+
+        for _k in _pick:
+            _axk.plot(_tc, _ymap(_s["pred"][_k]), lw=0.35, color=_OUTc,
+                      alpha=0.05, zorder=4)
+        _axk.plot(_tc, _ymap(CEM_REF.numpy()), lw=1.1, color=INK,
+                  ls=(0, (2.4, 1.6)), zorder=6)
+        _axk.plot(_tc, _ymap(_s["pred"][_s["best"]]), lw=0.9, color=_OUTc, zorder=7)
+
+        # -- 4  the cost of every plan, and which eighth survives
+        _d0, _d1 = _COL[3]
+        _thr = float(np.sort(_s["cost"])[CEM_NELITE - 1])
+        _edges = np.linspace(_clo, _chi, 34)
+        _cnt, _ = np.histogram(_s["cost"], bins=_edges)
+        _cmx = _cnt.max()
+        for _k in range(len(_cnt)):
+            if _cnt[_k] == 0:
+                continue
+            _el = _edges[_k + 1] <= _thr
+            _axk.add_patch(plt.Rectangle(
+                (_d0 + (_edges[_k] - _clo) / (_chi - _clo) * (_d1 - _d0), _y0 + 0.03),
+                (_edges[1] - _edges[0]) / (_chi - _clo) * (_d1 - _d0) * 0.92,
+                _cnt[_k] / _cmx * (_hgt - 0.10),
+                fc=_OUTc if _el else MUTED, alpha=0.85 if _el else 0.38,
+                ec="none", zorder=4))
+        _axk.text(_d1 - 0.03, _y1 - 0.04, f"median {np.median(_s['cost']):.3f}",
+                  ha="right", va="top", fontsize=5.0, color=INK, zorder=6)
+
+
+    # -- forward arrows: the four steps of ONE pass, drawn in every row ------------
+    # The backward arrows already say "and then it repeats". Without a forward arrow
+    # the reader has to infer that the four columns are sequential rather than four
+    # views of the same thing, which is the one structural fact the figure turns on.
+    for _ri, (_ry0, _ry1) in enumerate(_ROW):
+        _rym = (_ry0 + _ry1) / 2
+        for _ci in range(3):
+            _gx0, _gx1 = _COL[_ci][1], _COL[_ci + 1][0]
+            _axk.annotate("", xy=(_gx1 - 0.02, _rym), xytext=(_gx0 + 0.02, _rym),
+                          zorder=7,
+                          arrowprops=dict(arrowstyle="-|>", color=INK, lw=0.9,
+                                          shrinkA=0, shrinkB=0, mutation_scale=8))
+        if _ri == 0:
+            for _ci, _lab in enumerate(["sample", "predict", "score"]):
+                _axk.text((_COL[_ci][1] + _COL[_ci + 1][0]) / 2, _rym + 0.045, _lab,
+                          ha="center", va="bottom", fontsize=5.0, color=INK,
+                          style="italic")
+
+    # -- axis hints, on the bottom row only
+    _axk.text(_COL[0][0] - 0.03, _ROW[2][1], "300", ha="right", va="center",
+              fontsize=4.8, color=MUTED)
+    _axk.text(_COL[0][0] - 0.03, _ROW[2][0], "0 ms", ha="right", va="center",
+              fontsize=4.8, color=MUTED)
+    for _j, _lab in enumerate(["30 horizon steps", "30 horizon steps",
+                               "30 horizon steps", "cost of a plan"]):
+        _axk.text((_COL[_j][0] + _COL[_j][1]) / 2, _ROW[2][0] - 0.06, _lab,
+                  ha="center", va="top", fontsize=5.0, color=MUTED)
+    _axk.text(_COL[2][0] + 0.04, _ROW[0][1] - 0.04, "dashed: the goal",
+              ha="left", va="top", fontsize=5.0, color=INK, zorder=8,
+              bbox=dict(boxstyle="round,pad=0.13", fc="white", ec="none", alpha=0.8))
+
+    # -- the loop, drawn where it happens: cost back to distribution
+    for _yb in (2.73, 1.71):
+        _axk.annotate("", xy=(0.56, _yb), xytext=(6.14, _yb), zorder=6,
+                      arrowprops=dict(arrowstyle="-|>", color=_MODc, lw=1.0,
+                                      shrinkA=0, shrinkB=0, mutation_scale=9))
+    _axk.text(3.35, 2.77, "pick 64 best, refit the distribution to them, then mix a tenth of uniform back in",
+              ha="center", va="bottom", fontsize=5.8, color=_MODc)
+    _axk.text(3.35, 1.75, "and again", ha="center", va="bottom", fontsize=5.8,
+              color=_MODc)
+
+    # -- what comes out
+    _axk.annotate("", xy=(5.95, 0.50), xytext=(5.95, 0.80), zorder=6,
+                  arrowprops=dict(arrowstyle="-|>", color=_OUTc, lw=1.1,
+                                  shrinkA=0, shrinkB=0, mutation_scale=9))
+    _axk.text(5.98, 0.46,
+              f"the winning plan's first step,\n"
+              f"{CEM_LEV[CEM[-1]['idx'][CEM[-1]['best'], 0]]:.0f} ms, is this cell's dose",
+              ha="right", va="top", fontsize=5.8, color=_OUTc, linespacing=1.4)
+    _axk.text(0.02, 0.46,
+              f"{CEM_NPLANS} plans scored per pass, {3 * CEM_NPLANS:,} rollouts for this cell on this\n"
+              f"frame. Green bars are the cheapest 64, the ones the next distribution is fit to.\n"
+              f"Every cell is searched separately.",
+              ha="left", va="top", fontsize=5.8, color=MUTED, linespacing=1.4)
+
+    save_fig(fig_cem2, "mpc-schematic-alt")
+    fig_cem2
+
     return
 
 
@@ -4410,9 +4654,13 @@ def _(
     # built from the arm names rather than a fixed table, so a change of
     # matched block does not silently fall through to the long label
     def _dec_short(a):
+        # Keep everything that is left after the controller words are removed, not
+        # just the last token: "20 min" reduced to "min", which made all four v19
+        # rows read identically.
         run, _, rest = a.partition(" \u00b7 ")
-        t = rest.replace("MPC, masked", "").replace("MPC", "").split()
-        return (run + " " + " ".join(t[-1:])).strip()
+        t = (rest.replace("MPC, masked", "").replace("MPC", "")
+                 .replace("demand ", "").replace(",", "").split())
+        return (run + " " + " ".join(t)).strip()
 
     _axd.set_yticks(_y, [_dec_short(a) for a in DEC_ARMS], fontsize=6.5)
     _axd.tick_params(axis="y", length=0)
@@ -4599,6 +4847,145 @@ def _(
     save_fig(fig_bode, "bandwidth")
     fig_bode
     return (wilcoxon,)
+
+
+@app.cell(hide_code=True)
+def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
+
+    # --- v10 / v11: what the four controller arms actually did ---------------------
+    # Replaces the stray exp_v10_arm2_plot.png, which carried matplotlib defaults, a
+    # baked title, `cnr_median` as an axis label, and only one of the four arms.
+    #
+    # Every field carries all four phase groups (offsets 0/10/20/30 min on a 40 min
+    # cycle), so cells must be aligned by their own phase before any median is taken;
+    # without that the four references cancel each other out.
+    #
+    # Panel (b) exists because the text claims base MPC is "best". With four arms and
+    # two runs that claim needs all eight numbers, not one.
+    V10_ARMS = ["MPC", "MPC, move 0.6", "MPC, band, move 0.6", "constant dose"]
+    V10_SHORT = {"MPC": "MPC", "MPC, move 0.6": "+ move penalty",
+                 "MPC, band, move 0.6": "+ band, + move", "constant dose": "constant dose"}
+    V10_COL = dict(zip(V10_ARMS, [SERIES[0], SERIES[1], SERIES[2], MUTED]))
+    V10_SCORE_FROM = 76
+
+
+    def _v10_load(run):
+        _a = (pl.read_parquet(materials_path("tracks_arms.parquet"))
+                .filter(pl.col("run") == run).select("fov", "arm_label"))
+        return (pl.read_parquet(materials_path(f"tracks_{run}.parquet"))
+                  .join(_a, on="fov", how="left"))
+
+
+    v10_trk, v11_trk = _v10_load("v10"), _v10_load("v11")
+
+    # per-cell tracking error, both runs, every arm
+    _v10_rows = []
+    for _run, _t in (("v10", v10_trk), ("v11", v11_trk)):
+        _p = (_t.filter(pl.col("timestep") >= V10_SCORE_FROM)
+                .group_by(["arm_label", "fov", "particle"])
+                .agg(((pl.col("raw_cnr") - pl.col("r_t")) ** 2).mean().sqrt().alias("rmse"),
+                     pl.len().alias("n"))
+                .filter(pl.col("n") >= 120))
+        for _arm in V10_ARMS:
+            _v = _p.filter(pl.col("arm_label") == _arm)["rmse"].to_numpy()
+            _v10_rows.append(dict(run=_run, arm=_arm, n=len(_v),
+                                  med=float(np.median(_v)),
+                                  q1=float(np.quantile(_v, 0.25)),
+                                  q3=float(np.quantile(_v, 0.75))))
+    v10_rmse = pl.DataFrame(_v10_rows)
+
+    fig_v10 = plt.figure(figsize=(W_TEXT, 4.6))
+    _gv = fig_v10.add_gridspec(2, 1, height_ratios=[1.55, 1.0], hspace=0.52,
+                               left=0.20, right=0.955, top=0.90, bottom=0.10)
+
+    # -- a: phase-aligned median CNR per arm, across the whole run
+    _axv = fig_v10.add_subplot(_gv[0])
+    # Verified empirically: adding the offset collapses r_t across the four phase
+    # groups exactly (spread 0.0000), subtracting it does not.
+    _al = v10_trk.with_columns(
+        (pl.col("timestep") + pl.col("phase_offset_min")).cast(pl.Int64).alias("ta"))
+    # One arm, not four. Overlaid, the four medians are the same shape at slightly
+    # different amplitudes and the panel reads as noise; the arm comparison is what
+    # panel (b) is for. This is the winner, and the decline is what the panel shows.
+    V10_SHOWN = "MPC"
+    _ref = (_al.filter(pl.col("ta") >= 0).group_by("ta")
+               .agg(pl.col("r_t").median().alias("r")).sort("ta"))
+    _axv.plot(_ref["ta"] / 60, _ref["r"], color=INK, lw=1.0, ls=(0, (3, 2)),
+              zorder=5, label="reference")
+    _m = (_al.filter((pl.col("arm_label") == V10_SHOWN) & (pl.col("ta") >= 0))
+             .group_by("ta").agg(pl.col("raw_cnr").median().alias("c"),
+                                 pl.col("raw_cnr").quantile(0.25).alias("lo"),
+                                 pl.col("raw_cnr").quantile(0.75).alias("hi"),
+                                 pl.len().alias("n")).filter(pl.col("n") >= 30)
+             .sort("ta"))
+    _axv.fill_between(_m["ta"] / 60, _m["lo"], _m["hi"], color=V10_COL[V10_SHOWN],
+                      alpha=0.20, lw=0, zorder=1, label="interquartile range")
+    _axv.plot(_m["ta"] / 60, _m["c"], lw=1.1, color=V10_COL[V10_SHOWN], zorder=3,
+              label=V10_SHORT[V10_SHOWN])
+    _axv.set_xlabel("phase-aligned time (h)", fontsize=8)
+    _axv.set_ylabel("CNR", fontsize=8)
+    _axv.set_title("a  v10, base MPC: aligned to each cell's own phase", loc="left",
+                   fontweight="bold", fontsize=9, pad=16)
+    # anchored by its LOWER edge, so it sits above the axes rather than over the
+    # reference peaks at 1.15
+    _axv.legend(frameon=False, fontsize=6.8, ncol=3, loc="lower center",
+                bbox_to_anchor=(0.5, 1.0), handlelength=1.6, columnspacing=1.4)
+    _axv.tick_params(labelsize=7)
+    _axv.grid(True, color=GRID, lw=0.6)
+    _axv.set_axisbelow(True)
+
+    # -- b: the number the "best arm" claim rests on
+    _axr = fig_v10.add_subplot(_gv[1])
+    _y = {_a: len(V10_ARMS) - 1 - _i for _i, _a in enumerate(V10_ARMS)}
+    for _ri, _run in enumerate(("v10", "v11")):
+        for _arm in V10_ARMS:
+            _r = v10_rmse.filter((pl.col("run") == _run) & (pl.col("arm") == _arm)).row(0, named=True)
+            _yy = _y[_arm] + (0.18 if _ri == 0 else -0.18)
+            _axr.plot([_r["q1"], _r["q3"]], [_yy] * 2, lw=3.4,
+                      color=V10_COL[_arm], alpha=0.30 if _ri else 0.75,
+                      solid_capstyle="butt")
+            _axr.plot([_r["med"]], [_yy], "o", ms=4.6, color=V10_COL[_arm],
+                      mfc="white" if _ri else V10_COL[_arm], mew=1.4, zorder=5)
+            _axr.text(_r["q3"] + 0.006, _yy, f"{_r['med']:.3f}", va="center",
+                      fontsize=5.9, color=INK)
+    _axr.set_yticks(list(_y.values()), [V10_SHORT[_a] for _a in V10_ARMS], fontsize=7.5)
+    _axr.tick_params(axis="y", length=0)
+    _axr.set_ylim(-0.55, len(V10_ARMS) - 0.45)
+    _axr.set_xlabel("per-cell tracking error, RMSE (CNR)", fontsize=8)
+    _axr.set_title("b  and what each of them cost, in both runs", loc="left",
+                   fontweight="bold", fontsize=9, pad=14)
+    _axr.text(0.0, 1.03, "filled = v10 · open = v11", transform=_axr.transAxes,
+              ha="left", va="bottom", fontsize=6.2, color=MUTED)
+    _axr.set_xlim(float(v10_rmse["q1"].min()) - 0.012,
+                  float(v10_rmse["q3"].max()) + 0.030)
+    _axr.tick_params(axis="x", labelsize=7)
+    _axr.xaxis.grid(True, color=GRID, lw=0.6)
+    _axr.set_axisbelow(True)
+
+    save_fig(fig_v10, "v10-arms")
+    fig_v10
+
+    return V10_SCORE_FROM, v10_rmse
+
+
+@app.cell(hide_code=True)
+def _(V10_SCORE_FROM, mo, pl, v10_rmse):
+    mo.md(rf"""
+    **The v10 and v11 arms.** Panel (a) aligns every cell to its own phase group before taking a
+    median. v10 runs four groups offset by 0, 10, 20 and 30 minutes on a 40-minute cycle, and
+    adding the offset back collapses the four references onto one exactly; subtracting it, which
+    is the intuitive direction, does not. Only the winning arm is drawn: overlaid, the four
+    medians are the same shape at slightly different amplitudes and the panel reads as noise.
+    The arm comparison is what panel (b) is for.
+
+    Panel (b) is the evidence for the claim that base MPC is the best arm. It is, in both runs,
+    at {v10_rmse.filter((pl.col('run')=='v10') & (pl.col('arm')=='MPC'))['med'][0]:.3f} for v10
+    and {v10_rmse.filter((pl.col('run')=='v11') & (pl.col('arm')=='MPC'))['med'][0]:.3f} for v11.
+    What a single number hides is that the ordering below it does not replicate: in v10 the
+    constant-dose control came second, ahead of both move-penalty arms, while in v11 it came
+    last. Scored from frame {V10_SCORE_FROM} on cells with at least 120 scored frames.
+    """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -6491,7 +6878,7 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
     _axa.set_xlabel("minutes into the run", fontsize=8)
     _axa.set_ylabel("CNR", fontsize=8)
     _axa.tick_params(labelsize=7)
-    _axa.set_title("a  The median cell of each rung, against the demand",
+    _axa.set_title("a  The median cell of each arm, against the demand",
                    loc="left", fontweight="bold", fontsize=9)
     _axa.legend(frameon=False, fontsize=6.2, ncol=2, loc="lower center",
                 handlelength=1.5, columnspacing=1.3, borderaxespad=0.15)
@@ -7263,6 +7650,152 @@ def _(
 
 
 @app.cell(hide_code=True)
+def _(
+    FWD_COL,
+    FWD_DEMAND,
+    FWD_V21,
+    FWD_V23,
+    FW_FREE,
+    FW_RUNS,
+    MUTED,
+    W_TEXT,
+    fw_vec,
+    fw_win,
+    np,
+    pl,
+    plt,
+    save_fig,
+):
+    from matplotlib.colors import BoundaryNorm as _BN, ListedColormap as _LCM
+
+    # --- Alternative free-window heatmap: stripped to one panel --------------------
+    # Same data as `freewindow-heatmap`, three changes for legibility.
+    #
+    #  1. The total-light trace on the right is gone. It was never referred to in the
+    #     text, and it made the reader decode two coupled panels to read one picture.
+    #  2. A marker at seven minutes, the lead the actuator needs to climb from the
+    #     anchor to the demand. Every claim about these windows is about whether the
+    #     controller acts before or after that point, and the reader could not
+    #     previously see where it fell.
+    H2_LEAD = 7          # minutes: anchor to demand, driving flat out
+
+    _h2_mask = (fw_win["total"] > 0).to_numpy()
+    _h2_meta = fw_win.filter(pl.Series(_h2_mask))
+    _h2_D = fw_vec[_h2_mask]
+    _h2_X = _h2_D / _h2_D.sum(1, keepdims=True)
+    _h2_U, _h2_S, _ = np.linalg.svd(_h2_X - _h2_X.mean(0), full_matrices=False)
+
+    # arm first, then shape within arm: the same ordering the original uses
+    _h2_arm = _h2_meta["arm"].to_numpy()
+    _h2_order = np.lexsort((_h2_U[:, 0] * _h2_S[0], _h2_arm))
+    _h2_Ds, _h2_arms = _h2_D[_h2_order], _h2_arm[_h2_order]
+
+    H2_N = len(_h2_Ds)        # exported so the caption can quote it
+    H2_BIN = 30
+    _h2_nb = len(_h2_Ds) // H2_BIN
+    _h2_Db = _h2_Ds[:_h2_nb * H2_BIN].reshape(_h2_nb, H2_BIN, _h2_Ds.shape[1]).mean(1)
+    _h2_ab = np.median(_h2_arms[:_h2_nb * H2_BIN].reshape(_h2_nb, H2_BIN), axis=1)
+    _h2_edges = [0] + [int(np.argmax(_h2_ab >= _a)) for _a in (2, 3, 4)] + [_h2_nb]
+    _h2_mid = [(_h2_edges[_i] + _h2_edges[_i + 1]) / 2 for _i in range(4)]
+
+    _h2_demb = np.array([np.bincount(FWD_DEMAND[_h2_order][_i * H2_BIN:(_i + 1) * H2_BIN],
+                                     minlength=8).argmax() for _i in range(_h2_nb)])
+
+    fig_fwh2 = plt.figure(figsize=(W_TEXT, 4.2))
+    # Colourbar and demand key both go to the RIGHT rather than underneath. Stacking
+    # them below cost the heatmap a third of its height, and the vertical axis is the
+    # one carrying 10,752 rows.
+    _gh2 = fig_fwh2.add_gridspec(1, 2, width_ratios=[0.045, 1.0], wspace=0.035,
+                                 left=0.155, right=0.735, top=0.895, bottom=0.115)
+
+    _axs2 = fig_fwh2.add_subplot(_gh2[0, 0])
+    _axs2.imshow(_h2_demb[:, None], aspect="auto", interpolation="nearest",
+                 cmap=_LCM(FWD_COL), norm=_BN(np.arange(-0.5, 8.5), 8))
+    _axs2.set_xticks([])
+    _h2_lab = [f"arm {_a}\n" + " or ".join(
+        str(_m) for _m in sorted({FW_FREE[_r][_a] for _r in FW_RUNS})) + " free min"
+        for _a in (1, 2, 3, 4)]
+    _axs2.set_yticks(_h2_mid, _h2_lab, fontsize=6.4)
+    _axs2.tick_params(axis="y", length=0)
+
+    _ax2 = fig_fwh2.add_subplot(_gh2[0, 1])
+    _im2 = _ax2.imshow(_h2_Db, aspect="auto", cmap="viridis", interpolation="nearest",
+                       extent=[-20, 0, _h2_nb, 0],
+                       vmin=0, vmax=np.percentile(_h2_Db, 99.5))
+    for _s in _h2_edges[1:-1]:
+        _ax2.axhline(_s, color="white", lw=1.2)
+    _ax2.axvline(-H2_LEAD, color="white", lw=1.2, ls=(0, (3, 2.2)), zorder=5)
+    _ax2.text(-H2_LEAD - 0.45, _h2_nb * 0.985, f"{H2_LEAD} min lead",
+              fontsize=6.6, color="white", va="bottom", ha="right", zorder=6)
+    _ax2.set_yticks([])
+    _ax2.set_xticks([-20, -15, -10, -5, 0])
+    _ax2.tick_params(axis="x", labelsize=7)
+    _ax2.set_xlabel("minutes before the demand opens", fontsize=8)
+    _ax2.set_title("Light spent in the free window", loc="left",
+                   fontweight="bold", fontsize=9.5)
+
+    _cb2 = fig_fwh2.colorbar(_im2, ax=_ax2, fraction=0.035, pad=0.02, aspect=26)
+    # horizontal, above the bar: rotated on the side it ran straight through the
+    # demand legend
+    # loc="left" anchors the text at the bar's left edge rather than centring it on a
+    # narrow axes, which pushed it back over the heatmap
+    _cb2.ax.set_title("light in the\nminute (ms)", fontsize=6.3, color=MUTED,
+                      linespacing=1.4, pad=11, loc="left")
+    _cb2.ax.tick_params(labelsize=6.2)
+    _cb2.outline.set_visible(False)
+
+    fig_fwh2.legend(handles=[plt.Line2D([], [], color=_c, lw=5, label=_l)
+                             for _c, _l in zip(FWD_COL,
+                                               [f"v21 {_x}" for _x in FWD_V21]
+                                               + [f"v23 {_x}" for _x in FWD_V23])],
+                    loc="center left", bbox_to_anchor=(0.80, 0.52), ncol=1,
+                    frameon=False, fontsize=6.3, handlelength=1.2,
+                    labelspacing=0.5, title="demand ahead", title_fontsize=6.3)
+
+    save_fig(fig_fwh2, "freewindow-heatmap-simple")
+    fig_fwh2
+
+    return (H2_N,)
+
+
+@app.cell(hide_code=True)
+def _(H2_N, mo):
+    mo.md(rf"""
+    **Light spent in the free window.** Every pre-demand window in v21 and v23, {H2_N:,} of
+    them, drawn as one row. A row runs from twenty minutes before the demand opens to the
+    moment it does, and the colour of each cell is the exposure the controller commanded in
+    that minute, dark for none and bright for the top of the ladder. Rows are grouped into the
+    four arms, which differ only in how many of those last minutes went unscored, and within
+    each arm they are sorted by the first component of stimulation shape, so windows that
+    spend their light early sit at one end of a band and those that spend it late at the
+    other. The sort uses shape alone, so any vertical structure is a fact about the data
+    rather than something the ordering imposes.
+
+    The dashed line marks seven minutes before the demand, which is how long a cell takes to
+    climb from the anchor to the demanded level when driven flat out. Light commanded to the
+    right of it arrives in time to count; light to the left has decayed before it is scored.
+    Reading down the bands, arms 1 and 2 spread their light fairly evenly across the whole
+    twenty minutes, while arms 3 and 4 go dark early and concentrate almost everything into
+    the last seven. What changes with more unscored time is the width of the distribution, not
+    the kind of thing being done: no band separates into strata.
+
+    The strip on the far left is the demand each window was preparing for, in eight categories
+    because the two runs do not share a demand vocabulary. It is the confound check. If the
+    controller prepared differently for different objectives, those colours would line up with
+    the shape ordering inside each arm, since rows are sorted by shape. They stay mixed
+    throughout, which is the same conclusion the block-level comparison reaches and this
+    figure lets the reader see directly.
+
+    Two layout choices worth noting. The total-light trace that ran down the right of the
+    earlier version is dropped: it was never referred to in the text and forced the reader to
+    decode two coupled panels. The colourbar and the demand key both sit to the right rather
+    than underneath, because stacking them below cost the heatmap a third of its height and
+    the vertical axis is the one carrying all {H2_N:,} rows.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
     **Every window, ordered by the shape of its stimulation.** Both runs, all four arms.
@@ -7370,6 +7903,7 @@ def _(
 
     _dem = np.array([(_map21 if _r == "v21" else _map23)[_b] for _r, _b
                      in zip(_fwd_meta["run"].to_list(), _fwd_meta["block"].to_list())])
+    FWD_DEMAND = _dem      # exported: one demand code per window, unordered
     _demo = _dem[_fwd_order]
     _demb = np.array([np.bincount(_demo[_i * FWD_BIN:(_i + 1) * FWD_BIN],
                                   minlength=8).argmax() for _i in range(_fwd_nb)])
@@ -7446,7 +7980,7 @@ def _(
     save_fig(fig_fwd, "freewindow-heatmap-by-demand")
     fig_fwd
 
-    return (fwd_F,)
+    return FWD_COL, FWD_DEMAND, FWD_V21, FWD_V23, fwd_F
 
 
 @app.cell(hide_code=True)
@@ -7514,7 +8048,7 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
     _axa.legend(frameon=False, fontsize=6.6, ncol=2, loc="center left",
                 handlelength=1.4, columnspacing=1.4, labelspacing=0.3,
                 borderaxespad=0.6,
-                title="rung and its error in this block", title_fontsize=6.4)
+                title="arm and its error in this block", title_fontsize=6.4)
     _axa.yaxis.grid(True, color=GRID, lw=0.6)
     _axa.set_axisbelow(True)
 
@@ -7636,7 +8170,7 @@ def _(
     _axe.set_xlim(0, 0.95)
     _axe.set_xlabel("tracking error (CNR)", fontsize=8)
     _axe.tick_params(axis="x", labelsize=7)
-    _axe.set_title("a  Every cell, every rung", loc="left", fontweight="bold", fontsize=9)
+    _axe.set_title("a  Every cell, every arm", loc="left", fontweight="bold", fontsize=9)
     _axe.xaxis.grid(True, color=GRID, lw=0.6)
     _axe.set_axisbelow(True)
 
@@ -9203,7 +9737,7 @@ def _(
     #   cadence -- the model is trained on 1-minute sampling. A run whose median
     #              interval exceeds 1.05 min, or whose p90 exceeds 1.10, is feeding
     #              the encoder intervals it never saw.
-    #   rail    -- the share of cell-frames sitting on the top exposure rung. Above
+    #   rail    -- the share of cell-frames sitting on the largest exposure setting. Above
     #              20% the controller is not choosing a dose, it is asking for more
     #              light than the rig will give.
     #
@@ -9267,7 +9801,7 @@ def _(
     _axr.axvline(0.20, color=INK, lw=1.0, ls="--")
     _axr.set_xlim(0, 1.06)
     _axr.set_xticks([0, 0.2, 0.5, 0.8], ["0", "20%", "50%", "80%"], fontsize=6.5)
-    _axr.set_xlabel("closed-loop cell-frames on the top rung\n"
+    _axr.set_xlabel("closed-loop cell-frames on the largest setting\n"
                     "of their own field's ladder")
     _axr.set_title("b  Saturation", loc="left", fontweight="bold")
     _axr.xaxis.grid(True, color=GRID, lw=0.6)
@@ -9669,7 +10203,7 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
     _a1 = fig_ctlx.add_subplot(_gc[0, 0])
     _a1.barh(_y, ctl["dose_spread_ms"], height=0.62, color=_col)
     for _yi, _v, _k in zip(_y, ctl["dose_spread_ms"], ctl["mean_distinct"]):
-        _a1.text(_v + 1.5, _yi, f"{_k:.1f} rungs", va="center", fontsize=5.2,
+        _a1.text(_v + 1.5, _yi, f"{_k:.1f} settings", va="center", fontsize=5.2,
                  color=MUTED)
     _a1.set_xlabel("spread of dose across cells sharing\na field, a frame and a demand (ms)")
     _a1.set_title("a  The dose is chosen per cell", loc="left", fontweight="bold")
@@ -9683,10 +10217,10 @@ def _(GRID, INK, MUTED, SERIES, W_TEXT, materials_path, np, pl, plt, save_fig):
     _bot = ctl["at_bottom"].to_numpy()
     _mid = ctl["headroom"].to_numpy()
     _top = ctl["at_top"].to_numpy()
-    _a2.barh(_y, _bot, height=0.62, color=GRID, label="dark rung")
+    _a2.barh(_y, _bot, height=0.62, color=GRID, label="dark setting")
     _a2.barh(_y, _mid, left=_bot, height=0.62, color=SERIES[2], label="room to move")
     _a2.barh(_y, _top, left=_bot + _mid, height=0.62, color=SERIES[1],
-             label="top rung")
+             label="largest setting")
     _a2.set_xlim(0, 1)
     _a2.set_xticks([0, 0.5, 1], ["0", "50%", "100%"], fontsize=6.5)
     _a2.set_xlabel("share of cell-frames")
